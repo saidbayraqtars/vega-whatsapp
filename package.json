@@ -24,7 +24,8 @@
       {
         "provider": "github",
         "owner": "saidbayraqtars",
-        "repo": "vega-whatsapp-releases"
+        "repo": "vega-whatsapp-releases",
+        "releaseType": "release"
       }
     ],
     "files": [
