@@ -89,6 +89,7 @@ async function enterApp() {
     $('dbDot').className = 'dot on';
     await loadFirmalar();
     startWaPolling();
+    loadLicense();
 }
 
 async function loadFirmalar() {
@@ -464,11 +465,51 @@ async function loadWatcherConfig() {
     $('wc_template').value = s.template || '';
     $('wc_interval').value = s.intervalSec || 30;
     $('wc_min').value = s.minAmount || 0;
-    $('wc_codes').value = (s.izahatCodes || []).join(',');
+    applyIzahatCodesToUI(s.izahatCodes || []);
     $('wc_verify').checked = s.verifyOnWhatsApp !== false;
     $('wc_typing').checked = s.simulateTyping !== false;
     renderWatcherState(s);
 }
+
+// Kayıtlı izahat kodlarını UI'ya dağıt: boş = "Tüm ödemeler"; doluysa "seçili
+// tipler" moduna geç, eşleşen ön tanımlı tipleri işaretle, kalanı ek kod kutusuna yaz.
+function applyIzahatCodesToUI(codes) {
+    const set = new Set((codes || []).map(Number).filter(n => !isNaN(n)));
+    const ptypes = document.querySelectorAll('.wc_ptype');
+    if (!set.size) {
+        $('wc_mode_all').checked = true;
+        ptypes.forEach(cb => cb.checked = false);
+        $('wc_codes').value = '';
+        $('wc_typeBox').style.display = 'none';
+        return;
+    }
+    $('wc_mode_sel').checked = true;
+    $('wc_typeBox').style.display = '';
+    ptypes.forEach(cb => {
+        const pc = cb.dataset.codes.split(',').map(Number);
+        const all = pc.every(c => set.has(c));
+        cb.checked = all;
+        if (all) pc.forEach(c => set.delete(c));
+    });
+    $('wc_codes').value = [...set].join(',');
+}
+
+// UI seçimlerinden izahat kod listesi üret: "Tüm ödemeler" → [] (boş = hepsi).
+function collectWatcherIzahatCodes() {
+    const mode = document.querySelector('input[name="wc_mode"]:checked');
+    if (!mode || mode.value === 'all') return [];
+    const set = new Set();
+    document.querySelectorAll('.wc_ptype:checked').forEach(cb =>
+        cb.dataset.codes.split(',').forEach(c => { const n = +c.trim(); if (!isNaN(n)) set.add(n); }));
+    $('wc_codes').value.split(/[,\s]+/).map(s => s.trim()).filter(Boolean)
+        .map(Number).filter(n => !isNaN(n)).forEach(n => set.add(n));
+    return [...set];
+}
+
+// Mod radyo değişiminde seçili-tip kutusunu göster/gizle.
+document.querySelectorAll('input[name="wc_mode"]').forEach(r => r.addEventListener('change', () => {
+    $('wc_typeBox').style.display = $('wc_mode_sel').checked ? '' : 'none';
+}));
 
 function renderWatcherState(s) {
     const on = s.running;
@@ -493,7 +534,7 @@ function collectWatcherConfig() {
         template: $('wc_template').value,
         intervalSec: Math.max(10, +$('wc_interval').value || 30),
         minAmount: Math.max(0, +$('wc_min').value || 0),
-        izahatCodes: $('wc_codes').value.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n)),
+        izahatCodes: collectWatcherIzahatCodes(),
         verifyOnWhatsApp: $('wc_verify').checked,
         simulateTyping: $('wc_typing').checked,
     };
@@ -551,6 +592,7 @@ async function refreshWatcherLog() {
             <div class="logline">
                 <span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
                     ${e.tutar ? `<b>${esc(e.tutar)} TL</b>` : ''}
+                    ${e.bakiye ? `<span class="muted">bakiye: ${esc(e.bakiye)} TL</span>` : ''}
                     ${e.evrak ? `<span class="muted">(${esc(e.evrak)})</span>` : ''}
                     ${e.error ? `<span class="muted">— ${esc(e.error)}</span>` : ''}
                     <span class="muted" style="font-size:11px">${e.at ? new Date(e.at).toLocaleTimeString('tr-TR') : ''}</span>
@@ -559,6 +601,53 @@ async function refreshWatcherLog() {
             </div>`).join('');
     } catch { /* yok say */ }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Lisans (çevrimiçi lisans altyapısı — scaffold; şu an kısıtlamaz)
+// ═══════════════════════════════════════════════════════════════════════════
+const LIC_LABELS = {
+    valid: 'Lisanslı', offline: 'Çevrimdışı', unlicensed: 'Lisanssız',
+    invalid: 'Geçersiz', expired: 'Süresi doldu', error: 'Hata',
+};
+
+async function loadLicense() {
+    try { const r = await api('/license'); if (r.success) renderLicense(r.license); }
+    catch { /* yok say */ }
+}
+
+function renderLicense(L) {
+    if (!L) return;
+    $('licLabel').textContent = LIC_LABELS[L.status] || 'Lisans';
+    $('licDot').className = 'dot ' + (L.status === 'valid' ? 'on' : 'wait');
+    $('lic_machine').value = L.machineId || '';
+    $('lic_key').value = L.key || '';
+    const mode = L.enforced ? 'Zorunlu mod' : 'Altyapı hazır (kısıtlama yok)';
+    const bits = [`${mode}`, `Durum: ${LIC_LABELS[L.status] || L.status}`];
+    if (L.plan) bits.push(`Plan: ${L.plan}`);
+    if (L.validUntil) bits.push(`Bitiş: ${new Date(L.validUntil).toLocaleDateString('tr-TR')}`);
+    if (L.message) bits.push(L.message);
+    $('lic_state').textContent = bits.join('  ·  ');
+}
+
+$('licBtn').onclick = async () => { await loadLicense(); $('licModal').classList.remove('hidden'); };
+$('lic_close').onclick = () => $('licModal').classList.add('hidden');
+$('lic_activate').onclick = async () => {
+    $('lic_err').textContent = '';
+    const key = $('lic_key').value.trim();
+    if (!key) { $('lic_err').textContent = 'Anahtar girin.'; return; }
+    $('lic_activate').disabled = true;
+    try {
+        const r = await api('/license/activate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) });
+        renderLicense(r.license);
+        if (!r.success) $('lic_err').textContent = r.message || 'Etkinleştirilemedi.';
+    } catch (e) { $('lic_err').textContent = 'Hata: ' + e.message; }
+    $('lic_activate').disabled = false;
+};
+$('lic_recheck').onclick = async () => {
+    $('lic_err').textContent = '';
+    try { const r = await api('/license/recheck', { method: 'POST' }); renderLicense(r.license); }
+    catch (e) { $('lic_err').textContent = 'Hata: ' + e.message; }
+};
 
 // ─── yardımcı ───
 function esc(s) {

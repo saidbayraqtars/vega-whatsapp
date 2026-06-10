@@ -30,6 +30,7 @@ const {
 } = require('./whatsapp');
 const { normalizePhone, isLikelyValid } = require('./phone');
 const watcher = require('./watcher');
+const license = require('./license');
 
 const QRCode = require('qrcode');
 
@@ -387,7 +388,12 @@ async function resolveCariContacts(firmaNo, indList) {
         : `CAST(IND AS NVARCHAR)`;
     const kodExpr = info.hasFirmakodu ? 'FIRMAKODU' : `CAST(IND AS NVARCHAR)`;
     const phoneSelect = info.phoneCols.map(c => `[${c}] AS [PH_${c}]`).join(', ');
-    const cols = ['IND', `${kodExpr} AS KOD`, `${nameExpr} AS UNVAN`, phoneSelect].filter(Boolean).join(', ');
+    // Carinin güncel kalan bakiyesi TBLCARI.BAKIYE'de tutulur (cari hareket
+    // tablosunun BAKIYE kolonu Vega'da NULL; dönemler arası devirli toplamı
+    // burada saklanır). Pozitif = borç (müşteri bize borçlu).
+    const hasBakiye = info.all.some(c => c.toUpperCase() === 'BAKIYE');
+    const bakiyeSelect = hasBakiye ? 'BAKIYE AS BAKIYE' : 'CAST(NULL AS DECIMAL(18,2)) AS BAKIYE';
+    const cols = ['IND', `${kodExpr} AS KOD`, `${nameExpr} AS UNVAN`, bakiyeSelect, phoneSelect].filter(Boolean).join(', ');
 
     const rows = (await pool.request().query(`SELECT ${cols} FROM ${T} WHERE IND IN (${ids.join(',')})`)).recordset;
     for (const row of rows) {
@@ -400,7 +406,11 @@ async function resolveCariContacts(firmaNo, indList) {
             });
         }
         const primary = normalized.find(isLikelyValid) || normalized[0] || null;
-        map.set(row.IND, { name: row.UNVAN, kod: row.KOD, phone: primary, valid: primary ? isLikelyValid(primary) : false });
+        map.set(row.IND, {
+            name: row.UNVAN, kod: row.KOD, phone: primary,
+            valid: primary ? isLikelyValid(primary) : false,
+            bakiye: row.BAKIYE != null ? Number(row.BAKIYE) : null,
+        });
     }
     return map;
 }
@@ -502,6 +512,31 @@ app.get('/api/watcher/izahat-stats', async (req, res) => {
         };
         const data = rows.map(r => ({ ...r, label: KNOWN[r.code] || '', devir: [103, 104].includes(r.code) }));
         res.json({ success: true, table: tbl, data });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  LİSANS (çevrimiçi lisans altyapısı — scaffold, şu an kısıtlamaz)
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/license', (req, res) => {
+    res.json({ success: true, license: license.getStatus() });
+});
+
+app.post('/api/license/activate', async (req, res) => {
+    try {
+        const st = await license.activate(req.body && req.body.key);
+        res.json({ success: st.status !== 'invalid' && st.status !== 'error', license: st, message: st.message });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/license/recheck', async (req, res) => {
+    try {
+        const st = await license.recheck();
+        res.json({ success: true, license: st, message: st.message });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -742,6 +777,9 @@ app.use(express.static(PUBLIC_DIR));
 app.get('*', (req, res) => {
     res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
+
+// Lisans altyapısını başlat (data/license.json + machine-id; scaffold = kısıtlamaz).
+license.configure({ baseDir });
 
 // Watcher'ı bağımlılıklarıyla yapılandır (config/state data/ altına yazılır).
 watcher.configure({

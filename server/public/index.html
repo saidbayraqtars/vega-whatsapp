@@ -50,7 +50,9 @@
         </nav>
         <span class="pill"><span class="dot" id="dbDot"></span> Veritabanı</span>
         <span class="pill"><span class="dot" id="waDot"></span> <span id="waLabel">WhatsApp</span></span>
+        <span class="pill" id="licPill" title="Lisans durumu"><span class="dot" id="licDot"></span> <span id="licLabel">Lisans</span></span>
         <div class="spacer"></div>
+        <button class="btn ghost sm" id="licBtn">Lisans</button>
         <button class="btn ghost sm" id="waBtn">WhatsApp Bağlantısı</button>
         <button class="btn ghost sm" id="logoutBtn">Çıkış</button>
     </div>
@@ -158,8 +160,9 @@
                     <span class="chip" data-wcvar="{evrak}">{evrak}</span>
                     <span class="chip" data-wcvar="{tarih}">{tarih}</span>
                     <span class="chip" data-wcvar="{bakiye}">{bakiye}</span>
+                    <span class="chip" data-wcvar="{borc}">{borc}</span>
                 </div>
-                <div class="hint">{tutar} = tahsilat tutarı, {bakiye} = işlem sonrası bakiye.</div>
+                <div class="hint">{tutar} = bu ödeme tutarı, {bakiye} = {borc} = carinin güncel kalan borcu (pozitif = borçlu).</div>
             </div>
 
             <details class="adv">
@@ -169,10 +172,21 @@
                     <div><label>Min tutar (TL)</label><input id="wc_min" type="number" value="0" min="0" /></div>
                 </div>
                 <div class="field" style="margin-top:8px">
-                    <label>Tahsilat IZAHAT kodları (virgülle, boş = tümü)</label>
-                    <input id="wc_codes" value="" placeholder="boş bırak = tüm tahsilatlar (devir hariç)" />
-                    <div class="hint">Tahsilat = cari ALACAK girişi. Boş bırakırsan tüm ödemeler (yıl başı devri hariç) sayılır. Belirli tiplere daraltmak için kod yaz. <a href="#" id="wc_showCodes">Bu dönemdeki kodları göster</a></div>
-                    <div id="wc_codesList" class="muted" style="font-size:12px; margin-top:6px"></div>
+                    <label>Hangi ödemelerde mesaj gönderilsin?</label>
+                    <label class="check"><input type="radio" name="wc_mode" id="wc_mode_all" value="all" checked /> <b>Tüm ödemeler</b> <span class="muted">(bakiyeyi azaltan — havale, kredi kartı, nakit, manuel; yıl başı devri hariç)</span></label>
+                    <label class="check"><input type="radio" name="wc_mode" id="wc_mode_sel" value="selected" /> Sadece seçili tipler</label>
+                    <div id="wc_typeBox" style="display:none; margin-top:6px; padding-left:18px; border-left:2px solid var(--line, #e5e7eb)">
+                        <label class="check"><input type="checkbox" class="wc_ptype" data-codes="20" /> Havale / EFT</label>
+                        <label class="check"><input type="checkbox" class="wc_ptype" data-codes="13,14" /> Kredi Kartı (Visa)</label>
+                        <label class="check"><input type="checkbox" class="wc_ptype" data-codes="32" /> Nakit (Kasa)</label>
+                        <label class="check"><input type="checkbox" class="wc_ptype" data-codes="83" /> Manuel Fiş</label>
+                        <div class="field" style="margin-top:6px">
+                            <label>Ek IZAHAT kodları (virgülle)</label>
+                            <input id="wc_codes" value="" placeholder="örn: 22, 84" />
+                            <div class="hint">Yukarıdaki tipler dışında ek kod ekleyebilirsin. <a href="#" id="wc_showCodes">Bu dönemdeki kodları göster</a></div>
+                            <div id="wc_codesList" class="muted" style="font-size:12px; margin-top:6px"></div>
+                        </div>
+                    </div>
                 </div>
                 <label class="check" style="margin-top:8px"><input type="checkbox" id="wc_verify" checked /> Numara WhatsApp'ta mı kontrol et</label>
                 <label class="check"><input type="checkbox" id="wc_typing" checked /> "Yazıyor..." simülasyonu</label>
@@ -208,6 +222,29 @@
         <div class="actions">
             <button class="btn ghost" id="waRefresh">Oturumu Sıfırla</button>
             <button class="btn" id="waClose">Kapat</button>
+        </div>
+    </div>
+</div>
+
+<!-- ─── LİSANS MODAL ─── -->
+<div id="licModal" class="overlay hidden">
+    <div class="modal" style="max-width:440px">
+        <h2>Lisans</h2>
+        <p class="sub" id="lic_state">Durum yükleniyor...</p>
+        <div class="field">
+            <label>Cihaz Kimliği</label>
+            <input id="lic_machine" readonly style="font-family:monospace; font-size:12px" />
+        </div>
+        <div class="field">
+            <label>Lisans Anahtarı</label>
+            <input id="lic_key" placeholder="VEGA-XXXX-XXXX-XXXX-XXXX" />
+            <div class="hint" id="lic_hint">Anahtarı girip etkinleştirin. (Çevrimiçi lisans altyapısı hazır; şu an uygulamayı kısıtlamaz.)</div>
+        </div>
+        <div class="err" id="lic_err"></div>
+        <div class="actions">
+            <button class="btn ghost" id="lic_recheck">Yeniden Denetle</button>
+            <button class="btn green" id="lic_activate">Etkinleştir</button>
+            <button class="btn" id="lic_close">Kapat</button>
         </div>
     </div>
 </div>

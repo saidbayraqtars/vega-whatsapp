@@ -42,7 +42,7 @@ const DEFAULT_CONFIG = {
     // (devir hariç). Belirli kodlara daraltmak istenirse buraya yazılır (örn [13,20]).
     izahatCodes: [],
     minAmount: 0,
-    template: 'Sayın {ad}, {tutar} TL ödemeniz alınmış ve kaydedilmiştir. Teşekkür ederiz.',
+    template: 'Sayın {ad}, {tutar} TL ödemeniz alınmış ve kaydedilmiştir. Güncel bakiyeniz: {bakiye} TL. Teşekkür ederiz.',
     verifyOnWhatsApp: true,
     simulateTyping: true,
 };
@@ -114,7 +114,8 @@ function renderTemplate(tpl, vars) {
         .replace(/\{kod\}/gi, vars.kod || '')
         .replace(/\{evrak\}/gi, vars.evrak || '')
         .replace(/\{tarih\}/gi, vars.tarih || '')
-        .replace(/\{bakiye\}/gi, vars.bakiye || '');
+        .replace(/\{bakiye\}/gi, vars.bakiye || '')
+        .replace(/\{borc\}/gi, vars.borc || '');     // kalan borç = {bakiye} ile aynı (pozitif bakiye)
 }
 
 async function tableExists(pool, name) {
@@ -180,10 +181,14 @@ async function pollOnce() {
         for (const row of rows) {
             maxInd = Math.max(maxInd, row.IND);
             const c = contacts.get(row.FIRMANO) || {};
+            // Kalan borç = carinin güncel bakiyesi (TBLCARI.BAKIYE). Pozitif = borç.
+            // Cari hareketin BAKIYE kolonu Vega'da NULL → oradan okumak 0 verirdi.
+            const kalanBorc = c.bakiye != null ? c.bakiye : null;
             const base = {
                 ind: row.IND, cariInd: row.FIRMANO, name: c.name || String(row.FIRMANO),
                 kod: c.kod || '', phone: c.phone || null,
                 tutar: fmtAmount(row.ALACAK), evrak: row.EVRAKNO || '',
+                bakiye: kalanBorc != null ? fmtAmount(kalanBorc) : '',
             };
 
             if (!c.phone || !c.valid) {
@@ -214,7 +219,9 @@ async function pollOnce() {
                 ad: c.name, tutar: fmtAmount(row.ALACAK), kod: c.kod,
                 evrak: row.EVRAKNO || '',
                 tarih: row.TARIH ? new Date(row.TARIH).toLocaleDateString('tr-TR') : '',
-                bakiye: fmtAmount(row.BAKIYE),
+                // Kalan borç carinin güncel bakiyesinden (TBLCARI.BAKIYE). Yoksa boş bırak.
+                bakiye: kalanBorc != null ? fmtAmount(kalanBorc) : '',
+                borc: kalanBorc != null ? fmtAmount(kalanBorc) : '',
             });
 
             const res = await deps.waSend(c.phone, text, null, {
