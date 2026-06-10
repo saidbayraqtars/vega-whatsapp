@@ -11,7 +11,9 @@
       "PowerShell(git config --global user.email)",
       "PowerShell(git config --global credential.helper)",
       "PowerShell($fill = \"protocol=https`nhost=github.com`n\" | git credential fill; $tok = \\($fill | Select-String '^password='\\).Line.Substring\\(9\\); $u = Invoke-RestMethod -Uri 'https://api.github.com/user' -Headers @{ Authorization = \"token $tok\"; 'User-Agent' = 'vega' }; \"login: $\\($u.login\\)\"; $scopes = \\(Invoke-WebRequest -Uri 'https://api.github.com/user' -Headers @{ Authorization = \"token $tok\"; 'User-Agent' = 'vega' } -UseBasicParsing\\).Headers['X-OAuth-Scopes']; \"scopes: $scopes\")",
-      "Bash(git credential *)"
+      "Bash(git credential *)",
+      "PowerShell($app = \"C:\\\\Users\\\\saidb\\\\Desktop\\\\projeler\\\\yeni\\\\dist\\\\win-unpacked\\\\resources\\\\app\"; \"baileys: $\\(Test-Path \"$app\\\\node_modules\\\\@whiskeysockets\\\\baileys\"\\)\"; \"mssql: $\\(Test-Path \"$app\\\\node_modules\\\\mssql\"\\)\"; \"express: $\\(Test-Path \"$app\\\\node_modules\\\\express\"\\)\"; \"config.json haric mi: $\\(-not \\(Test-Path \"$app\\\\server\\\\config.json\"\\)\\)\"; \"server\\\\node_modules haric mi: $\\(-not \\(Test-Path \"$app\\\\server\\\\node_modules\"\\)\\)\"; \"app-update.yml: $\\(Test-Path \"C:\\\\Users\\\\saidb\\\\Desktop\\\\projeler\\\\yeni\\\\dist\\\\win-unpacked\\\\resources\\\\app-update.yml\"\\)\")",
+      "Bash(curl -s -o /dev/null -w \"latest.yml public erisim: %{http_code}\\\\n\" -L \"https://github.com/saidbayraqtars/vega-whatsapp-releases/releases/latest/download/latest.yml\")"
     ]
   }
 }
