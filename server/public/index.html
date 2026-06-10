@@ -165,6 +165,17 @@
                 <div class="hint">{tutar} = bu ödeme tutarı, {bakiye} = {borc} = carinin güncel kalan borcu (pozitif = borçlu).</div>
             </div>
 
+            <div class="field">
+                <label>Görsel / Video (opsiyonel)</label>
+                <input type="file" id="wc_media" accept="image/*,video/*" />
+                <div class="media-preview" id="wc_mediaPreview"></div>
+                <div class="hint" id="wc_mediaInfo" style="display:none">
+                    Kayıtlı: <b id="wc_mediaName"></b>
+                    <a href="#" id="wc_mediaClear" style="margin-left:8px">Kaldır</a>
+                </div>
+                <div class="hint">Mesaj metni görselin açıklaması (caption) olarak gönderilir.</div>
+            </div>
+
             <details class="adv">
                 <summary>Gelişmiş ayarlar</summary>
                 <div class="grid2">

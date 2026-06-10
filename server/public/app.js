@@ -468,8 +468,38 @@ async function loadWatcherConfig() {
     applyIzahatCodesToUI(s.izahatCodes || []);
     $('wc_verify').checked = s.verifyOnWhatsApp !== false;
     $('wc_typing').checked = s.simulateTyping !== false;
+    renderWatcherMedia(s.media);
     renderWatcherState(s);
 }
+
+function renderWatcherMedia(media) {
+    const info = $('wc_mediaInfo');
+    if (media && media.name) {
+        $('wc_mediaName').textContent = media.name + (media.kind ? ` (${media.kind})` : '');
+        info.style.display = '';
+    } else {
+        info.style.display = 'none';
+    }
+}
+
+$('wc_media').onchange = () => {
+    const f = $('wc_media').files[0];
+    const box = $('wc_mediaPreview');
+    box.innerHTML = '';
+    if (!f) return;
+    const url = URL.createObjectURL(f);
+    if (f.type.startsWith('image/')) box.innerHTML = `<img src="${url}" />`;
+    else if (f.type.startsWith('video/')) box.innerHTML = `<video src="${url}" controls></video>`;
+    else box.innerHTML = `<span class="muted">${esc(f.name)}</span>`;
+};
+
+$('wc_mediaClear').onclick = async (e) => {
+    e.preventDefault();
+    const r = await api('/watcher/media/clear', { method: 'POST' });
+    $('wc_media').value = '';
+    $('wc_mediaPreview').innerHTML = '';
+    renderWatcherMedia(r.status && r.status.media);
+};
 
 // Kayıtlı izahat kodlarını UI'ya dağıt: boş = "Tüm ödemeler"; doluysa "seçili
 // tipler" moduna geç, eşleşen ön tanımlı tipleri işaretle, kalanı ek kod kutusuna yaz.
@@ -548,6 +578,16 @@ $('wc_save').onclick = async () => {
     $('wc_save').disabled = true;
     try {
         await api('/watcher', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+        // Görsel/video seçildiyse yükle (gönderim anında okunur).
+        const mediaFile = $('wc_media').files[0];
+        if (mediaFile) {
+            const fd = new FormData();
+            fd.append('media', mediaFile);
+            const mr = await fetch('/api/watcher/media', { method: 'POST', body: fd }).then(x => x.json());
+            $('wc_media').value = '';
+            $('wc_mediaPreview').innerHTML = '';
+            if (mr.status) renderWatcherMedia(mr.status.media);
+        }
         const r = await api('/watcher/start', { method: 'POST' });
         if (!r.success) $('wc_err').textContent = r.message || 'Başlatılamadı.';
         renderWatcherState(r.status);

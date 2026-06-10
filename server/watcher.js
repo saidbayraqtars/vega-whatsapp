@@ -20,6 +20,7 @@ const path = require('path');
 let deps = null;            // { getPool, sql, resolveCariContacts, waSend, checkOnWhatsApp, waStatus, baseDir }
 let CONFIG_PATH = null;
 let STATE_PATH = null;
+let MEDIA_DIR = null;       // görsel/video data/ altında saklanır
 
 let timer = null;
 let polling = false;        // tek seferde tek tarama (reentrancy koruması)
@@ -45,6 +46,8 @@ const DEFAULT_CONFIG = {
     template: 'Sayın {ad}, {tutar} TL ödemeniz alınmış ve kaydedilmiştir. Güncel bakiyeniz: {bakiye} TL. Teşekkür ederiz.',
     verifyOnWhatsApp: true,
     simulateTyping: true,
+    // Opsiyonel görsel/video: data/ altına kaydedilen dosya. { path, mime, kind, name } | null
+    media: null,
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -61,8 +64,51 @@ function configure(d) {
     if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
     CONFIG_PATH = path.join(dataDir, 'watcher.json');
     STATE_PATH = path.join(dataDir, 'watcher-state.json');
+    MEDIA_DIR = dataDir;
     loadConfig();
     loadState();
+}
+
+// ─── Görsel/video (opsiyonel ek) ───────────────────────────────────────────────
+function clearMediaFile() {
+    if (config.media && config.media.path && MEDIA_DIR) {
+        try {
+            const f = path.join(MEDIA_DIR, config.media.path);
+            if (fs.existsSync(f)) fs.unlinkSync(f);
+        } catch (e) { console.error('[Watcher] medya silinemedi:', e.message); }
+    }
+}
+
+// file = multer dosyası { buffer, mimetype, originalname }
+function setMedia(file) {
+    if (!file || !file.buffer) return getStatus();
+    const mt = file.mimetype || '';
+    const kind = mt.startsWith('image/') ? 'image' : mt.startsWith('video/') ? 'video' : 'document';
+    let ext = path.extname(file.originalname || '') || (kind === 'image' ? '.jpg' : kind === 'video' ? '.mp4' : '');
+    clearMediaFile();
+    const fname = `watcher-media${ext}`;
+    try { fs.writeFileSync(path.join(MEDIA_DIR, fname), file.buffer); }
+    catch (e) { console.error('[Watcher] medya yazılamadı:', e.message); return getStatus(); }
+    config.media = { path: fname, mime: mt, kind, name: file.originalname || fname };
+    saveConfig();
+    return getStatus();
+}
+
+function clearMedia() {
+    clearMediaFile();
+    config.media = null;
+    saveConfig();
+    return getStatus();
+}
+
+// Kayıtlı medyayı waSend formatına oku (yoksa null → düz metin).
+function loadMediaForSend() {
+    if (!config.media || !config.media.path || !MEDIA_DIR) return null;
+    try {
+        const f = path.join(MEDIA_DIR, config.media.path);
+        if (!fs.existsSync(f)) return null;
+        return { kind: config.media.kind, buffer: fs.readFileSync(f), mimetype: config.media.mime, fileName: config.media.name };
+    } catch (e) { console.error('[Watcher] medya okunamadı:', e.message); return null; }
 }
 
 function loadConfig() {
@@ -175,7 +221,10 @@ async function pollOnce() {
 
         // Cari iletişim bilgilerini topluca çöz (FIRMANO = TBLCARI.IND)
         const inds = [...new Set(rows.map(x => x.FIRMANO).filter(v => v != null))];
-        const contacts = await deps.resolveCariContacts(config.firmaNo, inds); // Map<ind,{name,kod,phone,valid}>
+        const contacts = await deps.resolveCariContacts(config.firmaNo, inds); // Map<ind,{name,kod,phone,valid,bakiye}>
+
+        // Opsiyonel görsel/video — bir kez oku, tüm alıcılara aynı buffer.
+        const media = loadMediaForSend();
 
         let maxInd = lastSeen;
         for (const row of rows) {
@@ -224,7 +273,7 @@ async function pollOnce() {
                 borc: kalanBorc != null ? fmtAmount(kalanBorc) : '',
             });
 
-            const res = await deps.waSend(c.phone, text, null, {
+            const res = await deps.waSend(c.phone, text, media, {
                 simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400),
             });
             if (res.success) { sent++; pushLog({ ...base, status: 'sent' }); }
@@ -292,6 +341,7 @@ function getStatus() {
         izahatCodes: config.izahatCodes, minAmount: config.minAmount,
         template: config.template,
         verifyOnWhatsApp: config.verifyOnWhatsApp, simulateTyping: config.simulateTyping,
+        media: config.media ? { name: config.media.name, kind: config.media.kind } : null,
         lastPollAt, lastError, lastResult,
         watermark: tableName() ? (state.lastSeenInd[tableName()] ?? null) : null,
     };
@@ -308,4 +358,5 @@ function resetWatermark() {
 module.exports = {
     configure, autoStart, start, stop,
     getConfig, setConfig, getStatus, getLog, resetWatermark, pollOnce,
+    setMedia, clearMedia,
 };

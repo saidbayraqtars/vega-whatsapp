@@ -483,6 +483,17 @@ app.get('/api/watcher/log', (req, res) => {
     res.json({ success: true, log: watcher.getLog(), status: watcher.getStatus() });
 });
 
+// Otomatik tahsilat mesajına eklenecek görsel/video yükle / kaldır.
+app.post('/api/watcher/media', upload.single('media'), (req, res) => {
+    if (!req.file) return res.status(400).json({ success: false, message: 'Dosya gerekli.' });
+    const status = watcher.setMedia(req.file);
+    res.json({ success: true, status });
+});
+
+app.post('/api/watcher/media/clear', (req, res) => {
+    res.json({ success: true, status: watcher.clearMedia() });
+});
+
 // Cari hareket tablosundaki IZAHAT dağılımı — kullanıcı tahsilat kodunu canlı görsün.
 app.get('/api/watcher/izahat-stats', async (req, res) => {
     if (!requireDb(req, res)) return;
