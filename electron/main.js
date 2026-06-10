@@ -97,7 +97,7 @@ function setupAutoUpdater() {
         updateVersion = info.version;
         refreshTrayMenu();
         if (tray) tray.displayBalloon?.({
-            title: 'Vega WhatsApp',
+            title: 'Expert Bilişim',
             content: `Yeni sürüm ${info.version} indirildi. Tray menüsünden kurabilir veya çıkışta otomatik kurulmasını bekleyebilirsiniz.`,
         });
         // Pencere açıksa kullanıcıya sor; tray'de gizliyse rahatsız etme.
@@ -125,7 +125,7 @@ function createWindow() {
     mainWindow = new BrowserWindow({
         width: 1280, height: 820, minWidth: 980, minHeight: 640,
         icon: path.join(__dirname, 'icon.png'),
-        title: 'Vega WhatsApp',
+        title: 'Expert Bilişim — WhatsApp Tahsilat',
         autoHideMenuBar: true,
         webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true },
     });
@@ -136,7 +136,7 @@ function createWindow() {
         if (!isQuitting) {
             e.preventDefault();
             mainWindow.hide();
-            if (tray) tray.displayBalloon?.({ title: 'Vega WhatsApp', content: 'Arka planda tahsilat takibi sürüyor.' });
+            if (tray) tray.displayBalloon?.({ title: 'Expert Bilişim', content: 'Arka planda tahsilat takibi sürüyor.' });
         }
     });
 }
@@ -169,7 +169,7 @@ function refreshTrayMenu() {
 function createTray() {
     const img = nativeImage.createFromPath(path.join(__dirname, 'icon.png')).resize({ width: 16, height: 16 });
     tray = new Tray(img);
-    tray.setToolTip('Vega WhatsApp — tahsilat takibi aktif');
+    tray.setToolTip('Expert Bilişim — tahsilat takibi aktif');
     refreshTrayMenu();
     tray.on('double-click', () => { mainWindow ? (mainWindow.show(), mainWindow.focus()) : createWindow(); });
 }

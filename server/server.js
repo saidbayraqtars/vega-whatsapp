@@ -517,8 +517,8 @@ app.get('/api/watcher/izahat-stats', async (req, res) => {
         // Bilinen etiketler — bu DB'de gerçek veriyle doğrulandı (2026-06). Kod→anlam
         // haritası firmalar arası değişebilir; etiketler sadece bilgilendirme amaçlı.
         const KNOWN = {
-            13: 'Visa Tahsilat', 14: 'Visa İade', 20: 'Havale/EFT',
-            32: 'Nakit (Kasa Fişi)', 83: 'Manuel Fiş',
+            13: 'Visa Giriş Bordrosu', 14: 'Visa Giriş İade Bordrosu', 20: 'Havale Giriş Bordrosu',
+            32: 'Nakit Giriş Bordrosu', 83: 'Manuel Fiş',
             103: 'Cari Devir (açılış)', 104: 'Cari Devir (borç)',
         };
         const data = rows.map(r => ({ ...r, label: KNOWN[r.code] || '', devir: [103, 104].includes(r.code) }));

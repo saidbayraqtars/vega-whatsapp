@@ -3,13 +3,20 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vega Toplu WhatsApp</title>
+    <title>Expert Bilişim — WhatsApp Tahsilat</title>
     <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 
 <!-- ─── KURULUM ─── -->
 <div id="setupScreen" class="center hidden">
+    <div class="brand big">
+        <div class="logo">EB</div>
+        <div>
+            <div class="name">Expert <span>Bilişim</span></div>
+            <div class="team">Yazılım Ekibi</div>
+        </div>
+    </div>
     <div class="card narrow">
         <h1>İlk Kurulum</h1>
         <p class="sub">VegaDB (SQL Server) bilgileri ve 6 haneli PIN. Bilgiler şifrelenip kaydedilir.</p>
@@ -30,6 +37,13 @@
 
 <!-- ─── PIN GİRİŞ ─── -->
 <div id="pinScreen" class="center hidden">
+    <div class="brand big">
+        <div class="logo">EB</div>
+        <div>
+            <div class="name">Expert <span>Bilişim</span></div>
+            <div class="team">Yazılım Ekibi</div>
+        </div>
+    </div>
     <div class="card narrow" style="text-align:center">
         <h1>Hoş Geldiniz</h1>
         <p class="sub">Devam etmek için PIN kodunuzu girin.</p>
@@ -43,7 +57,13 @@
 <!-- ─── ANA EKRAN ─── -->
 <div id="app" class="hidden">
     <div class="topbar">
-        <div class="brand">Vega <span>WhatsApp</span></div>
+        <div class="brand">
+            <div class="logo">EB</div>
+            <div>
+                <div class="name">Expert <span>Bilişim</span></div>
+                <div class="team">Yazılım Ekibi</div>
+            </div>
+        </div>
         <nav class="tabs">
             <button class="tab active" id="tabBulk" data-view="viewBulk">Toplu Mesaj</button>
             <button class="tab" id="tabWatcher" data-view="viewWatcher">Otomatik Tahsilat</button>
@@ -60,7 +80,12 @@
     <div class="wrap" id="viewBulk">
         <!-- SOL: Cari seçimi -->
         <div class="card">
-            <h2>Cariler</h2>
+            <h2>📋 Cariler</h2>
+            <ol class="steps">
+                <li>Firma seç ve carileri ara</li>
+                <li>Mesaj gidecek kişileri işaretle</li>
+                <li>Sağda mesajı yazıp Gönder'e bas</li>
+            </ol>
             <div class="toolbar">
                 <select id="firmaSel"></select>
                 <input type="text" id="searchInput" placeholder="Ünvan, kod veya telefon ara..." />
@@ -96,7 +121,7 @@
         <!-- SAĞ: Mesaj -->
         <div class="panel">
             <div class="card">
-                <h2>Mesaj Oluştur</h2>
+                <h2>✏️ Mesaj Oluştur</h2>
                 <div class="field">
                     <label>Mesaj metni</label>
                     <textarea id="msgText" placeholder="Merhaba {ad}, ..."></textarea>
@@ -140,10 +165,15 @@
     <div class="wrap" id="viewWatcher" style="display:none">
         <!-- SOL: Ayarlar -->
         <div class="card">
-            <h2>Otomatik Tahsilat Bildirimi
-                <span class="pill" style="float:right"><span class="dot" id="wcDot"></span> <span id="wcState">Pasif</span></span>
+            <h2>🔔 Otomatik Tahsilat Bildirimi
+                <span class="pill" style="margin-left:auto"><span class="dot" id="wcDot"></span> <span id="wcState">Pasif</span></span>
             </h2>
             <p class="sub">Seçilen firma/dönemin cari hareketleri taranır; yeni <b>tahsilat</b> (ödeme alındı) bulununca cariye otomatik WhatsApp gönderilir.</p>
+            <ol class="steps">
+                <li>Firma ve dönemi seç</li>
+                <li>Mesaj şablonunu yaz</li>
+                <li>Kaydet ve Başlat'a bas — gerisi otomatik</li>
+            </ol>
 
             <div class="row">
                 <div class="field"><label>Firma</label><select id="wc_firma"></select></div>
@@ -184,12 +214,12 @@
                 </div>
                 <div class="field" style="margin-top:8px">
                     <label>Hangi ödemelerde mesaj gönderilsin?</label>
-                    <label class="check"><input type="radio" name="wc_mode" id="wc_mode_all" value="all" checked /> <b>Tüm ödemeler</b> <span class="muted">(bakiyeyi azaltan — havale, kredi kartı, nakit, manuel; yıl başı devri hariç)</span></label>
+                    <label class="check"><input type="radio" name="wc_mode" id="wc_mode_all" value="all" checked /> <b>Tüm ödemeler</b> <span class="muted">(bakiyeyi azaltan — havale, visa, nakit giriş bordroları + manuel fiş; yıl başı devri hariç)</span></label>
                     <label class="check"><input type="radio" name="wc_mode" id="wc_mode_sel" value="selected" /> Sadece seçili tipler</label>
                     <div id="wc_typeBox" style="display:none; margin-top:6px; padding-left:18px; border-left:2px solid var(--line, #e5e7eb)">
-                        <label class="check"><input type="checkbox" class="wc_ptype" data-codes="20" /> Havale / EFT</label>
-                        <label class="check"><input type="checkbox" class="wc_ptype" data-codes="13,14" /> Kredi Kartı (Visa)</label>
-                        <label class="check"><input type="checkbox" class="wc_ptype" data-codes="32" /> Nakit (Kasa)</label>
+                        <label class="check"><input type="checkbox" class="wc_ptype" data-codes="20" /> Havale Giriş Bordrosu</label>
+                        <label class="check"><input type="checkbox" class="wc_ptype" data-codes="13" /> Visa Giriş Bordrosu</label>
+                        <label class="check"><input type="checkbox" class="wc_ptype" data-codes="32" /> Nakit Giriş Bordrosu</label>
                         <label class="check"><input type="checkbox" class="wc_ptype" data-codes="83" /> Manuel Fiş</label>
                         <div class="field" style="margin-top:6px">
                             <label>Ek IZAHAT kodları (virgülle)</label>
@@ -215,7 +245,7 @@
         <!-- SAĞ: Canlı kayıt -->
         <div class="panel">
             <div class="card">
-                <h2>Son Otomatik Gönderimler</h2>
+                <h2>📨 Son Otomatik Gönderimler</h2>
                 <div class="muted" id="wc_status" style="font-size:13px; margin-bottom:8px">—</div>
                 <div class="log" id="wc_log" style="max-height:520px"></div>
             </div>

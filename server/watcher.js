@@ -10,6 +10,14 @@
 //    • IZAHAT     hareket tipi kodu (nvarchar)
 //    • TARIH/EVRAKNO/BAKIYE/PARABIRIMI bilgilendirme alanları
 //
+//  DİKKAT: ALACAK>0 her zaman tahsilat değildir (gerçek veri doğrulandı, 2026-06):
+//    • Alış/e-faturası girişi cariye ALACAK satırı yazar (EVRAKNO = fatura
+//      başlığının BELGENO'su → TBLALFATBASLIK/TBLSATFATBASLIK'ta kayıtlı).
+//    • Peşin fatura/fiş aynı EVRAKNO ile BORC (fatura) + ALACAK (otomatik
+//      ödeme) çifti yazar.
+//  Bu satırlar fatura girişidir, tahsilat fişi değil → mesaj atılmaz (sorguda
+//  NOT EXISTS ile elenir). Gerçek tahsilat = cari giriş/kasa/visa fişleri.
+//
 //  Bağımlılıklar dışarıdan enjekte edilir (server.js ile gevşek bağlı):
 //    configure({ getPool, sql, resolveCariContacts, waSend, checkOnWhatsApp, waStatus, baseDir })
 // ═══════════════════════════════════════════════════════════════════════════
@@ -174,6 +182,31 @@ async function tableExists(pool, name) {
     return res.recordset[0].c > 0;
 }
 
+// Fatura başlık tabloları her taramada sorgulanmasın diye varlık bilgisi önbelleğe alınır.
+let tblExistsCache = {};
+async function cachedTableExists(pool, name) {
+    if (!(name in tblExistsCache)) tblExistsCache[name] = await tableExists(pool, name);
+    return tblExistsCache[name];
+}
+
+// Carilerin gerçek kalan borcu: dönem hareket tablosundan SUM(BORC)-SUM(ALACAK)
+// (devir satırları dahil → dönem açılışı + tüm hareketler). Vega'nın kendi ekstre
+// raporu da bakiyeyi aynı formülle hesaplar: SUM(BORC-ALACAK) per FIRMANO.
+// Pozitif = cari bize borçlu, negatif = biz cariye borçluyuz (gerçek DB doğrulandı).
+// TBLCARI.BAKIYE Vega tarafından gecikmeli güncellenebildiği için ödeme anında eski
+// değeri verebiliyor; hareket toplamı, az önce okunan ödeme satırıyla her zaman tutarlıdır.
+async function fetchKalanBorc(pool, tbl, indList) {
+    const map = new Map();
+    const ids = indList.map(n => parseInt(n, 10)).filter(Number.isFinite);
+    if (!ids.length) return map;
+    const rows = (await pool.request().query(`
+        SELECT FIRMANO, CAST(SUM(BORC) - SUM(ALACAK) AS DECIMAL(18,2)) AS NET
+        FROM [${tbl}] WHERE FIRMANO IN (${ids.join(',')}) GROUP BY FIRMANO
+    `)).recordset;
+    rows.forEach(r => map.set(r.FIRMANO, Number(r.NET)));
+    return map;
+}
+
 // ─── Çekirdek: tek tarama ──────────────────────────────────────────────────────
 async function pollOnce() {
     if (polling) return;
@@ -201,38 +234,70 @@ async function pollOnce() {
         const lastSeen = state.lastSeenInd[tbl];
         const codes = (config.izahatCodes || []).map(c => parseInt(c, 10)).filter(Number.isFinite);
         // Daima devir hariç; kod listesi verilmişse o kodlarla sınırla.
-        const devirFilter = ` AND TRY_CAST(IZAHAT AS INT) NOT IN (${DEVIR_CODES.join(',')})`;
+        const devirFilter = ` AND TRY_CAST(h.IZAHAT AS INT) NOT IN (${DEVIR_CODES.join(',')})`;
         const codeFilter = codes.length
-            ? ` AND TRY_CAST(IZAHAT AS INT) IN (${codes.join(',')})`
+            ? ` AND TRY_CAST(h.IZAHAT AS INT) IN (${codes.join(',')})`
             : '';
+
+        // Fatura kaynaklı ALACAK satırlarını ele (fatura girişi tahsilat değildir):
+        //  1) Aynı evrak + cari + günde BORC satırı varsa → peşin fatura/fiş çifti.
+        //  2) EVRAKNO alış/satış fatura başlığında kayıtlıysa → fatura kaydı.
+        const pairFilter = `
+            AND NOT EXISTS (SELECT 1 FROM [${tbl}] b
+                WHERE b.FIRMANO = h.FIRMANO AND b.EVRAKNO = h.EVRAKNO AND b.BORC > 0
+                  AND b.IND <> h.IND AND CONVERT(date, b.TARIH) = CONVERT(date, h.TARIH))`;
+        let faturaFilter = '';
+        for (const [suffix, alias] of [['TBLALFATBASLIK', 'fal'], ['TBLSATFATBASLIK', 'fst']]) {
+            const ft = `F${config.firmaNo}D${config.donemNo}${suffix}`;
+            if (await cachedTableExists(pool, ft)) {
+                faturaFilter += `
+            AND NOT EXISTS (SELECT 1 FROM [${ft}] ${alias}
+                WHERE ${alias}.BELGENO = h.EVRAKNO AND ${alias}.FIRMANO = h.FIRMANO)`;
+            }
+        }
+
+        // Yeni satırların tavanı: fatura/BORC satırları filtrelense de watermark ilerleyebilsin.
+        const rMax = pool.request();
+        rMax.input('last', deps.sql.Int, lastSeen);
+        const newMax = (await rMax.query(`
+            SELECT ISNULL(MAX(IND), @last) AS mx FROM [${tbl}] WHERE IND > @last
+        `)).recordset[0].mx;
 
         const r = pool.request();
         r.input('last', deps.sql.Int, lastSeen);
         r.input('minAmt', deps.sql.Decimal(18, 2), config.minAmount || 0);
         const rows = (await r.query(`
-            SELECT IND, FIRMANO, ALACAK, BAKIYE, EVRAKNO, TARIH, IZAHAT, PARABIRIMI
-            FROM [${tbl}]
-            WHERE IND > @last AND ALACAK > @minAmt${devirFilter}${codeFilter}
-            ORDER BY IND ASC
+            SELECT h.IND, h.FIRMANO, h.ALACAK, h.BAKIYE, h.EVRAKNO, h.TARIH, h.IZAHAT, h.PARABIRIMI
+            FROM [${tbl}] h
+            WHERE h.IND > @last AND h.ALACAK > @minAmt${devirFilter}${codeFilter}${pairFilter}${faturaFilter}
+            ORDER BY h.IND ASC
         `)).recordset;
 
         found = rows.length;
-        if (!found) { lastResult = { sent, skipped, found, note: 'Yeni tahsilat yok' }; return; }
+        if (!found) {
+            if (newMax > lastSeen) { state.lastSeenInd[tbl] = newMax; saveState(); }
+            lastResult = { sent, skipped, found, note: 'Yeni tahsilat yok' };
+            return;
+        }
 
         // Cari iletişim bilgilerini topluca çöz (FIRMANO = TBLCARI.IND)
         const inds = [...new Set(rows.map(x => x.FIRMANO).filter(v => v != null))];
         const contacts = await deps.resolveCariContacts(config.firmaNo, inds); // Map<ind,{name,kod,phone,valid,bakiye}>
+        // Gerçek kalan borç hareket toplamından; TBLCARI.BAKIYE sadece yedek.
+        const borcMap = await fetchKalanBorc(pool, tbl, inds);
 
         // Opsiyonel görsel/video — bir kez oku, tüm alıcılara aynı buffer.
         const media = loadMediaForSend();
 
         let maxInd = lastSeen;
+        let interrupted = false; // waOffline kesintisinde watermark newMax'e çekilmesin
         for (const row of rows) {
             maxInd = Math.max(maxInd, row.IND);
             const c = contacts.get(row.FIRMANO) || {};
-            // Kalan borç = carinin güncel bakiyesi (TBLCARI.BAKIYE). Pozitif = borç.
-            // Cari hareketin BAKIYE kolonu Vega'da NULL → oradan okumak 0 verirdi.
-            const kalanBorc = c.bakiye != null ? c.bakiye : null;
+            // Kalan borç = hareket toplamı (ödeme satırı dahil, anlık tutarlı). Pozitif = borç.
+            // TBLCARI.BAKIYE gecikmeli güncellenebildiğinden sadece yedek olarak kullanılır.
+            const kalanBorc = borcMap.has(row.FIRMANO) ? borcMap.get(row.FIRMANO)
+                : (c.bakiye != null ? c.bakiye : null);
             const base = {
                 ind: row.IND, cariInd: row.FIRMANO, name: c.name || String(row.FIRMANO),
                 kod: c.kod || '', phone: c.phone || null,
@@ -250,6 +315,7 @@ async function pollOnce() {
             if (!waOk.ready) {
                 // WhatsApp bağlı değil → bu satırı henüz işlenmemiş say (watermark'ı ilerletme).
                 maxInd = Math.min(maxInd, row.IND - 1);
+                interrupted = true;
                 skipped++;
                 pushLog({ ...base, status: 'waOffline', error: 'WhatsApp bağlı değil, sonraki taramada denenecek' });
                 break; // sonrakileri de beklet; watermark kesinti noktasına çekilir
@@ -268,7 +334,7 @@ async function pollOnce() {
                 ad: c.name, tutar: fmtAmount(row.ALACAK), kod: c.kod,
                 evrak: row.EVRAKNO || '',
                 tarih: row.TARIH ? new Date(row.TARIH).toLocaleDateString('tr-TR') : '',
-                // Kalan borç carinin güncel bakiyesinden (TBLCARI.BAKIYE). Yoksa boş bırak.
+                // Kalan borç hareket toplamından (ödeme düşülmüş hali). Yoksa boş bırak.
                 bakiye: kalanBorc != null ? fmtAmount(kalanBorc) : '',
                 borc: kalanBorc != null ? fmtAmount(kalanBorc) : '',
             });
@@ -282,6 +348,8 @@ async function pollOnce() {
             await sleep(rand(2500, 6000)); // düşük hacim — küçük insansı gecikme
         }
 
+        // Kesinti yoksa filtrelenen (fatura/BORC) satırların da üzerinden atla.
+        if (!interrupted) maxInd = Math.max(maxInd, newMax);
         if (maxInd > state.lastSeenInd[tbl]) { state.lastSeenInd[tbl] = maxInd; saveState(); }
         lastResult = { sent, skipped, found, note: `${sent} gönderildi, ${skipped} atlandı` };
     } catch (e) {
