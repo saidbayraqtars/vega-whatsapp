@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude update *)",
+      "PowerShell(Get-ChildItem -Recurse -Depth 2 \"C:\\\\Users\\\\saidb\\\\Desktop\\\\projeler\\\\yeni\" | Where-Object { $_.FullName -notmatch 'node_modules' } | Select-Object FullName, Length | Format-Table -AutoSize)",
+      "PowerShell(node \"C:\\\\Users\\\\saidb\\\\Desktop\\\\projeler\\\\yeni\\\\server\\\\_dbcheck.js\")",
+      "PowerShell($b = [System.IO.File]::ReadAllBytes\\(\"C:\\\\Users\\\\saidb\\\\Desktop\\\\projeler\\\\yeni\\\\electron\\\\icon.png\"\\); $w = [System.BitConverter]::ToUInt32\\(\\($b[19..16]\\),0\\); $h = [System.BitConverter]::ToUInt32\\(\\($b[23..20]\\),0\\); \"PNG: ${w}x${h}, $\\($b.Length\\) bytes\"; Test-Path \"C:\\\\Users\\\\saidb\\\\Desktop\\\\projeler\\\\yeni\\\\dist\")",
+      "PowerShell(gh auth status)",
+      "PowerShell(gh api user --jq .login)",
+      "PowerShell(git config --global user.name)",
+      "PowerShell(git config --global user.email)",
+      "PowerShell(git config --global credential.helper)",
+      "PowerShell($fill = \"protocol=https`nhost=github.com`n\" | git credential fill; $tok = \\($fill | Select-String '^password='\\).Line.Substring\\(9\\); $u = Invoke-RestMethod -Uri 'https://api.github.com/user' -Headers @{ Authorization = \"token $tok\"; 'User-Agent' = 'vega' }; \"login: $\\($u.login\\)\"; $scopes = \\(Invoke-WebRequest -Uri 'https://api.github.com/user' -Headers @{ Authorization = \"token $tok\"; 'User-Agent' = 'vega' } -UseBasicParsing\\).Headers['X-OAuth-Scopes']; \"scopes: $scopes\")",
+      "Bash(git credential *)"
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+# Bağımlılıklar / derleme çıktıları
+node_modules/
+dist/
+server/build/
+
+# Çalışma verileri — ASLA commit edilmez:
+# config.json şifreli DB parolası + PIN hash içerir; data/ WhatsApp oturumu içerir.
+config.json
+server/config.json
+data/
+server/data/
+
+# Eski pkg exe (artık Electron kullanılıyor)
+VegaWhatsApp.exe
+
+# Loglar / geçici
+*.log
+server/_x/
+_dbcheck.js

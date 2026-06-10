@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vega Toplu WhatsApp</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ─── KURULUM ─── -->
+<div id="setupScreen" class="center hidden">
+    <div class="card narrow">
+        <h1>İlk Kurulum</h1>
+        <p class="sub">VegaDB (SQL Server) bilgileri ve 6 haneli PIN. Bilgiler şifrelenip kaydedilir.</p>
+        <div class="row">
+            <div class="field"><label>Sunucu</label><input id="su_server" value="localhost" /></div>
+            <div class="field" style="flex:.5"><label>Port</label><input id="su_port" value="1433" /></div>
+        </div>
+        <div class="field"><label>Veritabanı</label><input id="su_db" value="VegaDB" /></div>
+        <div class="row">
+            <div class="field"><label>Kullanıcı</label><input id="su_user" value="sa" /></div>
+            <div class="field"><label>Parola</label><input id="su_pass" type="password" /></div>
+        </div>
+        <div class="field"><label>PIN (6 hane)</label><input id="su_pin" maxlength="6" inputmode="numeric" placeholder="••••••" /></div>
+        <button class="btn" id="su_btn">Bağlan ve Kaydet</button>
+        <div class="err" id="su_err"></div>
+    </div>
+</div>
+
+<!-- ─── PIN GİRİŞ ─── -->
+<div id="pinScreen" class="center hidden">
+    <div class="card narrow" style="text-align:center">
+        <h1>Hoş Geldiniz</h1>
+        <p class="sub">Devam etmek için PIN kodunuzu girin.</p>
+        <input id="pin_input" type="password" maxlength="6" inputmode="numeric" placeholder="••••••"
+               style="text-align:center; letter-spacing:.5em; font-size:26px" />
+        <div class="err" id="pin_err"></div>
+        <button class="btn ghost sm" id="pin_reset" style="width:100%; margin-top:14px">Ayarları Sıfırla</button>
+    </div>
+</div>
+
+<!-- ─── ANA EKRAN ─── -->
+<div id="app" class="hidden">
+    <div class="topbar">
+        <div class="brand">Vega <span>WhatsApp</span></div>
+        <nav class="tabs">
+            <button class="tab active" id="tabBulk" data-view="viewBulk">Toplu Mesaj</button>
+            <button class="tab" id="tabWatcher" data-view="viewWatcher">Otomatik Tahsilat</button>
+        </nav>
+        <span class="pill"><span class="dot" id="dbDot"></span> Veritabanı</span>
+        <span class="pill"><span class="dot" id="waDot"></span> <span id="waLabel">WhatsApp</span></span>
+        <div class="spacer"></div>
+        <button class="btn ghost sm" id="waBtn">WhatsApp Bağlantısı</button>
+        <button class="btn ghost sm" id="logoutBtn">Çıkış</button>
+    </div>
+
+    <div class="wrap" id="viewBulk">
+        <!-- SOL: Cari seçimi -->
+        <div class="card">
+            <h2>Cariler</h2>
+            <div class="toolbar">
+                <select id="firmaSel"></select>
+                <input type="text" id="searchInput" placeholder="Ünvan, kod veya telefon ara..." />
+                <button class="btn sm" id="searchBtn">Ara</button>
+                <label class="check"><input type="checkbox" id="onlyPhone" checked /> Telefonu olanlar</label>
+            </div>
+
+            <div class="tablewrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th class="c"><input type="checkbox" id="selAll" title="Sayfayı seç" /></th>
+                            <th>Ünvan</th>
+                            <th>Kod</th>
+                            <th>Telefon</th>
+                        </tr>
+                    </thead>
+                    <tbody id="cariBody">
+                        <tr><td colspan="4" class="muted" style="padding:18px">Firma seçip arayın.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="selbar">
+                <span class="count" id="loadInfo"></span>
+                <div class="spacer" style="flex:1"></div>
+                <span class="count">Seçili: <b id="selCount">0</b></span>
+                <button class="btn ghost sm" id="selPage">Sayfayı Seç</button>
+                <button class="btn ghost sm" id="selClear">Temizle</button>
+            </div>
+        </div>
+
+        <!-- SAĞ: Mesaj -->
+        <div class="panel">
+            <div class="card">
+                <h2>Mesaj Oluştur</h2>
+                <div class="field">
+                    <label>Mesaj metni</label>
+                    <textarea id="msgText" placeholder="Merhaba {ad}, ..."></textarea>
+                    <div class="chips">
+                        <span class="chip" data-var="{ad}">{ad}</span>
+                        <span class="chip" data-var="{unvan}">{unvan}</span>
+                        <span class="chip" data-var="{kod}">{kod}</span>
+                    </div>
+                    <div class="hint">Değişkenler her cariye göre kişiselleştirilir.</div>
+                </div>
+
+                <div class="field">
+                    <label>Görsel / Video (opsiyonel)</label>
+                    <input type="file" id="mediaInput" accept="image/*,video/*" />
+                    <div class="media-preview" id="mediaPreview"></div>
+                </div>
+
+                <details class="adv">
+                    <summary>Gönderim ayarları (bot koruması)</summary>
+                    <div class="grid2">
+                        <div><label>Min gecikme (sn)</label><input id="p_min" type="number" value="8" /></div>
+                        <div><label>Max gecikme (sn)</label><input id="p_max" type="number" value="22" /></div>
+                        <div><label>Parti boyutu</label><input id="p_batch" type="number" value="25" /></div>
+                        <div><label>Günlük tavan</label><input id="p_cap" type="number" value="200" /></div>
+                        <div><label>Parti molası min (sn)</label><input id="p_pmin" type="number" value="60" /></div>
+                        <div><label>Parti molası max (sn)</label><input id="p_pmax" type="number" value="150" /></div>
+                    </div>
+                    <label class="check" style="margin-top:10px"><input type="checkbox" id="p_typing" checked /> "Yazıyor..." simülasyonu</label>
+                    <label class="check"><input type="checkbox" id="p_verify" checked /> Numara WhatsApp'ta mı kontrol et</label>
+                    <label class="check"><input type="checkbox" id="p_shuffle" /> Sırayı karıştır</label>
+                </details>
+
+                <div class="est" id="estimate"></div>
+                <button class="btn green" id="sendBtn" style="margin-top:14px">Gönder</button>
+                <div class="err" id="sendErr"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ─── OTOMATİK TAHSİLAT ─── -->
+    <div class="wrap" id="viewWatcher" style="display:none">
+        <!-- SOL: Ayarlar -->
+        <div class="card">
+            <h2>Otomatik Tahsilat Bildirimi
+                <span class="pill" style="float:right"><span class="dot" id="wcDot"></span> <span id="wcState">Pasif</span></span>
+            </h2>
+            <p class="sub">Seçilen firma/dönemin cari hareketleri taranır; yeni <b>tahsilat</b> (ödeme alındı) bulununca cariye otomatik WhatsApp gönderilir.</p>
+
+            <div class="row">
+                <div class="field"><label>Firma</label><select id="wc_firma"></select></div>
+                <div class="field"><label>Dönem</label><select id="wc_donem"></select></div>
+            </div>
+
+            <div class="field">
+                <label>Mesaj şablonu</label>
+                <textarea id="wc_template" placeholder="Sayın {ad}, {tutar} TL ödemeniz alınmıştır."></textarea>
+                <div class="chips">
+                    <span class="chip" data-wcvar="{ad}">{ad}</span>
+                    <span class="chip" data-wcvar="{tutar}">{tutar}</span>
+                    <span class="chip" data-wcvar="{kod}">{kod}</span>
+                    <span class="chip" data-wcvar="{evrak}">{evrak}</span>
+                    <span class="chip" data-wcvar="{tarih}">{tarih}</span>
+                    <span class="chip" data-wcvar="{bakiye}">{bakiye}</span>
+                </div>
+                <div class="hint">{tutar} = tahsilat tutarı, {bakiye} = işlem sonrası bakiye.</div>
+            </div>
+
+            <details class="adv">
+                <summary>Gelişmiş ayarlar</summary>
+                <div class="grid2">
+                    <div><label>Tarama sıklığı (sn)</label><input id="wc_interval" type="number" value="30" min="10" /></div>
+                    <div><label>Min tutar (TL)</label><input id="wc_min" type="number" value="0" min="0" /></div>
+                </div>
+                <div class="field" style="margin-top:8px">
+                    <label>Tahsilat IZAHAT kodları (virgülle, boş = tümü)</label>
+                    <input id="wc_codes" value="" placeholder="boş bırak = tüm tahsilatlar (devir hariç)" />
+                    <div class="hint">Tahsilat = cari ALACAK girişi. Boş bırakırsan tüm ödemeler (yıl başı devri hariç) sayılır. Belirli tiplere daraltmak için kod yaz. <a href="#" id="wc_showCodes">Bu dönemdeki kodları göster</a></div>
+                    <div id="wc_codesList" class="muted" style="font-size:12px; margin-top:6px"></div>
+                </div>
+                <label class="check" style="margin-top:8px"><input type="checkbox" id="wc_verify" checked /> Numara WhatsApp'ta mı kontrol et</label>
+                <label class="check"><input type="checkbox" id="wc_typing" checked /> "Yazıyor..." simülasyonu</label>
+            </details>
+
+            <div class="selbar" style="margin-top:14px">
+                <button class="btn green" id="wc_save">Kaydet ve Başlat</button>
+                <button class="btn danger" id="wc_stop" style="display:none">Durdur</button>
+                <div class="spacer" style="flex:1"></div>
+                <span class="count" id="wc_info"></span>
+            </div>
+            <div class="err" id="wc_err"></div>
+        </div>
+
+        <!-- SAĞ: Canlı kayıt -->
+        <div class="panel">
+            <div class="card">
+                <h2>Son Otomatik Gönderimler</h2>
+                <div class="muted" id="wc_status" style="font-size:13px; margin-bottom:8px">—</div>
+                <div class="log" id="wc_log" style="max-height:520px"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ─── WhatsApp QR MODAL ─── -->
+<div id="waModal" class="overlay hidden">
+    <div class="modal" style="max-width:360px; text-align:center">
+        <h2>WhatsApp Bağlantısı</h2>
+        <div id="waContent" class="qrbox">
+            <p class="muted">Durum yükleniyor...</p>
+        </div>
+        <div class="actions">
+            <button class="btn ghost" id="waRefresh">Oturumu Sıfırla</button>
+            <button class="btn" id="waClose">Kapat</button>
+        </div>
+    </div>
+</div>
+
+<!-- ─── GÖNDERİM İLERLEME MODAL ─── -->
+<div id="sendModal" class="overlay hidden">
+    <div class="modal">
+        <h2>Gönderim</h2>
+        <div class="stats">
+            <span>Toplam: <b id="s_total">0</b></span>
+            <span class="st sent">Gönderildi: <b id="s_sent">0</b></span>
+            <span class="st failed">Başarısız: <b id="s_failed">0</b></span>
+            <span class="st info">Atlandı: <b id="s_skipped">0</b></span>
+        </div>
+        <div class="bar"><div id="s_bar"></div></div>
+        <div id="s_status" class="muted" style="font-size:13px"></div>
+        <div class="log" id="s_log"></div>
+        <div class="actions">
+            <button class="btn danger" id="s_cancel">Durdur</button>
+            <button class="btn" id="s_done" style="display:none">Kapat</button>
+        </div>
+    </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
