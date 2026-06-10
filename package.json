@@ -32,6 +32,8 @@
       "server/**",
       "!server/build/**",
       "!server/data/**",
+      "!server/node_modules/**",
+      "!server/config.json",
       "!server/server.log",
       "!server/_x/**"
     ],
@@ -52,6 +54,12 @@
     "electron-builder": "^25.1.8"
   },
   "dependencies": {
-    "electron-updater": "^6.8.9"
+    "@whiskeysockets/baileys": "^6.7.18",
+    "cors": "^2.8.5",
+    "electron-updater": "^6.8.9",
+    "express": "^4.21.0",
+    "mssql": "^11.0.1",
+    "multer": "^1.4.5-lts.1",
+    "qrcode": "^1.5.4"
   }
 }
