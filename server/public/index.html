@@ -152,6 +152,7 @@
                     <label class="check" style="margin-top:10px"><input type="checkbox" id="p_typing" checked /> "Yazıyor..." simülasyonu</label>
                     <label class="check"><input type="checkbox" id="p_verify" checked /> Numara WhatsApp'ta mı kontrol et</label>
                     <label class="check"><input type="checkbox" id="p_shuffle" /> Sırayı karıştır</label>
+                    <label class="check"><input type="checkbox" id="bulkAllPhones" /> Cari kartındaki <b>tüm telefon numaralarına</b> gönder (Telefon 1/2/3)</label>
                 </details>
 
                 <div class="est" id="estimate"></div>
@@ -191,8 +192,9 @@
                     <span class="chip" data-wcvar="{tarih}">{tarih}</span>
                     <span class="chip" data-wcvar="{bakiye}">{bakiye}</span>
                     <span class="chip" data-wcvar="{borc}">{borc}</span>
+                    <span class="chip" data-wcvar="{durum}">{durum}</span>
                 </div>
-                <div class="hint">{tutar} = bu ödeme tutarı, {bakiye} = {borc} = carinin güncel kalan borcu (pozitif = borçlu).</div>
+                <div class="hint">{tutar} = bu ödeme tutarı, {bakiye} = {borc} = carinin güncel kalan bakiyesi (işaretsiz), {durum} = bakiyenin yönü: <b>Borç</b> (cari borçlu) veya <b>Alacak</b> (cari alacaklı).</div>
             </div>
 
             <div class="field">
@@ -231,6 +233,7 @@
                 </div>
                 <label class="check" style="margin-top:8px"><input type="checkbox" id="wc_verify" checked /> Numara WhatsApp'ta mı kontrol et</label>
                 <label class="check"><input type="checkbox" id="wc_typing" checked /> "Yazıyor..." simülasyonu</label>
+                <label class="check"><input type="checkbox" id="wc_allPhones" /> Cari kartındaki <b>tüm telefon numaralarına</b> gönder (Telefon 1/2/3)</label>
             </details>
 
             <div class="selbar" style="margin-top:14px">
@@ -286,6 +289,18 @@
             <button class="btn ghost" id="lic_recheck">Yeniden Denetle</button>
             <button class="btn green" id="lic_activate">Etkinleştir</button>
             <button class="btn" id="lic_close">Kapat</button>
+        </div>
+    </div>
+</div>
+
+<!-- ─── GÖNDERİLEN MESAJ MODAL (otomatik tahsilat log'undan) ─── -->
+<div id="msgModal" class="overlay hidden">
+    <div class="modal" style="max-width:440px">
+        <h2>Gönderilen Mesaj</h2>
+        <div class="muted" id="msgModalMeta" style="font-size:13px; margin-bottom:10px"></div>
+        <div id="msgModalText" style="white-space:pre-wrap; font-size:14px; line-height:1.6; padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--bg3); overflow:auto"></div>
+        <div class="actions">
+            <button class="btn" id="msgModalClose">Kapat</button>
         </div>
     </div>
 </div>

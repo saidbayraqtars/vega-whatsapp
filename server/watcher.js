@@ -51,9 +51,11 @@ const DEFAULT_CONFIG = {
     // (devir hariç). Belirli kodlara daraltmak istenirse buraya yazılır (örn [13,20]).
     izahatCodes: [],
     minAmount: 0,
-    template: 'Sayın {ad}, {tutar} TL ödemeniz alınmış ve kaydedilmiştir. Güncel bakiyeniz: {bakiye} TL. Teşekkür ederiz.',
+    template: 'Sayın {ad}, {tutar} TL ödemeniz alınmış ve kaydedilmiştir. Güncel bakiyeniz: {bakiye} TL ({durum}). Teşekkür ederiz.',
     verifyOnWhatsApp: true,
     simulateTyping: true,
+    // Cari kartındaki tüm geçerli numaralara (TELEFON1/2/3 vb.) gönder; kapalıysa sadece birincil.
+    sendAllPhones: false,
     // Opsiyonel görsel/video: data/ altına kaydedilen dosya. { path, mime, kind, name } | null
     media: null,
 };
@@ -169,7 +171,9 @@ function renderTemplate(tpl, vars) {
         .replace(/\{evrak\}/gi, vars.evrak || '')
         .replace(/\{tarih\}/gi, vars.tarih || '')
         .replace(/\{bakiye\}/gi, vars.bakiye || '')
-        .replace(/\{borc\}/gi, vars.borc || '');     // kalan borç = {bakiye} ile aynı (pozitif bakiye)
+        .replace(/\{borc\}/gi, vars.borc || '')      // kalan bakiye = {bakiye} ile aynı (işaretsiz tutar)
+        .replace(/\{durum\}/gi, vars.durum || '')    // 'Borç' / 'Alacak' (bakiye 0 ise boş)
+        .replace(/ ?\(\s*\)/g, '');                  // bakiye 0 → "({durum})" boş parantez kalmasın
 }
 
 async function tableExists(pool, name) {
@@ -182,11 +186,16 @@ async function tableExists(pool, name) {
     return res.recordset[0].c > 0;
 }
 
-// Fatura başlık tabloları her taramada sorgulanmasın diye varlık bilgisi önbelleğe alınır.
-let tblExistsCache = {};
+// Fatura başlık tabloları her taramada sorgulanmasın diye varlık bilgisi önbelleğe
+// alınır; günde 1 kez tazelenir (uygulama haftalarca açık kalabiliyor — tray).
+const SCHEMA_CACHE_MS = 24 * 60 * 60 * 1000;
+let tblExistsCache = {};   // name -> { v, at }
 async function cachedTableExists(pool, name) {
-    if (!(name in tblExistsCache)) tblExistsCache[name] = await tableExists(pool, name);
-    return tblExistsCache[name];
+    const hit = tblExistsCache[name];
+    if (hit && Date.now() - hit.at < SCHEMA_CACHE_MS) return hit.v;
+    const v = await tableExists(pool, name);
+    tblExistsCache[name] = { v, at: Date.now() };
+    return v;
 }
 
 // Carilerin gerçek kalan borcu: dönem hareket tablosundan SUM(BORC)-SUM(ALACAK)
@@ -298,11 +307,14 @@ async function pollOnce() {
             // TBLCARI.BAKIYE gecikmeli güncellenebildiğinden sadece yedek olarak kullanılır.
             const kalanBorc = borcMap.has(row.FIRMANO) ? borcMap.get(row.FIRMANO)
                 : (c.bakiye != null ? c.bakiye : null);
+            // Bakiye işaretsiz yazılır; yönü {durum} söyler (pozitif = cari borçlu).
+            const bakiyeStr = kalanBorc != null ? fmtAmount(Math.abs(kalanBorc)) : '';
+            const durum = kalanBorc == null ? '' : (kalanBorc > 0 ? 'Borç' : kalanBorc < 0 ? 'Alacak' : '');
             const base = {
                 ind: row.IND, cariInd: row.FIRMANO, name: c.name || String(row.FIRMANO),
                 kod: c.kod || '', phone: c.phone || null,
                 tutar: fmtAmount(row.ALACAK), evrak: row.EVRAKNO || '',
-                bakiye: kalanBorc != null ? fmtAmount(kalanBorc) : '',
+                bakiye: bakiyeStr, bakiyeDurum: durum,
             };
 
             if (!c.phone || !c.valid) {
@@ -321,31 +333,35 @@ async function pollOnce() {
                 break; // sonrakileri de beklet; watermark kesinti noktasına çekilir
             }
 
-            if (config.verifyOnWhatsApp) {
-                const chk = await deps.checkOnWhatsApp(c.phone);
-                if (!chk.exists) {
-                    skipped++;
-                    pushLog({ ...base, status: 'notOnWhatsApp', error: chk.error || 'WhatsApp kullanıcısı değil' });
-                    continue;
-                }
-            }
-
             const text = renderTemplate(config.template, {
                 ad: c.name, tutar: fmtAmount(row.ALACAK), kod: c.kod,
                 evrak: row.EVRAKNO || '',
                 tarih: row.TARIH ? new Date(row.TARIH).toLocaleDateString('tr-TR') : '',
-                // Kalan borç hareket toplamından (ödeme düşülmüş hali). Yoksa boş bırak.
-                bakiye: kalanBorc != null ? fmtAmount(kalanBorc) : '',
-                borc: kalanBorc != null ? fmtAmount(kalanBorc) : '',
+                bakiye: bakiyeStr, borc: bakiyeStr, durum,
             });
 
-            const res = await deps.waSend(c.phone, text, media, {
-                simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400),
-            });
-            if (res.success) { sent++; pushLog({ ...base, status: 'sent' }); }
-            else { skipped++; pushLog({ ...base, status: 'failed', error: res.error }); }
+            // Seçenek açıksa karttaki tüm geçerli numaralara, değilse sadece birincile.
+            const targets = (config.sendAllPhones && Array.isArray(c.phones) && c.phones.length)
+                ? c.phones : [c.phone];
+            for (const phone of targets) {
+                if (config.verifyOnWhatsApp) {
+                    const chk = await deps.checkOnWhatsApp(phone);
+                    if (!chk.exists) {
+                        skipped++;
+                        pushLog({ ...base, phone, status: 'notOnWhatsApp', error: chk.error || 'WhatsApp kullanıcısı değil' });
+                        continue;
+                    }
+                }
 
-            await sleep(rand(2500, 6000)); // düşük hacim — küçük insansı gecikme
+                const res = await deps.waSend(phone, text, media, {
+                    simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400),
+                });
+                // Gönderilen metin log'a yazılır → arayüzde popup'ta görüntülenir.
+                if (res.success) { sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
+                else { skipped++; pushLog({ ...base, phone, status: 'failed', error: res.error, message: text }); }
+
+                await sleep(rand(2500, 6000)); // düşük hacim — küçük insansı gecikme
+            }
         }
 
         // Kesinti yoksa filtrelenen (fatura/BORC) satırların da üzerinden atla.
@@ -409,6 +425,7 @@ function getStatus() {
         izahatCodes: config.izahatCodes, minAmount: config.minAmount,
         template: config.template,
         verifyOnWhatsApp: config.verifyOnWhatsApp, simulateTyping: config.simulateTyping,
+        sendAllPhones: config.sendAllPhones === true,
         media: config.media ? { name: config.media.name, kind: config.media.kind } : null,
         lastPollAt, lastError, lastResult,
         watermark: tableName() ? (state.lastSeenInd[tableName()] ?? null) : null,

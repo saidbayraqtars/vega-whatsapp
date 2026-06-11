@@ -11,7 +11,8 @@ async function forgetPin() { if (desktop?.isElectron) { try { await desktop.clea
 const state = {
     firmaNo: null,
     rows: [],                 // ekranda görünen cariler
-    selected: new Map(),      // ind -> {name, unvan, kod, phone}
+    selected: new Map(),      // ind -> {name, unvan, kod, phone, phones}
+    cariLoadedAt: 0,          // cari kart bilgisi en son ne zaman çekildi (günlük tazeleme)
     waReady: false,
     waPollTimer: null,
     currentJob: null,
@@ -125,9 +126,16 @@ async function loadCari() {
         return;
     }
     state.rows = r.data;
+    state.cariLoadedAt = Date.now();
     renderCari();
     $('loadInfo').textContent = `${r.data.length} kayıt gösteriliyor${r.total > r.data.length ? ` (toplam ${r.total}, daraltmak için arayın)` : ''}`;
 }
+
+// Cari kart bilgileri günde 1 kez DB'den tazelenir (uygulama tray'de açık kalsa bile
+// telefon/ünvan değişiklikleri en geç 24 saatte ekrana yansır). Seçimler korunur.
+setInterval(() => {
+    if (state.firmaNo && state.cariLoadedAt && Date.now() - state.cariLoadedAt > 24 * 60 * 60 * 1000) loadCari();
+}, 60 * 60 * 1000);
 
 function renderCari() {
     const body = $('cariBody');
@@ -153,9 +161,12 @@ function renderCari() {
     updateSelCount();
 }
 
+// phones = karttaki tüm geçerli numaralar ("tüm numaralara gönder" seçeneği için).
+const selObj = (row) => ({ ind: row.ind, name: row.unvan, unvan: row.unvan, kod: row.kod, phone: row.phone, phones: row.phones || [] });
+
 function toggleSelect(row, on, tr) {
     if (on && row.phone) {
-        state.selected.set(row.ind, { ind: row.ind, name: row.unvan, unvan: row.unvan, kod: row.kod, phone: row.phone });
+        state.selected.set(row.ind, selObj(row));
         tr && tr.classList.add('sel');
     } else {
         state.selected.delete(row.ind);
@@ -165,11 +176,11 @@ function toggleSelect(row, on, tr) {
 }
 
 $('selAll').onchange = (e) => {
-    state.rows.forEach(row => { if (row.phone) state.selected.set(row.ind, { ind: row.ind, name: row.unvan, unvan: row.unvan, kod: row.kod, phone: row.phone }); });
+    state.rows.forEach(row => { if (row.phone) state.selected.set(row.ind, selObj(row)); });
     if (!e.target.checked) state.rows.forEach(row => state.selected.delete(row.ind));
     renderCari();
 };
-$('selPage').onclick = () => { state.rows.forEach(row => { if (row.phone) state.selected.set(row.ind, { ind: row.ind, name: row.unvan, unvan: row.unvan, kod: row.kod, phone: row.phone }); }); renderCari(); };
+$('selPage').onclick = () => { state.rows.forEach(row => { if (row.phone) state.selected.set(row.ind, selObj(row)); }); renderCari(); };
 $('selClear').onclick = () => { state.selected.clear(); renderCari(); };
 
 function updateSelCount() {
@@ -216,8 +227,16 @@ function getPacing() {
     };
 }
 
+// "Tüm numaralara gönder" açıksa hedef sayısı = seçili carilerin numara toplamı.
+function countBulkTargets() {
+    if (!$('bulkAllPhones').checked) return state.selected.size;
+    let n = 0;
+    state.selected.forEach(r => { n += (r.phones && r.phones.length) ? r.phones.length : 1; });
+    return n;
+}
+
 function updateEstimate() {
-    const n = Math.min(state.selected.size, +$('p_cap').value);
+    const n = Math.min(countBulkTargets(), +$('p_cap').value);
     if (!n) { $('estimate').textContent = ''; return; }
     const p = getPacing();
     const avgDelay = (p.minDelayMs + p.maxDelayMs) / 2;
@@ -228,6 +247,7 @@ function updateEstimate() {
     $('estimate').textContent = `~${n} mesaj, tahmini süre ~${min} dakika (bot koruması gecikmeleriyle).`;
 }
 ['p_min', 'p_max', 'p_batch', 'p_cap', 'p_pmin', 'p_pmax'].forEach(id => $(id).oninput = updateEstimate);
+$('bulkAllPhones').onchange = updateEstimate;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  WhatsApp durum / QR
@@ -281,8 +301,14 @@ $('logoutBtn').onclick = async () => { await api('/reset', { method: 'POST' }); 
 // ═══════════════════════════════════════════════════════════════════════════
 $('sendBtn').onclick = async () => {
     $('sendErr').textContent = '';
-    const recipients = [...state.selected.values()];
+    let recipients = [...state.selected.values()];
     if (!recipients.length) { $('sendErr').textContent = 'Önce cari seçin.'; return; }
+    // Seçenek açıksa her cari, karttaki numara sayısı kadar alıcıya açılır
+    // (sunucu aynı numarayı zaten tekilleştirir).
+    if ($('bulkAllPhones').checked) {
+        recipients = recipients.flatMap(r =>
+            ((r.phones && r.phones.length) ? r.phones : [r.phone]).map(p => ({ ...r, phone: p })));
+    }
     if (!state.waReady) { $('sendErr').textContent = 'WhatsApp bağlı değil. Sağ üstten QR okutun.'; $('waModal').classList.remove('hidden'); pollWa(); return; }
     const message = $('msgText').value;
     const media = $('mediaInput').files[0];
@@ -468,6 +494,7 @@ async function loadWatcherConfig() {
     applyIzahatCodesToUI(s.izahatCodes || []);
     $('wc_verify').checked = s.verifyOnWhatsApp !== false;
     $('wc_typing').checked = s.simulateTyping !== false;
+    $('wc_allPhones').checked = s.sendAllPhones === true;
     renderWatcherMedia(s.media);
     renderWatcherState(s);
 }
@@ -567,6 +594,7 @@ function collectWatcherConfig() {
         izahatCodes: collectWatcherIzahatCodes(),
         verifyOnWhatsApp: $('wc_verify').checked,
         simulateTyping: $('wc_typing').checked,
+        sendAllPhones: $('wc_allPhones').checked,
     };
 }
 
@@ -620,6 +648,8 @@ $('wc_stop').onclick = async () => {
     renderWatcherState(r.status);
 };
 
+let wcLogEntries = []; // popup'ta mesaj gösterimi için son log (index ile erişilir)
+
 async function refreshWatcherLog() {
     try {
         const r = await api('/watcher/log');
@@ -627,20 +657,36 @@ async function refreshWatcherLog() {
         renderWatcherState(r.status);
         const box = $('wc_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz otomatik gönderim yok.</div>'; return; }
+        wcLogEntries = r.log;
         const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı' };
-        box.innerHTML = r.log.map(e => `
+        box.innerHTML = r.log.map((e, i) => `
             <div class="logline">
                 <span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
                     ${e.tutar ? `<b>${esc(e.tutar)} TL</b>` : ''}
-                    ${e.bakiye ? `<span class="muted">bakiye: ${esc(e.bakiye)} TL</span>` : ''}
+                    ${e.bakiye ? `<span class="muted">bakiye: ${esc(e.bakiye)} TL${e.bakiyeDurum ? ` <b>${esc(e.bakiyeDurum)}</b>` : ''}</span>` : ''}
                     ${e.evrak ? `<span class="muted">(${esc(e.evrak)})</span>` : ''}
                     ${e.error ? `<span class="muted">— ${esc(e.error)}</span>` : ''}
                     <span class="muted" style="font-size:11px">${e.at ? new Date(e.at).toLocaleTimeString('tr-TR') : ''}</span>
+                    ${e.message ? `<a href="#" class="wc_msg" data-i="${i}">mesajı gör</a>` : ''}
                 </span>
                 <span class="st ${e.status === 'sent' ? 'sent' : (e.status === 'failed' ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>
             </div>`).join('');
+        box.querySelectorAll('.wc_msg').forEach(a => a.onclick = (ev) => {
+            ev.preventDefault();
+            showSentMessage(wcLogEntries[+a.dataset.i]);
+        });
     } catch { /* yok say */ }
 }
+
+// Gönderilen mesajın tam metni sadece popup'ta gösterilir (log satırı kalabalıklaşmasın).
+function showSentMessage(e) {
+    if (!e || !e.message) return;
+    const bits = [e.name, e.phone, e.at ? new Date(e.at).toLocaleString('tr-TR') : ''].filter(Boolean);
+    $('msgModalMeta').textContent = bits.join('  ·  ');
+    $('msgModalText').textContent = e.message;
+    $('msgModal').classList.remove('hidden');
+}
+$('msgModalClose').onclick = () => $('msgModal').classList.add('hidden');
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Lisans (çevrimiçi lisans altyapısı — scaffold; şu an kısıtlamaz)

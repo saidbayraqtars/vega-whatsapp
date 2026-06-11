@@ -210,9 +210,13 @@ app.get('/api/firmalar', async (req, res) => {
 });
 
 // ─── Cari tablosundaki iletişim sütunlarını otomatik tespit ──────────────────
-const phoneColCache = {}; // firmaNo -> { table, phoneCols, emailCols, all }
+// Şema bilgisi günde 1 kez tazelenir: uygulama tray'de haftalarca açık kalabiliyor,
+// cari kart yapısı değişirse (yeni telefon kolonu vb.) en geç 24 saatte yakalanır.
+const CARI_SCHEMA_TTL_MS = 24 * 60 * 60 * 1000;
+const phoneColCache = {}; // firmaNo -> { info: { table, phoneCols, emailCols, all }, at }
 async function detectCariColumns(firmaNo) {
-    if (phoneColCache[firmaNo]) return phoneColCache[firmaNo];
+    const hit = phoneColCache[firmaNo];
+    if (hit && Date.now() - hit.at < CARI_SCHEMA_TTL_MS) return hit.info;
     const table = `F${firmaNo}TBLCARI`;
     const r = pool.request();
     r.input('tbl', sql.NVarChar, table);
@@ -251,7 +255,7 @@ async function detectCariColumns(firmaNo) {
         hasFirmakodu: colSet.has('FIRMAKODU'),
         phoneCols, emailCols, all: cols,
     };
-    phoneColCache[firmaNo] = info;
+    phoneColCache[firmaNo] = { info, at: Date.now() };
     return info;
 }
 
@@ -408,6 +412,8 @@ async function resolveCariContacts(firmaNo, indList) {
         const primary = normalized.find(isLikelyValid) || normalized[0] || null;
         map.set(row.IND, {
             name: row.UNVAN, kod: row.KOD, phone: primary,
+            // Karttaki tüm geçerli numaralar (TELEFON1/2/3, YGSM...) — "tümüne gönder" seçeneği için.
+            phones: normalized.filter(isLikelyValid),
             valid: primary ? isLikelyValid(primary) : false,
             bakiye: row.BAKIYE != null ? Number(row.BAKIYE) : null,
         });
@@ -456,7 +462,7 @@ app.get('/api/watcher', (req, res) => {
 });
 
 app.post('/api/watcher', (req, res) => {
-    const allowed = ['firmaNo', 'donemNo', 'intervalSec', 'izahatCodes', 'minAmount', 'template', 'verifyOnWhatsApp', 'simulateTyping'];
+    const allowed = ['firmaNo', 'donemNo', 'intervalSec', 'izahatCodes', 'minAmount', 'template', 'verifyOnWhatsApp', 'simulateTyping', 'sendAllPhones'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
     const prev = watcher.getConfig();

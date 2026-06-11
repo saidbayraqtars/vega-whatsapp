@@ -301,6 +301,7 @@ textarea { min-height: 130px; resize: vertical; line-height: 1.55; }
 }
 .logline { padding: 6px 8px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
 .logline:last-child { border-bottom: none; }
+.logline a { color: var(--accent); font-size: 12px; white-space: nowrap; }
 .logline .st { font-weight: 700; white-space: nowrap; font-size: 12px; }
 .st.sent { color: var(--primary); }
 .st.failed, .st.invalid, .st.notOnWhatsApp { color: var(--danger); }
