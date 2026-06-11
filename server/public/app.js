@@ -369,6 +369,12 @@ function openSendModal(jobId, total) {
         } else if (d.type === 'batchPause') {
             $('s_status').textContent = `Parti molası: ${Math.round(d.ms / 1000)} sn (${d.after} gönderildi)...`;
             addLogRaw(`⏸ Parti molası ${Math.round(d.ms / 1000)} sn`, 'info');
+        } else if (d.type === 'waDisconnected') {
+            $('s_status').textContent = 'WhatsApp bağlantısı koptu — bağlanınca devam edilecek...';
+            addLogRaw('⚠ Bağlantı koptu, kalan mesajlar sırada bekliyor', 'info');
+        } else if (d.type === 'waReconnected') {
+            $('s_status').textContent = 'Yeniden bağlandı, gönderim sürüyor...';
+            addLogRaw('✓ Yeniden bağlandı, gönderim devam ediyor', 'info');
         } else if (d.type === 'capReached') {
             addLogRaw(`Günlük tavana ulaşıldı (${d.cap})`, 'info');
         } else if (d.type === 'cancelled') {

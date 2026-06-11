@@ -47,6 +47,32 @@ const bumpDailySent = () => {
 };
 const getDailySent = () => (dailyStats.date === todayKey() ? dailyStats.sent : 0);
 
+// ─── Bağlantı bekleyicileri ──────────────────────────────────────────────────
+// Bağlantı koptuğunda gönderim döngüleri burada bekler; "open" gelince hepsi
+// uyandırılır. Böylece mesajlar kaybolmaz, sırada birikir ve bağlanınca akar.
+let readyWaiters = [];
+const notifyReady = () => {
+    const waiters = readyWaiters;
+    readyWaiters = [];
+    for (const resolve of waiters) resolve(true);
+};
+// isReady olana kadar bekle. timeoutMs > 0 verilirse süre dolunca false döner
+// (çağıran taraf iptal kontrolü yapıp tekrar bekleyebilsin diye).
+const waitForReady = (timeoutMs = 0) => {
+    if (isReady) return Promise.resolve(true);
+    return new Promise((resolve) => {
+        let timer = null;
+        const entry = (ok) => { if (timer) clearTimeout(timer); resolve(ok); };
+        if (timeoutMs > 0) {
+            timer = setTimeout(() => {
+                readyWaiters = readyWaiters.filter((w) => w !== entry);
+                resolve(false);
+            }, timeoutMs);
+        }
+        readyWaiters.push(entry);
+    });
+};
+
 // Yeniden başlatmayı tek timer'la debounce et (hata döngüsünde spam olmasın).
 let retryTimer = null;
 const scheduleInit = (ms) => {
@@ -157,6 +183,7 @@ const initializeWhatsApp = async () => {
                 meId = sock?.user?.id || null;
                 clearQrTimer();
                 console.log('[WhatsApp] Bağlantı kuruldu!', meId || '');
+                notifyReady();
             }
 
             if (connection === 'close') {
@@ -304,6 +331,7 @@ module.exports = {
     sendMessage,
     checkOnWhatsApp,
     getDailySent,
+    waitForReady,
     toJid,
     get client() { return sock; },
 };

@@ -27,6 +27,7 @@ const multer = require('multer');
 const {
     initializeWhatsApp, refreshWhatsApp, logoutWhatsApp,
     getStatus: waStatus, sendMessage: waSend, checkOnWhatsApp, getDailySent,
+    waitForReady: waWaitForReady,
 } = require('./whatsapp');
 const { normalizePhone, isLikelyValid } = require('./phone');
 const watcher = require('./watcher');
@@ -622,6 +623,20 @@ function renderMessage(template, recipient) {
         .replace(/\{kod\}/gi, recipient.kod || '');
 }
 
+// Bağlantı koptuysa job'u duraklat, bağlanana kadar bekle. Kalan alıcılar
+// kuyrukta birikir; bağlantı gelince kaldığı yerden devam eder. İptal edilirse
+// false döner. 2 sn'lik dilimlerle beklenir ki iptal gecikmeden işlesin.
+async function waitForWhatsApp(job) {
+    if (waStatus().ready) return true;
+    pushEvent(job, { type: 'waDisconnected', message: 'WhatsApp bağlantısı koptu, bağlanınca devam edilecek...' });
+    while (!job.cancelled && !waStatus().ready) {
+        await waWaitForReady(2000);
+    }
+    if (job.cancelled) return false;
+    pushEvent(job, { type: 'waReconnected', message: 'WhatsApp yeniden bağlandı, gönderim sürüyor.' });
+    return true;
+}
+
 async function runJob(job) {
     job.status = 'running';
     const p = job.pacing;
@@ -648,9 +663,15 @@ async function runJob(job) {
             continue;
         }
 
+        // Bağlantı yoksa burada bekle — alıcı atlanmaz, sırada bekler.
+        if (!(await waitForWhatsApp(job))) { pushEvent(job, { type: 'cancelled', index: i }); break; }
+
         if (p.verifyOnWhatsApp) {
             const chk = await checkOnWhatsApp(phone);
             if (!chk.exists) {
+                // Kontrol sırasında bağlantı koptuysa alıcıyı "kayıtlı değil" sayma;
+                // bağlantıyı bekleyip aynı alıcıyı yeniden dene.
+                if (!waStatus().ready) { i--; continue; }
                 pushEvent(job, { ...base, status: 'notOnWhatsApp', error: chk.error || 'WhatsApp kullanıcısı değil' });
                 job.results.push({ ...rcp, status: 'notOnWhatsApp' });
                 continue;
@@ -658,10 +679,22 @@ async function runJob(job) {
         }
 
         const text = renderMessage(job.message, rcp);
-        const result = await waSend(phone, text, job.media, {
+        let result = await waSend(phone, text, job.media, {
             simulateTyping: p.simulateTyping,
             typingMs: rand(1200, 2600),
         });
+
+        // Gönderim sırasında kopma: bağlantı gelene kadar bekle, aynı alıcıya
+        // yeniden dene. Bağlıyken alınan hatalar (geçersiz numara vb.) yeniden
+        // denenmez, normal "failed" akışına düşer.
+        while (!result.success && !waStatus().ready && !job.cancelled) {
+            if (!(await waitForWhatsApp(job))) break;
+            result = await waSend(phone, text, job.media, {
+                simulateTyping: p.simulateTyping,
+                typingMs: rand(1200, 2600),
+            });
+        }
+        if (job.cancelled) { pushEvent(job, { type: 'cancelled', index: i }); break; }
 
         if (result.success) {
             job.sentCount++;
