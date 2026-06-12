@@ -16,6 +16,8 @@ const baseDir = process.env.VEGA_BASE_DIR || (isPkg ? path.dirname(process.execP
 const DATA_DIR = path.join(baseDir, 'data');
 const AUTH_DIR = path.join(DATA_DIR, 'baileys-auth');
 const STATS_PATH = path.join(DATA_DIR, 'wa-stats.json');
+const VERSION_PATH = path.join(DATA_DIR, 'wa-version.json');
+const EVENTS_PATH = path.join(DATA_DIR, 'wa-events.log');
 const QR_TIMEOUT_MS = 60_000;
 
 let sock = null;
@@ -46,6 +48,38 @@ const bumpDailySent = () => {
     try { ensureDir(DATA_DIR); fs.writeFileSync(STATS_PATH, JSON.stringify(dailyStats)); } catch { /* yok say */ }
 };
 const getDailySent = () => (dailyStats.date === todayKey() ? dailyStats.sent : 0);
+
+// ─── Bağlantı olay günlüğü (kalıcı) ──────────────────────────────────────────
+// Müşteride "bağlantı sürekli düşüyor" şikâyeti teşhis edilemiyordu çünkü kopma
+// sebebi hiçbir yere yazılmıyordu. Her open/close olayı kod+mesajıyla buraya
+// eklenir; dosya 200KB'ı aşınca son yarısı tutulur.
+const waEvent = (line) => {
+    try {
+        ensureDir(DATA_DIR);
+        fs.appendFileSync(EVENTS_PATH, `${new Date().toISOString()} ${line}\n`);
+        const st = fs.statSync(EVENTS_PATH);
+        if (st.size > 200_000) {
+            const buf = fs.readFileSync(EVENTS_PATH, 'utf8');
+            fs.writeFileSync(EVENTS_PATH, buf.slice(buf.length / 2));
+        }
+    } catch { /* günlük yazılamazsa gönderim etkilenmesin */ }
+};
+
+// ─── WA protokol sürümü önbelleği ────────────────────────────────────────────
+// fetchLatestBaileysVersion her bağlanışta internete çıkar; ağ sorunluyken
+// (tam da yeniden bağlanmaya çalıştığımız anda) hata verip varsayılan eski
+// sürüme düşer, bu da 405 ile bağlantının tekrar kopmasına yol açabilir.
+// Başarılı sorgu diske yazılır; sorgu başarısızsa son bilinen sürüm kullanılır.
+const loadCachedVersion = () => {
+    try {
+        const v = JSON.parse(fs.readFileSync(VERSION_PATH, 'utf8'));
+        return Array.isArray(v.version) ? v.version : null;
+    } catch { return null; }
+};
+const saveCachedVersion = (version) => {
+    try { ensureDir(DATA_DIR); fs.writeFileSync(VERSION_PATH, JSON.stringify({ version, at: Date.now() })); }
+    catch { /* yok say */ }
+};
 
 // ─── Bağlantı bekleyicileri ──────────────────────────────────────────────────
 // Bağlantı koptuğunda gönderim döngüleri burada bekler; "open" gelince hepsi
@@ -82,6 +116,12 @@ const scheduleInit = (ms) => {
         if (!isReady && !isInitializing) initializeWhatsApp();
     }, ms);
 };
+
+// Üst üste kopmalarda bekleme süresini artır (3s → 6s → 12s ... 60s tavan).
+// Sabit 3sn ile sorunlu ağda saniyede bir el sıkışma denenip WhatsApp tarafında
+// şüpheli trafik oluşuyordu; başarılı bağlantı sayacı sıfırlar.
+let reconnectFails = 0;
+const backoffMs = () => Math.min(3000 * Math.pow(2, Math.min(reconnectFails, 5)), 60_000);
 
 const makeLogger = () => {
     const log = {
@@ -146,9 +186,11 @@ const initializeWhatsApp = async () => {
         try {
             const fetched = await fetchLatestBaileysVersion();
             version = fetched.version;
+            saveCachedVersion(version);
             console.log('[WhatsApp] WA protokol sürümü:', version.join('.'));
         } catch (err) {
-            console.warn('[WhatsApp] Sürüm sorgulanamadı, varsayılan:', err.message);
+            version = loadCachedVersion() || undefined;
+            console.warn('[WhatsApp] Sürüm sorgulanamadı,', version ? `önbellek: ${version.join('.')}` : 'varsayılan kullanılacak.', '—', err.message);
         }
 
         sock = makeWASocket({
@@ -181,8 +223,10 @@ const initializeWhatsApp = async () => {
                 currentQR = null;
                 lastError = null;
                 meId = sock?.user?.id || null;
+                reconnectFails = 0;
                 clearQrTimer();
                 console.log('[WhatsApp] Bağlantı kuruldu!', meId || '');
+                waEvent(`open ${meId || ''}`);
                 notifyReady();
             }
 
@@ -191,6 +235,7 @@ const initializeWhatsApp = async () => {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const errMsg = lastDisconnect?.error?.message;
                 console.log(`[WhatsApp] Bağlantı kapandı. Kod: ${statusCode}, mesaj: ${errMsg}`);
+                waEvent(`close code=${statusCode} msg=${errMsg || ''}`);
                 isReady = false;
                 cleanupSocket();
 
@@ -199,16 +244,27 @@ const initializeWhatsApp = async () => {
                     statusCode === DisconnectReason.badSession ||
                     statusCode === 401;
 
+                // 440: aynı oturum başka yerde açıldı (WhatsApp Web/ikinci kopya).
+                // Hemen geri bağlanmak karşı tarafı düşürür, o da bizi düşürür →
+                // sonsuz düşürme savaşı. Daha uzun bekle ve sebebi kullanıcıya söyle.
+                const conflict =
+                    statusCode === DisconnectReason.connectionReplaced || statusCode === 440;
+                if (conflict) {
+                    lastError = 'Bu WhatsApp oturumu başka bir yerde açıldı (WhatsApp Web / ikinci kopya). Diğer oturumu kapatın.';
+                }
+
                 if (shouldWipe) {
                     wipeAuth();
                     isInitializing = false;
                     currentQR = null;
                     lastError = null;
+                    reconnectFails = 0;
                     scheduleInit(1500);
                 } else {
                     isInitializing = false;
                     currentQR = null;
-                    scheduleInit(3000);
+                    scheduleInit(conflict ? 20_000 : backoffMs());
+                    reconnectFails++;
                 }
             }
         });
@@ -263,15 +319,22 @@ const logoutWhatsApp = async () => {
 const toJid = (phone) => `${String(phone).replace(/[^0-9]/g, '')}@s.whatsapp.net`;
 
 // Numara WhatsApp'ta kayıtlı mı? Kayıtlı değilse gönderme (ban sinyalini azaltır).
+// transient=true → sonuç güvenilmez (bağlantı yok / sorgu hatası / boş yanıt);
+// çağıran taraf numarayı "WhatsApp'ta yok" sayıp kalıcı atlamamalı, tekrar denemeli.
+// (Baileys yeniden bağlanmanın hemen ardından onWhatsApp'a boş dizi dönebiliyor —
+// gerçek kullanıcılar "kullanıcı değil" sanılıp mesajsız kalıyordu.)
 const checkOnWhatsApp = async (phone) => {
-    if (!isReady || !sock) return { exists: false, error: 'WhatsApp bağlı değil.' };
+    if (!isReady || !sock) return { exists: false, transient: true, error: 'WhatsApp bağlı değil.' };
     try {
         const clean = String(phone).replace(/[^0-9]/g, '');
         const results = await sock.onWhatsApp(clean);
-        const r = Array.isArray(results) ? results[0] : null;
+        if (!Array.isArray(results) || !results.length) {
+            return { exists: false, transient: true, error: 'Sorgu boş yanıt verdi' };
+        }
+        const r = results[0];
         return { exists: !!r?.exists, jid: r?.jid || null };
     } catch (err) {
-        return { exists: false, error: err.message };
+        return { exists: false, transient: true, error: err.message };
     }
 };
 

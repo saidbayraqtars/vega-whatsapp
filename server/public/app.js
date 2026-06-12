@@ -583,6 +583,7 @@ function renderWatcherState(s) {
     const parts = [];
     if (s.table) parts.push(`Tablo: ${s.table}`);
     if (s.watermark != null) parts.push(`Son IND: ${s.watermark}`);
+    if (s.pendingCount > 0) parts.push(`⏳ Kuyrukta ${s.pendingCount} mesaj (bağlanınca gönderilecek)`);
     if (s.lastPollAt) parts.push(`Son tarama: ${new Date(s.lastPollAt).toLocaleTimeString('tr-TR')}`);
     if (s.lastResult?.note) parts.push(s.lastResult.note);
     if (s.lastError) parts.push(`⚠ ${s.lastError}`);
@@ -664,7 +665,7 @@ async function refreshWatcherLog() {
         const box = $('wc_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz otomatik gönderim yok.</div>'; return; }
         wcLogEntries = r.log;
-        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı' };
+        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta' };
         box.innerHTML = r.log.map((e, i) => `
             <div class="logline">
                 <span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>

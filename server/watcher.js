@@ -28,6 +28,8 @@ const path = require('path');
 let deps = null;            // { getPool, sql, resolveCariContacts, waSend, checkOnWhatsApp, waStatus, baseDir }
 let CONFIG_PATH = null;
 let STATE_PATH = null;
+let PENDING_PATH = null;    // bağlantı kopunca bekleyen mesajlar (kalıcı kuyruk)
+let LOG_PATH = null;        // son gönderim günlüğü (kalıcı — yeniden başlatmada kaybolmasın)
 let MEDIA_DIR = null;       // görsel/video data/ altında saklanır
 
 let timer = null;
@@ -63,6 +65,12 @@ const DEFAULT_CONFIG = {
 let config = { ...DEFAULT_CONFIG };
 let state = { lastSeenInd: {} };  // tableName -> son işlenen IND
 let log = [];                     // son otomatik gönderimler (en yeni başta), tavan 200
+let pending = [];                 // gönderilemeyen mesajlar — diskte saklanır, bağlanınca akar
+
+// Kuyruk deneme tavanları: bağlantı yokken sayaç İŞLEMEZ (denenmez bile);
+// sayaçlar yalnızca bağlantı varken alınan yanıtlarla artar.
+const MAX_VERIFY_ATTEMPTS = 3;  // üst üste bu kadar temiz "WhatsApp'ta yok" yanıtı → kalıcı kabul
+const MAX_SEND_ATTEMPTS = 8;    // bağlıyken bu kadar gönderim hatası → vazgeç (failed)
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
@@ -74,9 +82,13 @@ function configure(d) {
     if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
     CONFIG_PATH = path.join(dataDir, 'watcher.json');
     STATE_PATH = path.join(dataDir, 'watcher-state.json');
+    PENDING_PATH = path.join(dataDir, 'watcher-pending.json');
+    LOG_PATH = path.join(dataDir, 'watcher-log.json');
     MEDIA_DIR = dataDir;
     loadConfig();
     loadState();
+    loadPending();
+    loadLog();
 }
 
 // ─── Görsel/video (opsiyonel ek) ───────────────────────────────────────────────
@@ -146,9 +158,104 @@ function saveState() {
     catch (e) { console.error('[Watcher] state yazılamadı:', e.message); }
 }
 
+function loadPending() {
+    try {
+        if (fs.existsSync(PENDING_PATH)) {
+            const p = JSON.parse(fs.readFileSync(PENDING_PATH, 'utf8'));
+            if (Array.isArray(p)) pending = p;
+        }
+    } catch (e) { console.error('[Watcher] kuyruk okunamadı:', e.message); }
+}
+
+function savePending() {
+    try { fs.writeFileSync(PENDING_PATH, JSON.stringify(pending, null, 2), 'utf8'); }
+    catch (e) { console.error('[Watcher] kuyruk yazılamadı:', e.message); }
+}
+
+function loadLog() {
+    try {
+        if (fs.existsSync(LOG_PATH)) {
+            const l = JSON.parse(fs.readFileSync(LOG_PATH, 'utf8'));
+            if (Array.isArray(l)) log = l;
+        }
+    } catch (e) { console.error('[Watcher] günlük okunamadı:', e.message); }
+}
+
 function pushLog(entry) {
     log.unshift({ ...entry, at: new Date().toISOString() });
     if (log.length > 200) log.length = 200;
+    try { fs.writeFileSync(LOG_PATH, JSON.stringify(log), 'utf8'); }
+    catch { /* günlük diske yazılamazsa bellekte devam */ }
+}
+
+// Kuyruğa ekle. ind+phone çifti zaten kuyruktaysa eklenmez (watermark kaydı ile
+// kuyruk kaydı arasında çökme olursa satır tekrar taranabilir — çift mesaj engeli).
+function enqueue(base, phone, text, reason) {
+    if (pending.some(p => p.ind === base.ind && p.phone === phone)) return;
+    pending.push({
+        ind: base.ind, cariInd: base.cariInd, name: base.name, kod: base.kod,
+        tutar: base.tutar, evrak: base.evrak, bakiye: base.bakiye, bakiyeDurum: base.bakiyeDurum,
+        phone, text, attempts: 0, noWaCount: 0,
+        queuedAt: new Date().toISOString(), lastError: reason,
+    });
+    savePending();
+    pushLog({ ...base, phone, status: 'queued', error: reason, message: text });
+}
+
+const pendingBase = (p) => ({
+    ind: p.ind, cariInd: p.cariInd, name: p.name, kod: p.kod, phone: p.phone,
+    tutar: p.tutar, evrak: p.evrak, bakiye: p.bakiye, bakiyeDurum: p.bakiyeDurum,
+});
+
+// Bekleyen kuyruğu boşaltmayı dene. Bağlantı yokken hiç dokunmaz; bağlıyken
+// sırayla doğrula+gönder, başaranı kuyruktan düş. Gönderilen adedini döndürür.
+async function processPending() {
+    if (!pending.length || !deps.waStatus().ready) return 0;
+    const media = loadMediaForSend();
+    let sentCount = 0;
+    for (const item of [...pending]) {
+        if (!deps.waStatus().ready) break; // bağlantı yine koptu — kalanlar sonraki taramada
+        if (config.verifyOnWhatsApp) {
+            const chk = await deps.checkOnWhatsApp(item.phone);
+            if (!chk.exists) {
+                if (chk.transient) {
+                    // Güvenilmez yanıt (bağlantı az önce geldi / sorgu hatası) → sayma, beklet.
+                    item.lastError = chk.error || 'Doğrulama yapılamadı';
+                    savePending();
+                    continue;
+                }
+                item.noWaCount = (item.noWaCount || 0) + 1;
+                if (item.noWaCount >= MAX_VERIFY_ATTEMPTS) {
+                    pending = pending.filter(p => p !== item);
+                    savePending();
+                    pushLog({ ...pendingBase(item), status: 'notOnWhatsApp', error: `WhatsApp kullanıcısı değil (${MAX_VERIFY_ATTEMPTS} doğrulama sonrası)` });
+                } else {
+                    item.lastError = 'WhatsApp kullanıcısı değil (tekrar doğrulanacak)';
+                    savePending();
+                }
+                continue;
+            }
+        }
+        const res = await deps.waSend(item.phone, item.text, media, {
+            simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400),
+        });
+        if (res.success) {
+            pending = pending.filter(p => p !== item);
+            savePending();
+            sentCount++;
+            pushLog({ ...pendingBase(item), status: 'sent', message: item.text });
+        } else {
+            item.attempts = (item.attempts || 0) + 1;
+            item.lastError = res.error;
+            if (item.attempts >= MAX_SEND_ATTEMPTS) {
+                pending = pending.filter(p => p !== item);
+                pushLog({ ...pendingBase(item), status: 'failed', error: `${res.error} (${MAX_SEND_ATTEMPTS} deneme sonrası vazgeçildi)`, message: item.text });
+            }
+            savePending();
+        }
+        await sleep(rand(2500, 6000)); // insansı gecikme (toplu boşaltmada da geçerli)
+    }
+    return sentCount;
 }
 
 // ─── Yardımcılar ──────────────────────────────────────────────────────────────
@@ -222,7 +329,12 @@ async function pollOnce() {
     polling = true;
     lastPollAt = new Date().toISOString();
     lastError = null;
-    let sent = 0, skipped = 0, found = 0;
+    let sent = 0, skipped = 0, found = 0, queued = 0;
+
+    // Önce birikmiş kuyruk: DB erişimi gerektirmez, bağlantı geldiyse geçmiş
+    // (gönderilememiş) mesajlar yeni satırlardan önce akar.
+    try { sent += await processPending(); }
+    catch (e) { console.error('[Watcher] kuyruk işleme hatası:', e.message); }
 
     try {
         const pool = deps.getPool();
@@ -285,7 +397,10 @@ async function pollOnce() {
         found = rows.length;
         if (!found) {
             if (newMax > lastSeen) { state.lastSeenInd[tbl] = newMax; saveState(); }
-            lastResult = { sent, skipped, found, note: 'Yeni tahsilat yok' };
+            lastResult = {
+                sent, skipped, found,
+                note: sent ? `Kuyruktan ${sent} gönderildi` : (pending.length ? `Yeni tahsilat yok (kuyrukta ${pending.length})` : 'Yeni tahsilat yok'),
+            };
             return;
         }
 
@@ -298,10 +413,10 @@ async function pollOnce() {
         // Opsiyonel görsel/video — bir kez oku, tüm alıcılara aynı buffer.
         const media = loadMediaForSend();
 
-        let maxInd = lastSeen;
-        let interrupted = false; // waOffline kesintisinde watermark newMax'e çekilmesin
+        // Gönderilemeyen her satır kalıcı kuyruğa alınır (watermark daima ilerler;
+        // satırın sahibi artık kuyruktur). Eski "watermark'ı geri çek" yaklaşımı,
+        // uygulama kapanınca veya doğrulama yanlış "yok" dediğinde mesaj kaybediyordu.
         for (const row of rows) {
-            maxInd = Math.max(maxInd, row.IND);
             const c = contacts.get(row.FIRMANO) || {};
             // Kalan borç = hareket toplamı (ödeme satırı dahil, anlık tutarlı). Pozitif = borç.
             // TBLCARI.BAKIYE gecikmeli güncellenebildiğinden sadece yedek olarak kullanılır.
@@ -323,16 +438,6 @@ async function pollOnce() {
                 continue;
             }
 
-            const waOk = deps.waStatus();
-            if (!waOk.ready) {
-                // WhatsApp bağlı değil → bu satırı henüz işlenmemiş say (watermark'ı ilerletme).
-                maxInd = Math.min(maxInd, row.IND - 1);
-                interrupted = true;
-                skipped++;
-                pushLog({ ...base, status: 'waOffline', error: 'WhatsApp bağlı değil, sonraki taramada denenecek' });
-                break; // sonrakileri de beklet; watermark kesinti noktasına çekilir
-            }
-
             const text = renderTemplate(config.template, {
                 ad: c.name, tutar: fmtAmount(row.ALACAK), kod: c.kod,
                 evrak: row.EVRAKNO || '',
@@ -344,11 +449,22 @@ async function pollOnce() {
             const targets = (config.sendAllPhones && Array.isArray(c.phones) && c.phones.length)
                 ? c.phones : [c.phone];
             for (const phone of targets) {
+                if (!deps.waStatus().ready) {
+                    enqueue(base, phone, text, 'WhatsApp bağlı değil — kuyruğa alındı, bağlanınca gönderilecek');
+                    queued++;
+                    continue;
+                }
                 if (config.verifyOnWhatsApp) {
                     const chk = await deps.checkOnWhatsApp(phone);
                     if (!chk.exists) {
-                        skipped++;
-                        pushLog({ ...base, phone, status: 'notOnWhatsApp', error: chk.error || 'WhatsApp kullanıcısı değil' });
+                        if (chk.transient) {
+                            // Yanıt güvenilmez (bağlantı sorunu / boş yanıt) → kalıcı atlama YOK.
+                            enqueue(base, phone, text, `Doğrulanamadı (${chk.error || 'geçici hata'}) — kuyruğa alındı`);
+                            queued++;
+                        } else {
+                            skipped++;
+                            pushLog({ ...base, phone, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' });
+                        }
                         continue;
                     }
                 }
@@ -358,16 +474,22 @@ async function pollOnce() {
                 });
                 // Gönderilen metin log'a yazılır → arayüzde popup'ta görüntülenir.
                 if (res.success) { sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
-                else { skipped++; pushLog({ ...base, phone, status: 'failed', error: res.error, message: text }); }
+                else {
+                    // Gönderim hatası çoğunlukla geçici (bağlantı o an koptu) → kuyruğa.
+                    enqueue(base, phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`);
+                    queued++;
+                }
 
                 await sleep(rand(2500, 6000)); // düşük hacim — küçük insansı gecikme
             }
         }
 
-        // Kesinti yoksa filtrelenen (fatura/BORC) satırların da üzerinden atla.
-        if (!interrupted) maxInd = Math.max(maxInd, newMax);
-        if (maxInd > state.lastSeenInd[tbl]) { state.lastSeenInd[tbl] = maxInd; saveState(); }
-        lastResult = { sent, skipped, found, note: `${sent} gönderildi, ${skipped} atlandı` };
+        // Watermark daima yeni tavana çekilir; gönderilemeyenler kuyrukta yaşar.
+        if (newMax > state.lastSeenInd[tbl]) { state.lastSeenInd[tbl] = newMax; saveState(); }
+        const bits = [`${sent} gönderildi`];
+        if (queued) bits.push(`${queued} kuyrukta`);
+        if (skipped) bits.push(`${skipped} atlandı`);
+        lastResult = { sent, skipped, found, queued, note: bits.join(', ') };
     } catch (e) {
         lastError = e.message;
         lastResult = { sent, skipped, found, note: 'Hata: ' + e.message };
@@ -429,6 +551,7 @@ function getStatus() {
         media: config.media ? { name: config.media.name, kind: config.media.kind } : null,
         lastPollAt, lastError, lastResult,
         watermark: tableName() ? (state.lastSeenInd[tableName()] ?? null) : null,
+        pendingCount: pending.length,
     };
 }
 
