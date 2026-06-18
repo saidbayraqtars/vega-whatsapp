@@ -10,6 +10,7 @@ async function forgetPin() { if (desktop?.isElectron) { try { await desktop.clea
 
 const state = {
     firmaNo: null,
+    donemNo: null,            // uygulama genel bağlamı (ayarlardan; toplu+watcher paylaşır)
     rows: [],                 // ekranda görünen cariler
     selected: new Map(),      // ind -> {name, unvan, kod, phone, phones}
     cariLoadedAt: 0,          // cari kart bilgisi en son ne zaman çekildi (günlük tazeleme)
@@ -19,67 +20,77 @@ const state = {
     sse: null,
 };
 
+// Uygulama bağlamı (firma/dönem) kalıcı: hem sunucu config'i hem localStorage.
+async function saveContext(firmaNo, donemNo) {
+    state.firmaNo = firmaNo; state.donemNo = donemNo ?? null;
+    try { localStorage.setItem('vega.ctx', JSON.stringify({ firmaNo, donemNo: donemNo ?? null })); } catch { /* yok say */ }
+    try { await api('/settings/context', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ firmaNo, donemNo: donemNo ?? null }) }); } catch { /* yok say */ }
+}
+function localContext() { try { return JSON.parse(localStorage.getItem('vega.ctx') || '{}'); } catch { return {}; } }
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Açılış akışı
 // ═══════════════════════════════════════════════════════════════════════════
 async function boot() {
     const r = await api('/check-setup');
-    if (!r.isSetup) {
-        show('setupScreen');
-        return;
-    }
-    // Electron oto-bağlantı: sunucu kayıtlı PIN ile zaten giriş yaptıysa PIN sorma.
+    if (!r.isSetup) { show('setupScreen'); return; }
+    // Giriş PIN'i kaldırıldı: sunucu açılışta otomatik bağlanır. Bağlı değilse dene.
     try {
-        const st = await api('/status');
+        let st = await api('/status');
+        if (!st.dbConnected && !st.needsReauth) {
+            await api('/connect', { method: 'POST' });
+            st = await api('/status');
+        }
         if (st.dbConnected) { await enterApp(); return; }
+        if (st.needsReauth || r.needsReauth) {
+            show('setupScreen');
+            $('su_err').textContent = 'Sürüm güncellendi. Lütfen DB parolasını bir kez yeniden girin.';
+            return;
+        }
     } catch { /* yok say */ }
-    show('pinScreen');
-    $('pin_input').focus();
+    show('setupScreen'); // bağlanılamadı (sunucu/parola değişmiş olabilir)
 }
 
 function show(screen) {
-    ['setupScreen', 'pinScreen', 'app'].forEach(s => $(s).classList.add('hidden'));
+    ['setupScreen', 'app'].forEach(s => $(s).classList.add('hidden'));
     $(screen).classList.remove('hidden');
 }
 
 // ─── Kurulum ───
-$('su_btn').onclick = async () => {
-    $('su_err').textContent = '';
-    const body = {
+function setupBody() {
+    return {
         server: $('su_server').value.trim(),
         port: $('su_port').value.trim(),
         database: $('su_db').value.trim(),
         username: $('su_user').value.trim(),
         password: $('su_pass').value,
-        pin: $('su_pin').value.trim(),
     };
+}
+
+$('su_test').onclick = async () => {
+    const box = $('su_testResult');
+    box.style.display = '';
+    box.className = 'hint';
+    box.textContent = 'Sınanıyor...';
+    try {
+        const r = await api('/test-connection', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(setupBody()) });
+        if (r.success) { box.className = 'hint ok'; box.textContent = `✓ ${r.message}${r.firmaSayisi != null ? ` (${r.firmaSayisi} firma)` : ''}`; }
+        else { box.className = 'err'; box.textContent = r.message; }
+    } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
+};
+
+$('su_btn').onclick = async () => {
+    $('su_err').textContent = '';
+    const body = setupBody();
     $('su_btn').disabled = true;
     $('su_btn').textContent = 'Bağlanıyor...';
     try {
         const r = await api('/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-        if (r.success) { await rememberPin(body.pin); await enterApp(); }
+        if (r.success) { await enterApp(); }
         else $('su_err').textContent = r.message;
     } catch (e) { $('su_err').textContent = 'Hata: ' + e.message; }
     $('su_btn').disabled = false;
     $('su_btn').textContent = 'Bağlan ve Kaydet';
-};
-
-// ─── PIN giriş ───
-$('pin_input').oninput = async (e) => {
-    const v = e.target.value.replace(/\D/g, '').slice(0, 6);
-    e.target.value = v;
-    if (v.length === 6) {
-        $('pin_err').textContent = '';
-        const r = await api('/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: v }) });
-        if (r.success) { await rememberPin(v); await enterApp(); }
-        else { $('pin_err').textContent = r.message; e.target.value = ''; }
-    }
-};
-$('pin_reset').onclick = async () => {
-    if (!confirm('Veritabanı ayarları silinecek. Emin misiniz?')) return;
-    await api('/reset', { method: 'POST' });
-    await forgetPin();
-    show('setupScreen');
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -104,23 +115,26 @@ async function loadFirmalar() {
         o.textContent = `${f.FIRMANO} — ${f.FIRMAADI}`;
         sel.appendChild(o);
     });
-    if (r.data.length) {
-        state.firmaNo = r.data[0].FIRMANO;
-        await loadCari();
-    }
+    if (!r.data.length) return;
+    // Hatırlanan firma: bellek > localStorage > sunucu bağlamı > ilk firma.
+    let pref = state.firmaNo || localContext().firmaNo;
+    if (!pref) { try { const cr = await api('/settings/context'); pref = cr.context && cr.context.firmaNo; state.donemNo = (cr.context && cr.context.donemNo) || state.donemNo; } catch { /* yok say */ } }
+    state.firmaNo = r.data.some(f => f.FIRMANO === pref) ? pref : r.data[0].FIRMANO;
+    sel.value = state.firmaNo;
+    await loadCari();
 }
 
-$('firmaSel').onchange = async () => { state.firmaNo = $('firmaSel').value; await loadCari(); };
+$('firmaSel').onchange = async () => { await saveContext($('firmaSel').value, state.donemNo); await loadCari(); };
 $('searchBtn').onclick = loadCari;
 $('searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadCari(); });
-$('onlyPhone').onchange = loadCari;
+$('onlySms').onchange = loadCari;
 
 async function loadCari() {
     if (!state.firmaNo) return;
     $('cariBody').innerHTML = `<tr><td colspan="4" class="muted" style="padding:18px">Yükleniyor...</td></tr>`;
     const search = encodeURIComponent($('searchInput').value.trim());
-    const onlyPhone = $('onlyPhone').checked ? '1' : '0';
-    const r = await api(`/cari?firmaNo=${state.firmaNo}&search=${search}&onlyWithPhone=${onlyPhone}&pageSize=1000`);
+    const onlySms = $('onlySms').checked ? '1' : '0';
+    const r = await api(`/cari?firmaNo=${state.firmaNo}&search=${search}&onlySmsGonder=${onlySms}&pageSize=1000`);
     if (!r.success) {
         $('cariBody').innerHTML = `<tr><td colspan="4" class="nophone" style="padding:18px">${r.message}</td></tr>`;
         return;
@@ -150,7 +164,7 @@ function renderCari() {
         if (checked) tr.classList.add('sel');
         tr.innerHTML = `
             <td class="c"><input type="checkbox" ${checked ? 'checked' : ''} ${row.phone ? '' : 'disabled'} /></td>
-            <td>${esc(row.unvan)}</td>
+            <td>${esc(row.unvan)}${row.smsGonder ? ' <span class="smsbadge" title="SMS Gönder izni var (SMSGONDER)">SMS</span>' : ''}</td>
             <td class="muted">${esc(row.kod)}</td>
             <td>${row.phone ? `<span title="${esc(row.phoneRaw)}">${esc(row.phone)}</span>${row.valid ? '' : ' <span class="nophone">?</span>'}` : '<span class="nophone">telefon yok</span>'}</td>
         `;
@@ -162,7 +176,8 @@ function renderCari() {
 }
 
 // phones = karttaki tüm geçerli numaralar ("tüm numaralara gönder" seçeneği için).
-const selObj = (row) => ({ ind: row.ind, name: row.unvan, unvan: row.unvan, kod: row.kod, phone: row.phone, phones: row.phones || [] });
+// firma = FIRMAADI ("Sayın {firma} müşterimiz"), smsGonder = SMS Gönder izni biti.
+const selObj = (row) => ({ ind: row.ind, name: row.unvan, unvan: row.unvan, firma: row.firma || row.unvan, kod: row.kod, phone: row.phone, phones: row.phones || [], valid: row.valid, smsGonder: row.smsGonder });
 
 function toggleSelect(row, on, tr) {
     if (on && row.phone) {
@@ -294,7 +309,103 @@ $('waRefresh').onclick = async () => {
     await api('/wa/refresh', { method: 'POST' });
     setTimeout(pollWa, 1500);
 };
-$('logoutBtn').onclick = async () => { await api('/reset', { method: 'POST' }); await forgetPin(); location.reload(); };
+// ═══════════════════════════════════════════════════════════════════════════
+//  Ayarlar modalı (SQL bağlantısı + varsayılan firma/dönem — en başa dönmez)
+// ═══════════════════════════════════════════════════════════════════════════
+$('settingsBtn').onclick = openSettings;
+$('set_close').onclick = () => $('settingsModal').classList.add('hidden');
+
+async function openSettings() {
+    $('set_err').textContent = '';
+    $('set_testResult').style.display = 'none';
+    $('set_pass').value = '';
+    try {
+        const r = await api('/settings/db');
+        if (r.db) {
+            $('set_server').value = r.db.server || '';
+            $('set_port').value = r.db.port || '1433';
+            $('set_db').value = r.db.database || '';
+            $('set_user').value = r.db.username || '';
+        }
+    } catch { /* yok say */ }
+    await loadSettingsFirmalar();
+    $('settingsModal').classList.remove('hidden');
+}
+
+async function loadSettingsFirmalar() {
+    const fr = await api('/firmalar');
+    const sel = $('set_firma');
+    sel.innerHTML = '';
+    if (fr.success) fr.data.forEach(f => {
+        const o = document.createElement('option');
+        o.value = f.FIRMANO; o.textContent = `${f.FIRMANO} — ${f.FIRMAADI}`;
+        sel.appendChild(o);
+    });
+    const ctx = localContext();
+    const firmaNo = ctx.firmaNo || state.firmaNo;
+    if (firmaNo && fr.success && fr.data.some(f => f.FIRMANO === firmaNo)) sel.value = firmaNo;
+    await loadSettingsDonemler(ctx.donemNo || state.donemNo);
+}
+
+async function loadSettingsDonemler(selectDonem) {
+    const firmaNo = $('set_firma').value;
+    const sel = $('set_donem');
+    sel.innerHTML = '<option>...</option>';
+    const r = await api(`/donemler?firmaNo=${firmaNo}`);
+    sel.innerHTML = '';
+    if (r.success && r.data.length) {
+        r.data.forEach(d => {
+            const o = document.createElement('option');
+            o.value = d.donemNo; o.textContent = d.donem ? `${d.donemNo} — ${d.donem}` : d.donemNo;
+            sel.appendChild(o);
+        });
+        sel.value = selectDonem || r.data[r.data.length - 1].donemNo;
+    } else {
+        sel.innerHTML = '<option value="">dönem yok</option>';
+    }
+}
+
+// Firma/dönem değişince bağlamı kaydet + toplu ekranı aynı firmaya getir (en başa dönmeden).
+$('set_firma').onchange = async () => { await loadSettingsDonemler(); await applySettingsContext(); };
+$('set_donem').onchange = applySettingsContext;
+
+async function applySettingsContext() {
+    const firmaNo = $('set_firma').value, donemNo = $('set_donem').value;
+    if (!firmaNo) return;
+    await saveContext(firmaNo, donemNo);
+    if ($('firmaSel').value !== firmaNo) { $('firmaSel').value = firmaNo; await loadCari(); }
+}
+
+$('set_test').onclick = async () => {
+    const box = $('set_testResult');
+    box.style.display = ''; box.className = 'hint'; box.textContent = 'Sınanıyor...';
+    const body = { server: $('set_server').value.trim(), port: $('set_port').value.trim(), database: $('set_db').value.trim(), username: $('set_user').value.trim(), password: $('set_pass').value };
+    if (!body.password) { box.className = 'err'; box.textContent = 'Sınamak için parola girin.'; return; }
+    try {
+        const r = await api('/test-connection', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        if (r.success) { box.className = 'hint ok'; box.textContent = `✓ ${r.message}${r.firmaSayisi != null ? ` (${r.firmaSayisi} firma)` : ''}`; }
+        else { box.className = 'err'; box.textContent = r.message; }
+    } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
+};
+
+$('set_saveDb').onclick = async () => {
+    $('set_err').textContent = '';
+    const body = { server: $('set_server').value.trim(), port: $('set_port').value.trim(), database: $('set_db').value.trim(), username: $('set_user').value.trim(), password: $('set_pass').value };
+    $('set_saveDb').disabled = true;
+    try {
+        const r = await api('/settings/db', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        if (r.success) { $('set_pass').value = ''; await loadFirmalar(); $('settingsModal').classList.add('hidden'); }
+        else $('set_err').textContent = r.message;
+    } catch (e) { $('set_err').textContent = 'Hata: ' + e.message; }
+    $('set_saveDb').disabled = false;
+};
+
+$('set_reset').onclick = async () => {
+    if (!confirm('Tüm DB ayarları silinecek ve kurulum ekranına dönülecek. Emin misiniz?')) return;
+    await api('/reset', { method: 'POST' });
+    await forgetPin();
+    location.reload();
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Gönderim
@@ -313,6 +424,11 @@ $('sendBtn').onclick = async () => {
     const message = $('msgText').value;
     const media = $('mediaInput').files[0];
     if (!message.trim() && !media) { $('sendErr').textContent = 'Mesaj metni veya medya gerekli.'; return; }
+
+    // Gönderim log'unda "mesajı gör" için: gönderilen şablon + alıcılar telefon bazlı saklanır.
+    state.jobMessage = message;
+    state.jobRecipients = {};
+    recipients.forEach(rr => { if (rr.phone) state.jobRecipients[String(rr.phone)] = rr; });
 
     const pacing = getPacing();
     if (!confirm(`${recipients.length} kişiye gönderilecek (günlük tavan: ${pacing.dailyCap}).\nTahmini süre üstte yazıyor. Başlatılsın mı?`)) return;
@@ -405,9 +521,12 @@ $('s_done').onclick = () => { $('sendModal').classList.add('hidden'); if (state.
 
 function addLog(name, phone, status, error) {
     const labels = { sent: 'Gönderildi', failed: 'Başarısız', invalid: 'Geçersiz no', notOnWhatsApp: 'WA yok' };
+    const rcp = state.jobRecipients ? state.jobRecipients[String(phone)] : null;
+    const canShow = rcp && (state.jobMessage || '').trim();
     const div = document.createElement('div');
     div.className = 'logline';
-    div.innerHTML = `<span>${esc(name || '')} <span class="muted">${esc(phone || '')}</span>${error ? ` <span class="muted">— ${esc(error)}</span>` : ''}</span><span class="st ${status}">${labels[status] || status}</span>`;
+    div.innerHTML = `<span>${esc(name || '')} <span class="muted">${esc(phone || '')}</span>${error ? ` <span class="muted">— ${esc(error)}</span>` : ''}${canShow ? ` <a href="#" class="s_msg">mesajı gör</a>` : ''}</span><span class="st ${status}">${labels[status] || status}</span>`;
+    if (canShow) div.querySelector('.s_msg').onclick = (ev) => { ev.preventDefault(); showBulkMessage(rcp, status); };
     const log = $('s_log');
     log.appendChild(div);
     log.scrollTop = log.scrollHeight;
@@ -421,34 +540,27 @@ function addLogRaw(text, cls) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Sekmeler + Otomatik Tahsilat (watcher)
+//  Sekmeler + Belge Tipi Mesajları (watcher, çok kurallı)
 // ═══════════════════════════════════════════════════════════════════════════
 document.querySelectorAll('.tab').forEach(t => {
     t.onclick = () => {
         document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
         t.classList.add('active');
-        $('viewBulk').style.display = t.dataset.view === 'viewBulk' ? '' : 'none';
-        $('viewWatcher').style.display = t.dataset.view === 'viewWatcher' ? '' : 'none';
-        if (t.dataset.view === 'viewWatcher') initWatcherView();
+        const v = t.dataset.view;
+        ['viewBulk', 'viewWatcher', 'viewReminders'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
+        if (v === 'viewWatcher') initWatcherView();
+        if (v === 'viewReminders' && typeof initRemindersView === 'function') initRemindersView();
     };
 });
 
-document.querySelectorAll('[data-wcvar]').forEach(c => {
-    c.onclick = () => {
-        const ta = $('wc_template');
-        const v = c.dataset.wcvar;
-        const pos = ta.selectionStart ?? ta.value.length;
-        ta.value = ta.value.slice(0, pos) + v + ta.value.slice(pos);
-        ta.focus();
-    };
-});
+// Belge tipi şablonunda kullanılabilir değişkenler (kart başına chip).
+const WC_VARS = ['{firma}', '{ad}', '{tutar}', '{kod}', '{evrak}', '{tarih}', '{bakiye}', '{durum}', '{belge}'];
 
 let wcLoaded = false;
 let wcLogTimer = null;
 
 async function initWatcherView() {
     if (!wcLoaded) {
-        // Firma listesini doldur (ana firmaSel ile aynı kaynak)
         const fr = await api('/firmalar');
         const sel = $('wc_firma');
         sel.innerHTML = '';
@@ -457,8 +569,11 @@ async function initWatcherView() {
             o.value = f.FIRMANO; o.textContent = `${f.FIRMANO} — ${f.FIRMAADI}`;
             sel.appendChild(o);
         });
-        // () sarmalayıcı şart: doğrudan atanırsa event objesi selectDonem sanılır.
         sel.onchange = () => loadWatcherDonemler();
+        $('wc_addRule').onclick = () => {
+            const empty = $('wc_rules').querySelector('.muted'); if (empty) empty.remove();
+            $('wc_rules').appendChild(createRuleCard({ enabled: true, direction: 'alacak', excludeFatura: true }));
+        };
         wcLoaded = true;
     }
     await loadWatcherConfig();
@@ -480,9 +595,7 @@ async function loadWatcherDonemler(selectDonem) {
             o.textContent = d.donem ? `${d.donemNo} — ${d.donem}` : d.donemNo;
             sel.appendChild(o);
         });
-        // en güncel dönem (en yüksek donemNo) varsayılan
-        const target = selectDonem || r.data[r.data.length - 1].donemNo;
-        sel.value = target;
+        sel.value = selectDonem || r.data[r.data.length - 1].donemNo;
     } else {
         sel.innerHTML = '<option value="">dönem yok</option>';
     }
@@ -492,87 +605,114 @@ async function loadWatcherConfig() {
     const r = await api('/watcher');
     if (!r.success) return;
     const s = r.status;
+    const ctx = localContext();
     if (s.firmaNo) $('wc_firma').value = s.firmaNo;
-    await loadWatcherDonemler(s.donemNo);
-    $('wc_template').value = s.template || '';
+    else if (ctx.firmaNo) $('wc_firma').value = ctx.firmaNo;
+    await loadWatcherDonemler(s.donemNo || ctx.donemNo);
     $('wc_interval').value = s.intervalSec || 30;
-    $('wc_min').value = s.minAmount || 0;
-    applyIzahatCodesToUI(s.izahatCodes || []);
     $('wc_verify').checked = s.verifyOnWhatsApp !== false;
     $('wc_typing').checked = s.simulateTyping !== false;
     $('wc_allPhones').checked = s.sendAllPhones === true;
-    renderWatcherMedia(s.media);
+    $('wc_onlySms').checked = s.onlySmsGonder === true;
+    renderWatcherRules(s.rules || []);
     renderWatcherState(s);
 }
 
-function renderWatcherMedia(media) {
-    const info = $('wc_mediaInfo');
-    if (media && media.name) {
-        $('wc_mediaName').textContent = media.name + (media.kind ? ` (${media.kind})` : '');
-        info.style.display = '';
-    } else {
-        info.style.display = 'none';
-    }
-}
-
-$('wc_media').onchange = () => {
-    const f = $('wc_media').files[0];
-    const box = $('wc_mediaPreview');
+function renderWatcherRules(rules) {
+    const box = $('wc_rules');
     box.innerHTML = '';
-    if (!f) return;
-    const url = URL.createObjectURL(f);
-    if (f.type.startsWith('image/')) box.innerHTML = `<img src="${url}" />`;
-    else if (f.type.startsWith('video/')) box.innerHTML = `<video src="${url}" controls></video>`;
-    else box.innerHTML = `<span class="muted">${esc(f.name)}</span>`;
-};
-
-$('wc_mediaClear').onclick = async (e) => {
-    e.preventDefault();
-    const r = await api('/watcher/media/clear', { method: 'POST' });
-    $('wc_media').value = '';
-    $('wc_mediaPreview').innerHTML = '';
-    renderWatcherMedia(r.status && r.status.media);
-};
-
-// Kayıtlı izahat kodlarını UI'ya dağıt: boş = "Tüm ödemeler"; doluysa "seçili
-// tipler" moduna geç, eşleşen ön tanımlı tipleri işaretle, kalanı ek kod kutusuna yaz.
-function applyIzahatCodesToUI(codes) {
-    const set = new Set((codes || []).map(Number).filter(n => !isNaN(n)));
-    const ptypes = document.querySelectorAll('.wc_ptype');
-    if (!set.size) {
-        $('wc_mode_all').checked = true;
-        ptypes.forEach(cb => cb.checked = false);
-        $('wc_codes').value = '';
-        $('wc_typeBox').style.display = 'none';
+    if (!rules.length) {
+        box.innerHTML = '<div class="muted" style="padding:10px 0">Henüz mesaj türü yok. <b>+ Yeni mesaj türü ekle</b> ile başlayın.</div>';
         return;
     }
-    $('wc_mode_sel').checked = true;
-    $('wc_typeBox').style.display = '';
-    ptypes.forEach(cb => {
-        const pc = cb.dataset.codes.split(',').map(Number);
-        const all = pc.every(c => set.has(c));
-        cb.checked = all;
-        if (all) pc.forEach(c => set.delete(c));
+    rules.forEach(r => box.appendChild(createRuleCard(r)));
+}
+
+// Bir belge tipi kuralının kartını oluşturur (DOM + olaylar).
+function createRuleCard(rule) {
+    rule = rule || {};
+    const id = rule.id || `rule-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+    const dir = rule.direction || 'alacak';
+    const card = document.createElement('div');
+    card.className = 'rule-card';
+    card.dataset.id = id;
+    const mediaInfo = (rule.media && rule.media.name)
+        ? `Kayıtlı: <b>${esc(rule.media.name)}</b>${rule.media.kind ? ` (${esc(rule.media.kind)})` : ''} <a href="#" class="rc_mediaClear">Kaldır</a>` : '';
+    card.innerHTML = `
+        <div class="rule-head">
+            <label class="check"><input type="checkbox" class="rc_enabled" ${rule.enabled ? 'checked' : ''} /> <b>Etkin</b></label>
+            <input class="rc_name" placeholder="Tür adı (örn: Satış Faturası)" value="${esc(rule.name || '')}" />
+            <button class="btn ghost xs rc_del" title="Bu türü sil">✕</button>
+        </div>
+        <div class="row">
+            <div class="field"><label>Yön</label>
+                <select class="rc_dir">
+                    <option value="alacak">Tahsilat / Ödeme (ALACAK)</option>
+                    <option value="borc">Fatura / Borçlandırma (BORC)</option>
+                    <option value="any">Her ikisi</option>
+                </select>
+            </div>
+            <div class="field" style="flex:.55"><label>Min tutar</label><input class="rc_min" type="number" min="0" value="${Number(rule.minAmount) || 0}" /></div>
+        </div>
+        <div class="field">
+            <label>IZAHAT kodları (virgülle; boş = bu yöndeki tüm kodlar)</label>
+            <input class="rc_codes" placeholder="örn: 13, 32, 83" value="${esc((rule.izahatCodes || []).join(', '))}" />
+            <div class="hint"><a href="#" class="rc_showCodes">Bu dönemdeki kodları göster</a></div>
+            <div class="rc_codesList muted" style="font-size:12px; margin-top:6px"></div>
+        </div>
+        <label class="check"><input type="checkbox" class="rc_excludeFatura" /> Fatura kaynaklı satırları dışla <span class="muted">(tahsilat için önerilir)</span></label>
+        <div class="field">
+            <label>Mesaj şablonu</label>
+            <textarea class="rc_template" placeholder="Sayın {firma} müşterimiz, ...">${esc(rule.template || '')}</textarea>
+            <div class="chips rc_chips">${WC_VARS.map(v => `<span class="chip" data-v="${v}">${v}</span>`).join('')}</div>
+            <div class="hint">{firma}=firma adı, {tutar}=bu belgenin tutarı, {bakiye}=güncel kalan bakiye, {durum}=Borç/Alacak, {belge}=tür adı.</div>
+        </div>
+        <div class="field">
+            <label>Görsel / Video (opsiyonel)</label>
+            <input type="file" class="rc_media" accept="image/*,video/*" />
+            <div class="rc_mediaInfo hint" style="${mediaInfo ? '' : 'display:none'}">${mediaInfo}</div>
+        </div>`;
+    card.querySelector('.rc_dir').value = dir;
+    card.querySelector('.rc_excludeFatura').checked = (rule.excludeFatura !== undefined) ? !!rule.excludeFatura : (dir === 'alacak');
+    card.querySelector('.rc_del').onclick = () => card.remove();
+    card.querySelectorAll('.rc_chips .chip').forEach(ch => ch.onclick = () => {
+        const ta = card.querySelector('.rc_template');
+        const v = ch.dataset.v;
+        const pos = ta.selectionStart ?? ta.value.length;
+        ta.value = ta.value.slice(0, pos) + v + ta.value.slice(pos);
+        ta.focus();
     });
-    $('wc_codes').value = [...set].join(',');
+    card.querySelector('.rc_showCodes').onclick = (e) => { e.preventDefault(); showRuleCodes(card); };
+    const mc = card.querySelector('.rc_mediaClear');
+    if (mc) mc.onclick = async (e) => {
+        e.preventDefault();
+        await api(`/watcher/rules/${id}/media/clear`, { method: 'POST' });
+        const box = card.querySelector('.rc_mediaInfo'); box.style.display = 'none'; box.innerHTML = '';
+    };
+    return card;
 }
 
-// UI seçimlerinden izahat kod listesi üret: "Tüm ödemeler" → [] (boş = hepsi).
-function collectWatcherIzahatCodes() {
-    const mode = document.querySelector('input[name="wc_mode"]:checked');
-    if (!mode || mode.value === 'all') return [];
-    const set = new Set();
-    document.querySelectorAll('.wc_ptype:checked').forEach(cb =>
-        cb.dataset.codes.split(',').forEach(c => { const n = +c.trim(); if (!isNaN(n)) set.add(n); }));
-    $('wc_codes').value.split(/[,\s]+/).map(s => s.trim()).filter(Boolean)
-        .map(Number).filter(n => !isNaN(n)).forEach(n => set.add(n));
-    return [...set];
+// Karttaki "kodları göster" — dönemin IZAHAT dağılımını listeler; koda tıkla ekle.
+async function showRuleCodes(card) {
+    const firmaNo = $('wc_firma').value, donemNo = $('wc_donem').value;
+    const box = card.querySelector('.rc_codesList');
+    if (!firmaNo || !donemNo) { box.textContent = 'Önce firma/dönem seçin.'; return; }
+    box.textContent = 'Yükleniyor...';
+    const r = await api(`/watcher/izahat-stats?firmaNo=${firmaNo}&donemNo=${donemNo}`);
+    if (!r.success) { box.textContent = r.message; return; }
+    if (!r.data.length) { box.textContent = 'Bu dönemde hareket yok.'; return; }
+    const fmt = n => Number(n).toLocaleString('tr-TR');
+    box.innerHTML = 'Koda tıkla ekle (A=alacak/tahsilat, B=borç/fatura):<br>' + r.data.map(d => {
+        const borcAdet = (d.adet || 0) - (d.alacakAdet || 0);
+        return `<span class="chip" data-code="${d.code}" style="cursor:pointer">${d.code}${d.label ? ' ' + esc(d.label) : ''}${d.devir ? ' ⚠devir' : ''} · ${d.alacakAdet || 0}A/${borcAdet}B</span>`;
+    }).join(' ');
+    box.querySelectorAll('[data-code]').forEach(ch => ch.onclick = () => {
+        const inp = card.querySelector('.rc_codes');
+        const cur = inp.value.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+        if (!cur.includes(ch.dataset.code)) cur.push(ch.dataset.code);
+        inp.value = cur.join(', ');
+    });
 }
-
-// Mod radyo değişiminde seçili-tip kutusunu göster/gizle.
-document.querySelectorAll('input[name="wc_mode"]').forEach(r => r.addEventListener('change', () => {
-    $('wc_typeBox').style.display = $('wc_mode_sel').checked ? '' : 'none';
-}));
 
 function renderWatcherState(s) {
     const on = s.running;
@@ -591,17 +731,29 @@ function renderWatcherState(s) {
     $('wc_info').textContent = on ? `Her ${s.intervalSec}sn taranıyor` : '';
 }
 
+function collectRules() {
+    return [...document.querySelectorAll('#wc_rules .rule-card')].map(card => ({
+        id: card.dataset.id,
+        name: card.querySelector('.rc_name').value.trim(),
+        enabled: card.querySelector('.rc_enabled').checked,
+        direction: card.querySelector('.rc_dir').value,
+        minAmount: Math.max(0, +card.querySelector('.rc_min').value || 0),
+        izahatCodes: card.querySelector('.rc_codes').value.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n)),
+        excludeFatura: card.querySelector('.rc_excludeFatura').checked,
+        template: card.querySelector('.rc_template').value,
+    }));
+}
+
 function collectWatcherConfig() {
     return {
         firmaNo: $('wc_firma').value,
         donemNo: $('wc_donem').value,
-        template: $('wc_template').value,
         intervalSec: Math.max(10, +$('wc_interval').value || 30),
-        minAmount: Math.max(0, +$('wc_min').value || 0),
-        izahatCodes: collectWatcherIzahatCodes(),
         verifyOnWhatsApp: $('wc_verify').checked,
         simulateTyping: $('wc_typing').checked,
         sendAllPhones: $('wc_allPhones').checked,
+        onlySmsGonder: $('wc_onlySms').checked,
+        rules: collectRules(),
     };
 }
 
@@ -609,45 +761,29 @@ $('wc_save').onclick = async () => {
     $('wc_err').textContent = '';
     const cfg = collectWatcherConfig();
     if (!cfg.firmaNo || !cfg.donemNo) { $('wc_err').textContent = 'Firma ve dönem seçin.'; return; }
-    if (!cfg.template.trim()) { $('wc_err').textContent = 'Mesaj şablonu boş olamaz.'; return; }
+    const bad = cfg.rules.find(r => r.enabled && !r.template.trim());
+    if (bad) { $('wc_err').textContent = `"${bad.name || 'Mesaj türü'}" etkin ama şablonu boş.`; return; }
     $('wc_save').disabled = true;
     try {
         await api('/watcher', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
-        // Görsel/video seçildiyse yükle (gönderim anında okunur).
-        const mediaFile = $('wc_media').files[0];
-        if (mediaFile) {
-            const fd = new FormData();
-            fd.append('media', mediaFile);
-            const mr = await fetch('/api/watcher/media', { method: 'POST', body: fd }).then(x => x.json());
-            $('wc_media').value = '';
-            $('wc_mediaPreview').innerHTML = '';
-            if (mr.status) renderWatcherMedia(mr.status.media);
+        // Her kartın seçili görsel/videosunu ilgili kurala yükle.
+        for (const card of document.querySelectorAll('#wc_rules .rule-card')) {
+            const f = card.querySelector('.rc_media').files[0];
+            if (f) {
+                const fd = new FormData(); fd.append('media', f);
+                await fetch(`/api/watcher/rules/${card.dataset.id}/media`, { method: 'POST', body: fd });
+                card.querySelector('.rc_media').value = '';
+            }
         }
-        const r = await api('/watcher/start', { method: 'POST' });
-        if (!r.success) $('wc_err').textContent = r.message || 'Başlatılamadı.';
-        renderWatcherState(r.status);
+        if (cfg.rules.some(r => r.enabled)) {
+            const r = await api('/watcher/start', { method: 'POST' });
+            if (!r.success) $('wc_err').textContent = r.message || 'Başlatılamadı.';
+        } else {
+            await api('/watcher/stop', { method: 'POST' });
+        }
+        await loadWatcherConfig(); // kaydedilen kurallar + medya bilgisiyle tazele
     } catch (e) { $('wc_err').textContent = 'Hata: ' + e.message; }
     $('wc_save').disabled = false;
-};
-
-$('wc_showCodes').onclick = async (e) => {
-    e.preventDefault();
-    const firmaNo = $('wc_firma').value, donemNo = $('wc_donem').value;
-    if (!firmaNo || !donemNo) return;
-    const box = $('wc_codesList');
-    box.textContent = 'Yükleniyor...';
-    const r = await api(`/watcher/izahat-stats?firmaNo=${firmaNo}&donemNo=${donemNo}`);
-    if (!r.success) { box.textContent = r.message; return; }
-    if (!r.data.length) { box.textContent = 'Bu dönemde alacak (tahsilat) hareketi yok.'; return; }
-    const fmt = n => Number(n).toLocaleString('tr-TR');
-    box.innerHTML = 'ALACAK (tahsilat) içeren kodlar — koda tıkla ekle:<br>' + r.data.map(d =>
-        `<span class="chip" data-code="${d.code}" style="cursor:pointer">${d.code}${d.label ? ' ' + esc(d.label) : ''}${d.devir ? ' ⚠devir' : ''} · ${d.alacakAdet} adet · ${fmt(d.toplamAlacak)} TL</span>`
-    ).join(' ');
-    box.querySelectorAll('[data-code]').forEach(ch => ch.onclick = () => {
-        const cur = $('wc_codes').value.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
-        if (!cur.includes(ch.dataset.code)) cur.push(ch.dataset.code);
-        $('wc_codes').value = cur.join(',');
-    });
 };
 
 $('wc_stop').onclick = async () => {
@@ -665,7 +801,7 @@ async function refreshWatcherLog() {
         const box = $('wc_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz otomatik gönderim yok.</div>'; return; }
         wcLogEntries = r.log;
-        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta' };
+        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', noSmsConsent: 'SMS izni yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta' };
         box.innerHTML = r.log.map((e, i) => `
             <div class="logline">
                 <span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
@@ -685,15 +821,270 @@ async function refreshWatcherLog() {
     } catch { /* yok say */ }
 }
 
-// Gönderilen mesajın tam metni sadece popup'ta gösterilir (log satırı kalabalıklaşmasın).
+// Mesaj/değişken yer tutucuları client tarafında doldur (toplu log popup'ı için).
+// Sunucudaki renderMessage ile aynı: {ad}/{unvan}/{firma}/{kod}.
+function renderClientMessage(tpl, r) {
+    return String(tpl || '')
+        .replace(/\{ad\}/gi, r.name || r.unvan || '')
+        .replace(/\{unvan\}/gi, r.unvan || r.name || '')
+        .replace(/\{firma\}/gi, r.firma || r.unvan || r.name || '')
+        .replace(/\{kod\}/gi, r.kod || '');
+}
+
+// Popup'taki firma/cari bilgi bloğunu doldur (boş alanlar gizlenir).
+function fillCariInfo(pairs) {
+    const box = $('msgModalCari');
+    const rows = pairs.filter(([, v]) => v != null && String(v).trim() !== '');
+    box.innerHTML = rows.map(([k, v]) => `<div><span class="ci-k">${esc(k)}</span><span class="ci-v">${esc(v)}</span></div>`).join('');
+    box.style.display = rows.length ? '' : 'none';
+}
+
+// Otomatik tahsilat log'undan: gönderilen mesaj + cari/firma bilgileri.
 function showSentMessage(e) {
     if (!e || !e.message) return;
-    const bits = [e.name, e.phone, e.at ? new Date(e.at).toLocaleString('tr-TR') : ''].filter(Boolean);
-    $('msgModalMeta').textContent = bits.join('  ·  ');
+    $('msgModalMeta').textContent = [e.phone, e.at ? new Date(e.at).toLocaleString('tr-TR') : ''].filter(Boolean).join('  ·  ');
+    fillCariInfo([
+        ['Firma', e.firma || e.name],
+        ['Ünvan', e.name],
+        ['Kod', e.kod],
+        ['Telefon', e.phone],
+        ['Ödenen', e.tutar ? e.tutar + ' TL' : ''],
+        ['Bakiye', e.bakiye ? e.bakiye + ' TL' + (e.bakiyeDurum ? ` (${e.bakiyeDurum})` : '') : ''],
+        ['Evrak', e.evrak],
+    ]);
     $('msgModalText').textContent = e.message;
     $('msgModal').classList.remove('hidden');
 }
+
+// Toplu gönderim log'undan: şablonu cariye göre doldur + cari/firma bilgileri.
+function showBulkMessage(r, status) {
+    const stLabel = { sent: 'Gönderildi', failed: 'Başarısız', invalid: 'Geçersiz no', notOnWhatsApp: 'WA yok' }[status] || status;
+    $('msgModalMeta').textContent = [r.phone, stLabel].filter(Boolean).join('  ·  ');
+    fillCariInfo([
+        ['Firma', r.firma || r.unvan],
+        ['Ünvan', r.unvan],
+        ['Kod', r.kod],
+        ['Telefon', r.phone],
+        ['Geçerli numara', r.valid ? 'Evet' : 'Hayır'],
+        ['SMS Gönder izni', r.smsGonder ? 'Var' : 'Yok'],
+    ]);
+    $('msgModalText').textContent = renderClientMessage(state.jobMessage, r);
+    $('msgModal').classList.remove('hidden');
+}
 $('msgModalClose').onclick = () => $('msgModal').classList.add('hidden');
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Bakiye / Borç Hatırlatma (periyodik)
+// ═══════════════════════════════════════════════════════════════════════════
+const RM_VARS = ['{firma}', '{ad}', '{bakiye}', '{kalan}', '{durum}', '{gecikmeGun}', '{enEskiVade}'];
+const RM_TYPE_LABEL = { anyBalance: 'Bakiyesi olan tüm cariler', overdueBuyer: 'Alıcı borç hatırlatma (geciken)', creditorSupplier: 'Satıcı alacak bildirimi' };
+let rmLoaded = false;
+let rmLogTimer = null;
+
+async function initRemindersView() {
+    if (!rmLoaded) {
+        const fr = await api('/firmalar');
+        const sel = $('rm_firma');
+        sel.innerHTML = '';
+        if (fr.success) fr.data.forEach(f => {
+            const o = document.createElement('option');
+            o.value = f.FIRMANO; o.textContent = `${f.FIRMANO} — ${f.FIRMAADI}`;
+            sel.appendChild(o);
+        });
+        sel.onchange = () => loadRemindersDonemler();
+        $('rm_save').onclick = saveReminders;
+        rmLoaded = true;
+    }
+    await loadRemindersConfig();
+    if (rmLogTimer) clearInterval(rmLogTimer);
+    refreshRemindersLog();
+    rmLogTimer = setInterval(refreshRemindersLog, 5000);
+}
+
+async function loadRemindersDonemler(selectDonem) {
+    const firmaNo = $('rm_firma').value;
+    const sel = $('rm_donem');
+    sel.innerHTML = '<option>...</option>';
+    const r = await api(`/donemler?firmaNo=${firmaNo}`);
+    sel.innerHTML = '';
+    if (r.success && r.data.length) {
+        r.data.forEach(d => {
+            const o = document.createElement('option');
+            o.value = d.donemNo; o.textContent = d.donem ? `${d.donemNo} — ${d.donem}` : d.donemNo;
+            sel.appendChild(o);
+        });
+        sel.value = selectDonem || r.data[r.data.length - 1].donemNo;
+    } else {
+        sel.innerHTML = '<option value="">dönem yok</option>';
+    }
+}
+
+async function loadRemindersConfig() {
+    const r = await api('/reminders');
+    if (!r.success) return;
+    const s = r.status;
+    const ctx = localContext();
+    if (s.firmaNo) $('rm_firma').value = s.firmaNo;
+    else if (ctx.firmaNo) $('rm_firma').value = ctx.firmaNo;
+    await loadRemindersDonemler(s.donemNo || ctx.donemNo);
+    renderReminderCards(s.reminders || []);
+    renderRemindersStatus(s);
+}
+
+function renderReminderCards(reminders) {
+    const box = $('rm_cards');
+    box.innerHTML = '';
+    reminders.forEach(rem => box.appendChild(createReminderCard(rem)));
+}
+
+function createReminderCard(rem) {
+    const card = document.createElement('div');
+    card.className = 'rule-card';
+    card.dataset.id = rem.id;
+    card.dataset.type = rem.type;
+    const isOverdue = rem.type === 'overdueBuyer';
+    const vars = isOverdue ? RM_VARS : RM_VARS.filter(v => v !== '{gecikmeGun}' && v !== '{enEskiVade}');
+    const mediaInfo = (rem.media && rem.media.name)
+        ? `Kayıtlı: <b>${esc(rem.media.name)}</b>${rem.media.kind ? ` (${esc(rem.media.kind)})` : ''} <a href="#" class="rm_mediaClear">Kaldır</a>` : '';
+    const startVal = rem.startDate ? String(rem.startDate).slice(0, 10) : '';
+    card.innerHTML = `
+        <div class="rule-head">
+            <label class="check"><input type="checkbox" class="rm_enabled" ${rem.enabled ? 'checked' : ''} /> <b>Etkin</b></label>
+            <input class="rm_name" value="${esc(rem.name || RM_TYPE_LABEL[rem.type] || '')}" />
+            <button class="btn ghost xs rm_test" title="Şimdi bir kez gönder (test)">Şimdi gönder</button>
+        </div>
+        <div class="muted" style="font-size:12px; margin:-2px 0 8px">${esc(RM_TYPE_LABEL[rem.type] || rem.type)}</div>
+        <div class="field">
+            <label>Mesaj şablonu</label>
+            <textarea class="rm_template" placeholder="Sayın {firma} müşterimiz, ...">${esc(rem.template || '')}</textarea>
+            <div class="chips rm_chips">${vars.map(v => `<span class="chip" data-v="${v}">${v}</span>`).join('')}</div>
+            ${isOverdue ? '<div class="hint">{kalan}=geciken borç tutarı, {gecikmeGun}=gün, {enEskiVade}=en eski vade tarihi.</div>' : '<div class="hint">{bakiye}=güncel bakiye (işaretsiz), {durum}=Borç/Alacak.</div>'}
+        </div>
+        <div class="grid2">
+            <div><label>Gün sıklığı</label><input class="rm_interval" type="number" min="1" value="${Number(rem.intervalDays) || 7}" /></div>
+            <div><label>Gönderim saati</label><input class="rm_time" type="time" value="${esc(rem.sendTime || '10:00')}" /></div>
+            <div><label>Başlangıç tarihi</label><input class="rm_start" type="date" value="${esc(startVal)}" /></div>
+            <div><label>Min tutar (TL)</label><input class="rm_min" type="number" min="0" value="${Number(rem.minAmount) || 0}" /></div>
+        </div>
+        ${isOverdue ? `<div class="field"><label>Varsayılan vade günü (cari vadesi boşsa)</label><input class="rm_vade" type="number" min="0" value="${Number(rem.vadeGunDefault) || 90}" /></div>` : ''}
+        <label class="check"><input type="checkbox" class="rm_onlySms" ${rem.onlySmsGonder ? 'checked' : ''} /> Sadece <b>SMS Gönder izni</b> olan carilere</label>
+        <label class="check"><input type="checkbox" class="rm_verify" ${rem.verifyOnWhatsApp !== false ? 'checked' : ''} /> Numara WhatsApp'ta mı kontrol et</label>
+        <div class="field">
+            <label>Görsel / Video (opsiyonel)</label>
+            <input type="file" class="rm_media" accept="image/*,video/*" />
+            <div class="rm_mediaInfo hint" style="${mediaInfo ? '' : 'display:none'}">${mediaInfo}</div>
+        </div>`;
+    card.querySelectorAll('.rm_chips .chip').forEach(ch => ch.onclick = () => {
+        const ta = card.querySelector('.rm_template');
+        const v = ch.dataset.v;
+        const pos = ta.selectionStart ?? ta.value.length;
+        ta.value = ta.value.slice(0, pos) + v + ta.value.slice(pos);
+        ta.focus();
+    });
+    card.querySelector('.rm_test').onclick = () => testReminder(card);
+    const mc = card.querySelector('.rm_mediaClear');
+    if (mc) mc.onclick = async (e) => {
+        e.preventDefault();
+        await api(`/reminders/${rem.id}/media/clear`, { method: 'POST' });
+        const box = card.querySelector('.rm_mediaInfo'); box.style.display = 'none'; box.innerHTML = '';
+    };
+    return card;
+}
+
+function collectReminders() {
+    return [...document.querySelectorAll('#rm_cards .rule-card')].map(card => {
+        const rem = {
+            id: card.dataset.id, type: card.dataset.type,
+            name: card.querySelector('.rm_name').value.trim(),
+            enabled: card.querySelector('.rm_enabled').checked,
+            template: card.querySelector('.rm_template').value,
+            intervalDays: Math.max(1, +card.querySelector('.rm_interval').value || 7),
+            sendTime: card.querySelector('.rm_time').value || '10:00',
+            startDate: card.querySelector('.rm_start').value || null,
+            minAmount: Math.max(0, +card.querySelector('.rm_min').value || 0),
+            onlySmsGonder: card.querySelector('.rm_onlySms').checked,
+            verifyOnWhatsApp: card.querySelector('.rm_verify').checked,
+        };
+        const vade = card.querySelector('.rm_vade');
+        if (vade) rem.vadeGunDefault = Math.max(0, +vade.value || 90);
+        return rem;
+    });
+}
+
+async function saveRemindersConfig() {
+    const cfg = { firmaNo: $('rm_firma').value, donemNo: $('rm_donem').value, reminders: collectReminders() };
+    await api('/reminders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+    // kart medyalarını yükle
+    for (const card of document.querySelectorAll('#rm_cards .rule-card')) {
+        const f = card.querySelector('.rm_media').files[0];
+        if (f) {
+            const fd = new FormData(); fd.append('media', f);
+            await fetch(`/api/reminders/${card.dataset.id}/media`, { method: 'POST', body: fd });
+            card.querySelector('.rm_media').value = '';
+        }
+    }
+}
+
+async function saveReminders() {
+    $('rm_err').textContent = '';
+    const cfg = collectReminders();
+    const bad = cfg.find(r => r.enabled && !r.template.trim());
+    if (bad) { $('rm_err').textContent = `"${bad.name}" etkin ama şablonu boş.`; return; }
+    if (!$('rm_firma').value) { $('rm_err').textContent = 'Firma seçin.'; return; }
+    $('rm_save').disabled = true;
+    try { await saveRemindersConfig(); await loadRemindersConfig(); }
+    catch (e) { $('rm_err').textContent = 'Hata: ' + e.message; }
+    $('rm_save').disabled = false;
+}
+
+async function testReminder(card) {
+    $('rm_err').textContent = '';
+    if (!confirm('Bu kategoriye uyan TÜM carilere şimdi hatırlatma gönderilecek (zaten yakın zamanda gönderilenler atlanır). Devam edilsin mi?')) return;
+    const btn = card.querySelector('.rm_test');
+    btn.disabled = true; btn.textContent = 'Gönderiliyor...';
+    try {
+        await saveRemindersConfig(); // önce kaydet (firma/dönem + şablon güncel)
+        const r = await api('/reminders/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: card.dataset.id }) });
+        if (!r.success) $('rm_err').textContent = r.message || 'Gönderilemedi.';
+        if (r.status) renderRemindersStatus(r.status);
+        refreshRemindersLog();
+    } catch (e) { $('rm_err').textContent = 'Hata: ' + e.message; }
+    btn.disabled = false; btn.textContent = 'Şimdi gönder';
+}
+
+function renderRemindersStatus(s) {
+    const active = (s.reminders || []).filter(r => r.enabled).length;
+    const parts = [];
+    if (active) parts.push(`${active} kategori aktif`);
+    else parts.push('Hiç kategori aktif değil');
+    if (s.lastResult?.note) parts.push(`Son: ${s.lastResult.note}`);
+    if (s.lastTickAt) parts.push(`Son denetim: ${new Date(s.lastTickAt).toLocaleTimeString('tr-TR')}`);
+    if (s.lastError) parts.push(`⚠ ${s.lastError}`);
+    $('rm_status').textContent = parts.join('  •  ') || '—';
+    $('rm_info').textContent = active ? `${active} aktif kategori` : '';
+}
+
+async function refreshRemindersLog() {
+    try {
+        const r = await api('/reminders/log');
+        if (!r.success) return;
+        renderRemindersStatus(r.status);
+        const box = $('rm_log');
+        if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz hatırlatma gönderilmedi.</div>'; return; }
+        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', notOnWhatsApp: 'WA yok' };
+        box.innerHTML = r.log.map(e => `
+            <div class="logline">
+                <span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
+                    ${e.reminder ? `<span class="muted">[${esc(e.reminder)}]</span>` : ''}
+                    ${e.bakiye ? `<b>${esc(e.bakiye)} TL${e.bakiyeDurum ? ` ${esc(e.bakiyeDurum)}` : ''}</b>` : ''}
+                    ${e.gecikmeGun != null ? `<span class="muted">${esc(e.gecikmeGun)} gün gecikme</span>` : ''}
+                    ${e.error ? `<span class="muted">— ${esc(e.error)}</span>` : ''}
+                    <span class="muted" style="font-size:11px">${e.at ? new Date(e.at).toLocaleTimeString('tr-TR') : ''}</span>
+                </span>
+                <span class="st ${e.status === 'sent' ? 'sent' : (e.status === 'failed' ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>
+            </div>`).join('');
+    } catch { /* yok say */ }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Lisans (çevrimiçi lisans altyapısı — scaffold; şu an kısıtlamaz)

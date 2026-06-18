@@ -21,6 +21,7 @@ const cors = require('cors');
 const sql = require('mssql');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const multer = require('multer');
 
@@ -31,6 +32,7 @@ const {
 } = require('./whatsapp');
 const { normalizePhone, isLikelyValid } = require('./phone');
 const watcher = require('./watcher');
+const reminders = require('./reminders');
 const license = require('./license');
 
 const QRCode = require('qrcode');
@@ -61,17 +63,38 @@ const upload = multer({
     limits: { fileSize: 80 * 1024 * 1024 }, // 80MB (WhatsApp medya tavanına yakın)
 });
 
-// ─── Şifreleme (PIN'den türetilen AES-256) ───────────────────────────────────
-function encrypt(text, pin) {
-    const key = crypto.createHash('sha256').update(pin).digest();
+// ─── Şifreleme (makineye bağlı AES-256) ──────────────────────────────────────
+// Giriş PIN'i kaldırıldı: DB parolası artık PIN yerine makine kimliğinden
+// türetilen anahtarla şifrelenir; uygulama açılışta PIN'siz otomatik bağlanır.
+// machine-id, license.js ile paylaşılan kalıcı dosya (data/machine-id).
+const APP_SALT = 'vega-wa-machine-key-2026';
+const MACHINE_ID_PATH = path.join(baseDir, 'data', 'machine-id');
+function getMachineSecret() {
+    try {
+        if (fs.existsSync(MACHINE_ID_PATH)) {
+            const id = fs.readFileSync(MACHINE_ID_PATH, 'utf8').trim();
+            if (id) return id;
+        }
+    } catch { /* yok say */ }
+    const seed = `${os.hostname()}|${os.platform()}|${os.arch()}|${crypto.randomBytes(8).toString('hex')}`;
+    const id = crypto.createHash('sha256').update(seed).digest('hex').slice(0, 32).toUpperCase();
+    try {
+        fs.mkdirSync(path.dirname(MACHINE_ID_PATH), { recursive: true });
+        fs.writeFileSync(MACHINE_ID_PATH, id, 'utf8');
+    } catch { /* yok say */ }
+    return id;
+}
+function machineKey() {
+    return crypto.createHash('sha256').update(getMachineSecret() + APP_SALT).digest();
+}
+function encryptSecret(text, key = machineKey()) {
     const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
     let enc = cipher.update(text, 'utf8', 'hex');
     enc += cipher.final('hex');
     return iv.toString('hex') + ':' + enc;
 }
-function decrypt(text, pin) {
-    const key = crypto.createHash('sha256').update(pin).digest();
+function decryptSecret(text, key = machineKey()) {
     const parts = text.split(':');
     const iv = Buffer.from(parts.shift(), 'hex');
     const data = Buffer.from(parts.join(':'), 'hex');
@@ -80,8 +103,60 @@ function decrypt(text, pin) {
     dec += decipher.final('utf8');
     return dec;
 }
-function hashPin(pin) {
-    return crypto.createHash('sha256').update(pin).digest('hex');
+// Eski (v1) config göçü: parola PIN'den türetilen anahtarla şifreliydi.
+function pinKey(pin) { return crypto.createHash('sha256').update(String(pin)).digest(); }
+
+// ─── Config dosyası (v2 = makine anahtarı) ────────────────────────────────────
+function loadConfigFile() {
+    try { if (fs.existsSync(CONFIG_PATH)) return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); }
+    catch (e) { console.error('config okunamadı:', e.message); }
+    return null;
+}
+
+// Parola verilmezse mevcut şifreli parola korunur (ayar güncellemede işe yarar).
+function persistConfig({ server, database, username, port, password, uiContext }) {
+    const existing = loadConfigFile() || {};
+    const saved = {
+        v: 2,
+        server, database, username, port: port || '1433',
+        password: (password != null && password !== '') ? encryptSecret(password) : existing.password,
+        uiContext: uiContext !== undefined ? uiContext : (existing.uiContext || null),
+    };
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(saved, null, 2), 'utf8');
+    return saved;
+}
+
+// Kayıtlı config'i oku + parolayı çözmeyi dene. needsReauth = sürüm yükseltmede
+// eski (PIN ile şifreli) parola makine anahtarıyla çözülemez → bir kez yeniden gir.
+function readStoredConfig() {
+    const c = loadConfigFile();
+    if (!c) return { exists: false };
+    const legacy = !c.v && !!c.pinHash;
+    let password = null, needsReauth = false;
+    if (c.v === 2 && c.password) {
+        try { password = decryptSecret(c.password); }
+        catch { needsReauth = true; }
+    } else {
+        needsReauth = true; // eski v1 (PIN gerekli) veya bozuk
+    }
+    return { exists: true, config: c, password, needsReauth, legacy };
+}
+
+// Kayıtlı config varsa PIN'siz otomatik bağlan (boot + /api/connect).
+async function autoConnectFromConfig() {
+    if (pool && pool.connected) return true;
+    const st = readStoredConfig();
+    if (!st.exists || st.needsReauth || !st.password) return false;
+    const c = st.config;
+    const config = { server: c.server, database: c.database, username: c.username, password: st.password, port: c.port };
+    try {
+        if (pool) { try { await pool.close(); } catch { /* yok say */ } pool = null; }
+        pool = await createPool(config);
+        currentConfig = config;
+        watcher.autoStart();
+        try { reminders.autoStart(); } catch { /* Faz 6 */ }
+        return true;
+    } catch (e) { console.error('oto-bağlantı hata:', e.message); return false; }
 }
 
 // ─── SQL bağlantı havuzu ─────────────────────────────────────────────────────
@@ -123,16 +198,15 @@ async function validateTableName(tableName) {
 //  KURULUM / GİRİŞ
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/check-setup', (req, res) => {
-    res.json({ success: true, isSetup: fs.existsSync(CONFIG_PATH) });
+    const st = readStoredConfig();
+    res.json({ success: true, isSetup: st.exists, needsReauth: !!st.needsReauth });
 });
 
+// Kurulum — PIN istenmez; parola makine anahtarıyla şifrelenip kaydedilir.
 app.post('/api/setup', async (req, res) => {
-    const { server, database, username, password, port, pin } = req.body;
-    if (!server || !database || !username || !password || !pin) {
-        return res.status(400).json({ success: false, message: 'Tüm alanları ve PIN kodunu doldurunuz.' });
-    }
-    if (pin.length !== 6 || !/^\d+$/.test(pin)) {
-        return res.status(400).json({ success: false, message: 'PIN 6 haneli sadece rakam olmalı.' });
+    const { server, database, username, password, port } = req.body;
+    if (!server || !database || !username || !password) {
+        return res.status(400).json({ success: false, message: 'Sunucu, veritabanı, kullanıcı ve parola zorunlu.' });
     }
     try {
         if (pool) { await pool.close(); pool = null; }
@@ -143,12 +217,9 @@ app.post('/api/setup', async (req, res) => {
         // Bağlantıyı doğrula — firma tablosu okunabiliyor mu?
         await pool.request().query('SELECT TOP 1 IND FROM TBLFIRMA');
 
-        const saved = {
-            server, database, username, port: port || '1433',
-            password: encrypt(password, pin),
-            pinHash: hashPin(pin),
-        };
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(saved, null, 2), 'utf8');
+        persistConfig({ server, database, username, port: port || '1433', password });
+        watcher.autoStart();
+        try { reminders.autoStart(); } catch { /* yok say */ }
         res.json({ success: true, message: 'Kurulum tamamlandı.' });
     } catch (err) {
         console.error('setup hatası:', err.message);
@@ -156,22 +227,41 @@ app.post('/api/setup', async (req, res) => {
     }
 });
 
+// PIN'siz bağlan (boot/Electron). Eski v1 config gönderilen PIN ile göç ettirilir.
+app.post('/api/connect', async (req, res) => {
+    if (pool && pool.connected) return res.json({ success: true, message: 'Zaten bağlı.' });
+    const ok = await autoConnectFromConfig();
+    if (ok) return res.json({ success: true });
+    const st = readStoredConfig();
+    res.status(st.needsReauth ? 409 : 400).json({
+        success: false, needsReauth: !!st.needsReauth,
+        message: st.needsReauth ? 'Sürüm yükseltme: DB parolasını Ayarlar\'dan bir kez yeniden kaydedin.' : 'Bağlanılamadı.',
+    });
+});
+
+// Geriye uyumluluk + eski v1 → v2 göçü. PIN yalnızca eski config çözümünde gerekir.
 app.post('/api/login', async (req, res) => {
-    const { pin } = req.body;
-    if (!pin) return res.status(400).json({ success: false, message: 'PIN gerekli.' });
-    if (!fs.existsSync(CONFIG_PATH)) return res.status(400).json({ success: false, message: 'Kurulum yapılmamış.' });
+    const st = readStoredConfig();
+    if (!st.exists) return res.status(400).json({ success: false, message: 'Kurulum yapılmamış.' });
+
+    let password = st.password;
+    if (!password && st.legacy) {
+        const pin = req.body && req.body.pin;
+        if (!pin) return res.status(409).json({ success: false, needsReauth: true, message: 'DB parolası yeniden girilmeli.' });
+        try { password = decryptSecret(st.config.password, pinKey(pin)); }
+        catch { return res.status(401).json({ success: false, message: 'Hatalı PIN.' }); }
+    }
+    if (!password) return res.status(409).json({ success: false, needsReauth: true, message: 'DB parolası yeniden girilmeli.' });
 
     try {
-        const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-        if (saved.pinHash !== hashPin(pin)) {
-            return res.status(401).json({ success: false, message: 'Hatalı PIN.' });
-        }
-        const password = decrypt(saved.password, pin);
-        const config = { server: saved.server, database: saved.database, username: saved.username, password, port: saved.port };
+        const c = st.config;
+        const config = { server: c.server, database: c.database, username: c.username, password, port: c.port };
         if (pool) { try { await pool.close(); } catch { /* yok say */ } pool = null; }
         pool = await createPool(config);
         currentConfig = config;
-        watcher.autoStart(); // kayıtlı config aktifse otomatik tahsilat izlemeyi başlat
+        if (st.legacy) persistConfig({ server: c.server, database: c.database, username: c.username, port: c.port, password }); // v2'ye yükselt
+        watcher.autoStart();
+        try { reminders.autoStart(); } catch { /* Faz 6 */ }
         res.json({ success: true, message: 'Bağlandı.' });
     } catch (err) {
         console.error('login hatası:', err.message);
@@ -191,7 +281,96 @@ app.post('/api/reset', async (req, res) => {
 });
 
 app.get('/api/status', (req, res) => {
-    res.json({ success: true, dbConnected: !!(pool && pool.connected), wa: waStatus() });
+    const st = readStoredConfig();
+    res.json({
+        success: true,
+        dbConnected: !!(pool && pool.connected),
+        isSetup: st.exists, needsReauth: !!st.needsReauth,
+        wa: waStatus(),
+    });
+});
+
+// Bağlantıyı sına — canlı pool'a dokunmadan geçici bağlantı dener.
+app.post('/api/test-connection', async (req, res) => {
+    const { server, database, username, password, port } = req.body || {};
+    if (!server || !database || !username || !password) {
+        return res.status(400).json({ success: false, message: 'Sunucu, veritabanı, kullanıcı ve parola gerekli.' });
+    }
+    let testPool = null;
+    try {
+        testPool = await new sql.ConnectionPool({
+            user: username, password, database, server,
+            port: parseInt(port) || 1433,
+            options: { encrypt: false, trustServerCertificate: true, enableArithAbort: true },
+            connectionTimeout: 10000, requestTimeout: 15000,
+            pool: { max: 1, min: 0, idleTimeoutMillis: 5000 },
+        }).connect();
+        const r = await testPool.request().query('SELECT COUNT(*) AS c FROM TBLFIRMA');
+        res.json({ success: true, message: 'Bağlantı başarılı.', firmaSayisi: r.recordset[0].c });
+    } catch (err) {
+        res.status(200).json({ success: false, message: 'Bağlantı başarısız: ' + err.message });
+    } finally {
+        if (testPool) { try { await testPool.close(); } catch { /* yok say */ } }
+    }
+});
+
+// Ayarlar modalı için mevcut bağlantı bilgileri (parola HARİÇ).
+app.get('/api/settings/db', (req, res) => {
+    const c = loadConfigFile();
+    if (!c) return res.json({ success: true, db: null });
+    res.json({ success: true, db: { server: c.server, database: c.database, username: c.username, port: c.port } });
+});
+
+// Ayarlar → SQL bağlantısını YERİNDE güncelle (kurulumu sıfırlamaz, en başa dönmez).
+// Parola boş bırakılırsa mevcut kayıtlı parola korunur. Watcher/reminder durmaz;
+// sonraki taramada yeni pool'u kullanır.
+app.post('/api/settings/db', async (req, res) => {
+    const { server, database, username, password, port } = req.body || {};
+    if (!server || !database || !username) {
+        return res.status(400).json({ success: false, message: 'Sunucu, veritabanı ve kullanıcı gerekli.' });
+    }
+    let pass = password;
+    if (!pass) {
+        const st = readStoredConfig();
+        if (st.password) pass = st.password;
+        else return res.status(400).json({ success: false, message: 'Parola gerekli (kayıtlı parola çözülemedi).' });
+    }
+    const newCfg = { server, database, username, password: pass, port: port || '1433' };
+    try {
+        // Önce ayrı bir bağlantıyla doğrula — canlı pool'u bozma.
+        const test = await new sql.ConnectionPool({
+            user: username, password: pass, database, server, port: parseInt(port) || 1433,
+            options: { encrypt: false, trustServerCertificate: true, enableArithAbort: true },
+            connectionTimeout: 10000, requestTimeout: 15000, pool: { max: 1, min: 0, idleTimeoutMillis: 5000 },
+        }).connect();
+        await test.request().query('SELECT TOP 1 IND FROM TBLFIRMA');
+        await test.close();
+    } catch (err) {
+        return res.status(200).json({ success: false, message: 'Bağlantı hatası: ' + err.message });
+    }
+    try {
+        if (pool) { try { await pool.close(); } catch { /* yok say */ } pool = null; }
+        pool = await createPool(newCfg);
+        currentConfig = newCfg;
+        persistConfig({ server, database, username, port: port || '1433', password: (password || undefined) });
+        res.json({ success: true, message: 'Bağlantı güncellendi.' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Bağlantı uygulanamadı: ' + err.message });
+    }
+});
+
+// Uygulama genel bağlamı (varsayılan firma/dönem) — config.uiContext'te kalıcı.
+app.get('/api/settings/context', (req, res) => {
+    const c = loadConfigFile();
+    res.json({ success: true, context: (c && c.uiContext) || null });
+});
+
+app.post('/api/settings/context', (req, res) => {
+    const c = loadConfigFile();
+    if (!c) return res.status(400).json({ success: false, message: 'Kurulum yapılmamış.' });
+    const ctx = { firmaNo: (req.body && req.body.firmaNo) || null, donemNo: (req.body && req.body.donemNo) || null };
+    persistConfig({ server: c.server, database: c.database, username: c.username, port: c.port, uiContext: ctx });
+    res.json({ success: true, context: ctx });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -254,6 +433,8 @@ async function detectCariColumns(firmaNo) {
         hasUnvan: colSet.has('UNVAN'),
         hasFirmaadi: colSet.has('FIRMAADI'),
         hasFirmakodu: colSet.has('FIRMAKODU'),
+        // SMSGONDER = Vega "SMS Gönder" izni biti; mesaj göndermede onay/öncelik kapısı.
+        hasSmsGonder: colSet.has('SMSGONDER'),
         phoneCols, emailCols, all: cols,
     };
     phoneColCache[firmaNo] = { info, at: Date.now() };
@@ -284,6 +465,8 @@ app.get('/api/cari', async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const offset = (page - 1) * pageSize;
     const onlyWithPhone = req.query.onlyWithPhone === '1';
+    // SMS Gönder izni (SMSGONDER=1) olanları listele — "telefonu olanlar" filtresinin yerini alır.
+    const onlySmsGonder = req.query.onlySmsGonder === '1';
     if (!firmaNo) return res.status(400).json({ success: false, message: 'firmaNo gerekli.' });
 
     try {
@@ -302,6 +485,9 @@ app.get('/api/cari', async (req, res) => {
             ? `COALESCE(${nameParts.join(', ')}, CAST(IND AS NVARCHAR))`
             : `CAST(IND AS NVARCHAR)`;
         const kodExpr = info.hasFirmakodu ? 'FIRMAKODU' : `CAST(IND AS NVARCHAR)`;
+        // Firma adı: kullanıcı mesajda "Sayın {firma} müşterimiz" için FIRMAADI sütununu ister.
+        const firmaExpr = info.hasFirmaadi ? `NULLIF(LTRIM(RTRIM(FIRMAADI)),'')` : nameExpr;
+        const smsSelect = info.hasSmsGonder ? 'ISNULL(SMSGONDER,0) AS SMSGONDER' : 'CAST(0 AS BIT) AS SMSGONDER';
         const phoneSelect = info.phoneCols.map(c => `[${c}] AS [PH_${c}]`).join(', ');
         const emailSelect = info.emailCols.map(c => `[${c}] AS [EM_${c}]`).join(', ');
 
@@ -309,6 +495,8 @@ app.get('/api/cari', async (req, res) => {
             'IND',
             `${kodExpr} AS KOD`,
             `${nameExpr} AS UNVAN`,
+            `${firmaExpr} AS FIRMA`,
+            smsSelect,
             phoneSelect,
             emailSelect,
         ].filter(Boolean).join(', ');
@@ -316,6 +504,7 @@ app.get('/api/cari', async (req, res) => {
         const r = pool.request();
         const whereParts = [];
         if (info.hasDeleted) whereParts.push('ISNULL(DELETED,0)=0');
+        if (onlySmsGonder && info.hasSmsGonder) whereParts.push('ISNULL(SMSGONDER,0)=1');
         if (search.trim()) {
             r.input('s', sql.NVarChar, `%${search.trim()}%`);
             const searchCols = [
@@ -333,9 +522,11 @@ app.get('/api/cari', async (req, res) => {
 
         r.input('offset', sql.Int, offset);
         r.input('limit', sql.Int, pageSize);
+        // SMS Gönder izinliler önce (1. öncelik), sonra ada göre.
+        const orderExpr = (info.hasSmsGonder ? 'ISNULL(SMSGONDER,0) DESC, ' : '') + nameExpr;
         const rows = (await r.query(`
             SELECT ${selectCols} FROM ${T} ${where}
-            ORDER BY ${nameExpr}
+            ORDER BY ${orderExpr}
             OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
         `)).recordset;
 
@@ -358,6 +549,8 @@ app.get('/api/cari', async (req, res) => {
                 ind: row.IND,
                 kod: row.KOD,
                 unvan: row.UNVAN,
+                firma: row.FIRMA || row.UNVAN || null,
+                smsGonder: !!row.SMSGONDER,
                 phones: normalized,
                 phone: primary,
                 phoneRaw: rawPhones.join(' / '),
@@ -392,13 +585,15 @@ async function resolveCariContacts(firmaNo, indList) {
         ? `COALESCE(${nameParts.join(', ')}, CAST(IND AS NVARCHAR))`
         : `CAST(IND AS NVARCHAR)`;
     const kodExpr = info.hasFirmakodu ? 'FIRMAKODU' : `CAST(IND AS NVARCHAR)`;
+    const firmaExpr = info.hasFirmaadi ? `NULLIF(LTRIM(RTRIM(FIRMAADI)),'')` : nameExpr;
+    const smsSelect = info.hasSmsGonder ? 'ISNULL(SMSGONDER,0) AS SMSGONDER' : 'CAST(0 AS BIT) AS SMSGONDER';
     const phoneSelect = info.phoneCols.map(c => `[${c}] AS [PH_${c}]`).join(', ');
     // Carinin güncel kalan bakiyesi TBLCARI.BAKIYE'de tutulur (cari hareket
     // tablosunun BAKIYE kolonu Vega'da NULL; dönemler arası devirli toplamı
     // burada saklanır). Pozitif = borç (müşteri bize borçlu).
     const hasBakiye = info.all.some(c => c.toUpperCase() === 'BAKIYE');
     const bakiyeSelect = hasBakiye ? 'BAKIYE AS BAKIYE' : 'CAST(NULL AS DECIMAL(18,2)) AS BAKIYE';
-    const cols = ['IND', `${kodExpr} AS KOD`, `${nameExpr} AS UNVAN`, bakiyeSelect, phoneSelect].filter(Boolean).join(', ');
+    const cols = ['IND', `${kodExpr} AS KOD`, `${nameExpr} AS UNVAN`, `${firmaExpr} AS FIRMA`, smsSelect, bakiyeSelect, phoneSelect].filter(Boolean).join(', ');
 
     const rows = (await pool.request().query(`SELECT ${cols} FROM ${T} WHERE IND IN (${ids.join(',')})`)).recordset;
     for (const row of rows) {
@@ -413,6 +608,8 @@ async function resolveCariContacts(firmaNo, indList) {
         const primary = normalized.find(isLikelyValid) || normalized[0] || null;
         map.set(row.IND, {
             name: row.UNVAN, kod: row.KOD, phone: primary,
+            firma: row.FIRMA || row.UNVAN || null,
+            smsGonder: !!row.SMSGONDER,
             // Karttaki tüm geçerli numaralar (TELEFON1/2/3, YGSM...) — "tümüne gönder" seçeneği için.
             phones: normalized.filter(isLikelyValid),
             valid: primary ? isLikelyValid(primary) : false,
@@ -420,6 +617,34 @@ async function resolveCariContacts(firmaNo, indList) {
         });
     }
     return map;
+}
+
+// ─── Hatırlatma aday carileri (kategori + bakiye filtresi) ───────────────────
+// reminders.js için: FIRMATIPI + BAKIYE kategorisine uyan carilerin IND/BAKIYE/
+// FIRMATIPI/OPSIYON(vade günü) listesi. Telefon/isim resolveCariContacts ile çözülür.
+//   anyBalance       → BAKIYE <> 0
+//   overdueBuyer     → FIRMATIPI 1/3 (alıcı) & BAKIYE > 0
+//   creditorSupplier → FIRMATIPI 2/3 (satıcı) & BAKIYE < 0
+async function reminderCandidateInds(firmaNo, category, minAmount) {
+    if (!pool || !pool.connected) return [];
+    const info = await detectCariColumns(firmaNo);
+    const T = `[${info.table}]`;
+    const up = info.all.map(c => c.toUpperCase());
+    if (!up.includes('BAKIYE')) return [];
+    const hasTipi = up.includes('FIRMATIPI');
+    const hasOps = up.includes('OPSIYON');
+
+    const where = ['ISNULL(BAKIYE,0) <> 0'];
+    if (info.hasDeleted) where.push('ISNULL(DELETED,0)=0');
+    if (category === 'overdueBuyer') where.push(`${hasTipi ? 'FIRMATIPI IN (1,3) AND ' : ''}BAKIYE > 0`);
+    else if (category === 'creditorSupplier') where.push(`${hasTipi ? 'FIRMATIPI IN (2,3) AND ' : ''}BAKIYE < 0`);
+    if (minAmount > 0) where.push('ABS(BAKIYE) >= @minAmt');
+
+    const sel = `IND, BAKIYE, ${hasTipi ? 'FIRMATIPI' : 'CAST(NULL AS INT) AS FIRMATIPI'}, ${hasOps ? 'OPSIYON' : 'CAST(NULL AS INT) AS OPSIYON'}`;
+    const r = pool.request();
+    r.input('minAmt', sql.Decimal(18, 2), minAmount || 0);
+    const rows = (await r.query(`SELECT ${sel} FROM ${T} WHERE ${where.join(' AND ')}`)).recordset;
+    return rows.map(x => ({ IND: x.IND, BAKIYE: x.BAKIYE != null ? Number(x.BAKIYE) : null, FIRMATIPI: x.FIRMATIPI, OPSIYON: x.OPSIYON }));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -463,7 +688,7 @@ app.get('/api/watcher', (req, res) => {
 });
 
 app.post('/api/watcher', (req, res) => {
-    const allowed = ['firmaNo', 'donemNo', 'intervalSec', 'izahatCodes', 'minAmount', 'template', 'verifyOnWhatsApp', 'simulateTyping', 'sendAllPhones'];
+    const allowed = ['firmaNo', 'donemNo', 'intervalSec', 'verifyOnWhatsApp', 'simulateTyping', 'sendAllPhones', 'onlySmsGonder', 'rules'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
     const prev = watcher.getConfig();
@@ -490,15 +715,15 @@ app.get('/api/watcher/log', (req, res) => {
     res.json({ success: true, log: watcher.getLog(), status: watcher.getStatus() });
 });
 
-// Otomatik tahsilat mesajına eklenecek görsel/video yükle / kaldır.
-app.post('/api/watcher/media', upload.single('media'), (req, res) => {
+// Belge tipi kuralına eklenecek görsel/video yükle / kaldır (kural başına).
+app.post('/api/watcher/rules/:id/media', upload.single('media'), (req, res) => {
     if (!req.file) return res.status(400).json({ success: false, message: 'Dosya gerekli.' });
-    const status = watcher.setMedia(req.file);
+    const status = watcher.setRuleMedia(req.params.id, req.file);
     res.json({ success: true, status });
 });
 
-app.post('/api/watcher/media/clear', (req, res) => {
-    res.json({ success: true, status: watcher.clearMedia() });
+app.post('/api/watcher/rules/:id/media/clear', (req, res) => {
+    res.json({ success: true, status: watcher.clearRuleMedia(req.params.id) });
 });
 
 // Cari hareket tablosundaki IZAHAT dağılımı — kullanıcı tahsilat kodunu canlı görsün.
@@ -533,6 +758,45 @@ app.get('/api/watcher/izahat-stats', async (req, res) => {
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PERİYODİK BAKİYE/BORÇ HATIRLATMA (reminders)
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/reminders', (req, res) => {
+    res.json({ success: true, status: reminders.getStatus() });
+});
+
+app.post('/api/reminders', (req, res) => {
+    const allowed = ['firmaNo', 'donemNo', 'reminders'];
+    const patch = {};
+    for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    const status = reminders.setConfig(patch);
+    res.json({ success: true, status });
+});
+
+// Elle test gönderimi (UI "Şimdi test gönder").
+app.post('/api/reminders/run', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    try {
+        const r = await reminders.runNow(req.body && req.body.id);
+        res.json({ success: r.success, message: r.message, status: reminders.getStatus() });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/reminders/log', (req, res) => {
+    res.json({ success: true, log: reminders.getLog(), status: reminders.getStatus() });
+});
+
+app.post('/api/reminders/:id/media', upload.single('media'), (req, res) => {
+    if (!req.file) return res.status(400).json({ success: false, message: 'Dosya gerekli.' });
+    res.json({ success: true, status: reminders.setReminderMedia(req.params.id, req.file) });
+});
+
+app.post('/api/reminders/:id/media/clear', (req, res) => {
+    res.json({ success: true, status: reminders.clearReminderMedia(req.params.id) });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -616,10 +880,11 @@ function pushEvent(job, event) {
 }
 
 function renderMessage(template, recipient) {
-    // {ad} / {unvan} / {kod} değişkenleri
+    // {ad} / {unvan} / {firma} / {kod} değişkenleri
     return String(template || '')
         .replace(/\{ad\}/gi, recipient.name || recipient.unvan || '')
         .replace(/\{unvan\}/gi, recipient.unvan || recipient.name || '')
+        .replace(/\{firma\}/gi, recipient.firma || recipient.unvan || recipient.name || '')
         .replace(/\{kod\}/gi, recipient.kod || '');
 }
 
@@ -842,9 +1107,27 @@ watcher.configure({
     baseDir,
 });
 
-app.listen(PORT, () => {
+// Periyodik bakiye/borç hatırlatma zamanlayıcısı.
+reminders.configure({
+    getPool: () => pool,
+    sql,
+    resolveCariContacts,
+    reminderCandidateInds,
+    waSend,
+    checkOnWhatsApp,
+    waStatus,
+    baseDir,
+});
+
+app.listen(PORT, async () => {
     const url = `http://localhost:${PORT}`;
     console.log(`\n  Vega Toplu WhatsApp çalışıyor → ${url}\n`);
+    // Giriş PIN'i kaldırıldı: kayıtlı config varsa açılışta otomatik bağlan
+    // (watcher + reminders kendiliğinden başlar).
+    try {
+        const ok = await autoConnectFromConfig();
+        if (ok) console.log('  Otomatik bağlanıldı (kayıtlı ayarlar).');
+    } catch (e) { console.error('boot oto-bağlantı:', e.message); }
     if (isPkg) {
         const startCmd = process.platform === 'win32' ? 'start ""' : (process.platform === 'darwin' ? 'open' : 'xdg-open');
         try { require('child_process').exec(`${startCmd} ${url}`); } catch { /* yok say */ }

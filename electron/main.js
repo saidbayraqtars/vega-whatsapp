@@ -60,18 +60,14 @@ function readPin() {
 }
 function clearPin() { try { fs.existsSync(AUTH_BIN) && fs.unlinkSync(AUTH_BIN); } catch { /* yok say */ } }
 
-// PC açılışı / uygulama başlangıcında: kayıtlı PIN ile sessiz DB bağlantısı →
-// server.js login içinde watcher.autoStart() çalışır → takip kendiliğinden başlar.
+// PC açılışı / uygulama başlangıcında: PIN'siz sessiz DB bağlantısı. Sunucu zaten
+// boot'ta otomatik bağlanır; bu yalnızca emniyet için bir tetikleyici. /api/connect
+// içinde watcher + reminders autoStart çalışır → takip kendiliğinden sürer.
 async function autoConnect() {
-    const pin = readPin();
-    if (!pin) return;
     try {
-        await fetch(`${URL}/api/login`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin }),
-        });
+        await fetch(`${URL}/api/connect`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
         console.log('[Electron] Otomatik bağlantı denendi.');
-    } catch (e) { console.error('[Electron] auto-login hata:', e.message); }
+    } catch (e) { console.error('[Electron] auto-connect hata:', e.message); }
 }
 
 // ─── Otomatik güncelleme (GitHub Releases) ─────────────────────────────────────

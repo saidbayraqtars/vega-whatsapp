@@ -1,22 +1,22 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  Otomatik Tahsilat Bildirimi (payment-watcher)
-//  VegaDB cari hareket tablosunu periyodik tarar; yeni tahsilat (ALACAK>0,
-//  izlenen IZAHAT kodu) satırı bulunca ilgili cariye otomatik WhatsApp atar.
+//  Otomatik Belge-Tipi Mesajları (event-watcher, çok kurallı)
+//  VegaDB cari hareket tablosunu periyodik tarar; yeni satırı (BORC = fatura/
+//  borçlandırma, ALACAK = tahsilat/ödeme) TANIMLI KURALLARLA eşleştirip ilgili
+//  cariye otomatik WhatsApp atar. Her kural = bir belge tipi: kendi IZAHAT
+//  kodları, yönü, şablonu, opsiyonel görseli. Default: hiçbir kural etkin değil.
 //
 //  Tablo: F{firmaNo}D{donemNo}TBLCARIHAREKETLERI
 //    • IND        artan PK  → "yeni satır" watermark'ı
 //    • FIRMANO    = TBLCARI.IND (cari bağlantısı)
-//    • ALACAK     tahsilat tutarı (müşteri ödedi, borcu düştü)
-//    • IZAHAT     hareket tipi kodu (nvarchar)
+//    • BORC       borçlandırma (satış/alış faturası, borç fişi)
+//    • ALACAK     tahsilat/ödeme (müşteri ödedi, borcu düştü)
+//    • IZAHAT     belge tipi kodu (nvarchar) — kural eşleşmesi buradan
 //    • TARIH/EVRAKNO/BAKIYE/PARABIRIMI bilgilendirme alanları
 //
-//  DİKKAT: ALACAK>0 her zaman tahsilat değildir (gerçek veri doğrulandı, 2026-06):
-//    • Alış/e-faturası girişi cariye ALACAK satırı yazar (EVRAKNO = fatura
-//      başlığının BELGENO'su → TBLALFATBASLIK/TBLSATFATBASLIK'ta kayıtlı).
-//    • Peşin fatura/fiş aynı EVRAKNO ile BORC (fatura) + ALACAK (otomatik
-//      ödeme) çifti yazar.
-//  Bu satırlar fatura girişidir, tahsilat fişi değil → mesaj atılmaz (sorguda
-//  NOT EXISTS ile elenir). Gerçek tahsilat = cari giriş/kasa/visa fişleri.
+//  Fatura-dışlama: ALACAK satırı her zaman tahsilat değildir (peşin fatura oto-
+//  ödemesi / alış-satış fatura başlığı kaydı). Her satır için isFatura bayrağı
+//  hesaplanır; kuralın excludeFatura'sı açıksa fatura kaynaklı satır atlanır
+//  (tahsilat kuralları için varsayılan açık; fatura kuralları için kapalı).
 //
 //  Bağımlılıklar dışarıdan enjekte edilir (server.js ile gevşek bağlı):
 //    configure({ getPool, sql, resolveCariContacts, waSend, checkOnWhatsApp, waStatus, baseDir })
@@ -25,55 +25,72 @@
 const fs = require('fs');
 const path = require('path');
 
-let deps = null;            // { getPool, sql, resolveCariContacts, waSend, checkOnWhatsApp, waStatus, baseDir }
+let deps = null;
 let CONFIG_PATH = null;
 let STATE_PATH = null;
-let PENDING_PATH = null;    // bağlantı kopunca bekleyen mesajlar (kalıcı kuyruk)
-let LOG_PATH = null;        // son gönderim günlüğü (kalıcı — yeniden başlatmada kaybolmasın)
-let MEDIA_DIR = null;       // görsel/video data/ altında saklanır
+let PENDING_PATH = null;
+let LOG_PATH = null;
+let MEDIA_DIR = null;
 
 let timer = null;
-let polling = false;        // tek seferde tek tarama (reentrancy koruması)
-let running = false;        // watcher aktif mi
+let polling = false;
+let running = false;
 let lastPollAt = null;
 let lastError = null;
-let lastResult = null;      // son taramanın özeti
+let lastResult = null;
 
-// Devir (yıl başı açılış) kodları — bunlar tahsilat DEĞİL, daima hariç tutulur.
-// (Excel + gerçek veri doğrulandı: 103=devir alacak, 104=devir borç.)
+// Devir (yıl başı açılış) kodları — bunlar belge değil, daima hariç tutulur.
 const DEVIR_CODES = [103, 104];
 
 const DEFAULT_CONFIG = {
     enabled: false,
-    firmaNo: null,           // örn "0102"
-    donemNo: null,           // örn "0011"
+    firmaNo: null,
+    donemNo: null,
     intervalSec: 30,
-    // Tahsilat = cari ALACAK girişi (gerçek veri + vega_sorgu doğrulandı). Kod→anlam
-    // haritası firmalar arası tutarsız olduğu için VARSAYILAN: boş = tüm ALACAK>0
-    // (devir hariç). Belirli kodlara daraltmak istenirse buraya yazılır (örn [13,20]).
-    izahatCodes: [],
-    minAmount: 0,
-    template: 'Sayın {ad}, {tutar} TL ödemeniz alınmış ve kaydedilmiştir. Güncel bakiyeniz: {bakiye} TL ({durum}). Teşekkür ederiz.',
     verifyOnWhatsApp: true,
     simulateTyping: true,
-    // Cari kartındaki tüm geçerli numaralara (TELEFON1/2/3 vb.) gönder; kapalıysa sadece birincil.
+    // Cari kartındaki tüm geçerli numaralara gönder; kapalıysa sadece birincil.
     sendAllPhones: false,
-    // Opsiyonel görsel/video: data/ altına kaydedilen dosya. { path, mime, kind, name } | null
-    media: null,
+    // Sadece SMS Gönder izni (SMSGONDER=1) olanlara gönder.
+    onlySmsGonder: false,
+    // Belge tipi kuralları — default BOŞ = hiçbir mesaj gönderilmez.
+    //   { id, name, enabled, izahatCodes:[], direction:'alacak'|'borc'|'any',
+    //     minAmount, excludeFatura, template, media:{path,mime,kind,name}|null }
+    rules: [],
 };
 
 let config = { ...DEFAULT_CONFIG };
-let state = { lastSeenInd: {} };  // tableName -> son işlenen IND
-let log = [];                     // son otomatik gönderimler (en yeni başta), tavan 200
-let pending = [];                 // gönderilemeyen mesajlar — diskte saklanır, bağlanınca akar
+let state = { lastSeenInd: {} };
+let log = [];
+let pending = [];
 
-// Kuyruk deneme tavanları: bağlantı yokken sayaç İŞLEMEZ (denenmez bile);
-// sayaçlar yalnızca bağlantı varken alınan yanıtlarla artar.
-const MAX_VERIFY_ATTEMPTS = 3;  // üst üste bu kadar temiz "WhatsApp'ta yok" yanıtı → kalıcı kabul
-const MAX_SEND_ATTEMPTS = 8;    // bağlıyken bu kadar gönderim hatası → vazgeç (failed)
+const MAX_VERIFY_ATTEMPTS = 3;
+const MAX_SEND_ATTEMPTS = 8;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
+
+// ─── Kural normalizasyonu ──────────────────────────────────────────────────────
+let ruleSeq = 1;
+function normalizeRule(r, prev) {
+    const direction = ['alacak', 'borc', 'any'].includes(r.direction) ? r.direction : 'alacak';
+    let codes = r.izahatCodes;
+    if (typeof codes === 'string') codes = codes.split(/[,\s]+/);
+    codes = (Array.isArray(codes) ? codes : []).map(c => parseInt(c, 10)).filter(Number.isFinite);
+    // media: gönderilmediyse aynı id'li eski kuraldan koru (UI media'yı ayrı yükler).
+    const media = (r.media !== undefined) ? r.media : (prev ? prev.media : null);
+    return {
+        id: r.id || `rule-${Date.now()}-${ruleSeq++}`,
+        name: (r.name || '').toString().trim() || 'Mesaj türü',
+        enabled: r.enabled === true,
+        izahatCodes: codes,
+        direction,
+        minAmount: Math.max(0, Number(r.minAmount) || 0),
+        excludeFatura: (r.excludeFatura !== undefined) ? !!r.excludeFatura : (direction === 'alacak'),
+        template: (r.template || '').toString(),
+        media: media || null,
+    };
+}
 
 // ─── Kalıcılık ───────────────────────────────────────────────────────────────
 function configure(d) {
@@ -91,52 +108,66 @@ function configure(d) {
     loadLog();
 }
 
-// ─── Görsel/video (opsiyonel ek) ───────────────────────────────────────────────
-function clearMediaFile() {
-    if (config.media && config.media.path && MEDIA_DIR) {
+// ─── Görsel/video (kural başına) ───────────────────────────────────────────────
+function clearMediaFileByDesc(desc) {
+    if (desc && desc.path && MEDIA_DIR) {
         try {
-            const f = path.join(MEDIA_DIR, config.media.path);
+            const f = path.join(MEDIA_DIR, desc.path);
             if (fs.existsSync(f)) fs.unlinkSync(f);
         } catch (e) { console.error('[Watcher] medya silinemedi:', e.message); }
     }
 }
 
 // file = multer dosyası { buffer, mimetype, originalname }
-function setMedia(file) {
-    if (!file || !file.buffer) return getStatus();
+function setRuleMedia(ruleId, file) {
+    const rule = (config.rules || []).find(r => r.id === ruleId);
+    if (!rule || !file || !file.buffer) return getStatus();
     const mt = file.mimetype || '';
     const kind = mt.startsWith('image/') ? 'image' : mt.startsWith('video/') ? 'video' : 'document';
-    let ext = path.extname(file.originalname || '') || (kind === 'image' ? '.jpg' : kind === 'video' ? '.mp4' : '');
-    clearMediaFile();
-    const fname = `watcher-media${ext}`;
+    const ext = path.extname(file.originalname || '') || (kind === 'image' ? '.jpg' : kind === 'video' ? '.mp4' : '');
+    clearMediaFileByDesc(rule.media);
+    const fname = `watcher-media-${ruleId}${ext}`;
     try { fs.writeFileSync(path.join(MEDIA_DIR, fname), file.buffer); }
     catch (e) { console.error('[Watcher] medya yazılamadı:', e.message); return getStatus(); }
-    config.media = { path: fname, mime: mt, kind, name: file.originalname || fname };
+    rule.media = { path: fname, mime: mt, kind, name: file.originalname || fname };
     saveConfig();
     return getStatus();
 }
 
-function clearMedia() {
-    clearMediaFile();
-    config.media = null;
-    saveConfig();
+function clearRuleMedia(ruleId) {
+    const rule = (config.rules || []).find(r => r.id === ruleId);
+    if (rule) { clearMediaFileByDesc(rule.media); rule.media = null; saveConfig(); }
     return getStatus();
 }
 
-// Kayıtlı medyayı waSend formatına oku (yoksa null → düz metin).
-function loadMediaForSend() {
-    if (!config.media || !config.media.path || !MEDIA_DIR) return null;
+function loadMediaFromDescriptor(desc) {
+    if (!desc || !desc.path || !MEDIA_DIR) return null;
     try {
-        const f = path.join(MEDIA_DIR, config.media.path);
+        const f = path.join(MEDIA_DIR, desc.path);
         if (!fs.existsSync(f)) return null;
-        return { kind: config.media.kind, buffer: fs.readFileSync(f), mimetype: config.media.mime, fileName: config.media.name };
+        return { kind: desc.kind, buffer: fs.readFileSync(f), mimetype: desc.mime, fileName: desc.name };
     } catch (e) { console.error('[Watcher] medya okunamadı:', e.message); return null; }
 }
 
 function loadConfig() {
     try {
         if (fs.existsSync(CONFIG_PATH)) {
-            config = { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) };
+            const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+            config = { ...DEFAULT_CONFIG, ...raw };
+            // Göç: eski tek-şablon config → tek "Tahsilat" kuralı (etkinliği korunur).
+            if (!Array.isArray(config.rules) && (raw.template != null || raw.izahatCodes != null)) {
+                config.rules = [{
+                    id: 'tahsilat', name: 'Tahsilat (ödeme alındı)',
+                    enabled: !!raw.enabled, izahatCodes: raw.izahatCodes || [],
+                    direction: 'alacak', minAmount: raw.minAmount || 0,
+                    excludeFatura: true, template: raw.template || '',
+                    media: raw.media || null,
+                }];
+            }
+            if (!Array.isArray(config.rules)) config.rules = [];
+            config.rules = config.rules.map(r => normalizeRule(r));
+            // eski tek-şablon alanlarını bırak
+            delete config.template; delete config.izahatCodes; delete config.minAmount; delete config.media;
         }
     } catch (e) { console.error('[Watcher] config okunamadı:', e.message); }
 }
@@ -147,122 +178,90 @@ function saveConfig() {
 }
 
 function loadState() {
-    try {
-        if (fs.existsSync(STATE_PATH)) state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
-    } catch (e) { console.error('[Watcher] state okunamadı:', e.message); }
+    try { if (fs.existsSync(STATE_PATH)) state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')); }
+    catch (e) { console.error('[Watcher] state okunamadı:', e.message); }
     if (!state.lastSeenInd) state.lastSeenInd = {};
 }
-
 function saveState() {
     try { fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), 'utf8'); }
     catch (e) { console.error('[Watcher] state yazılamadı:', e.message); }
 }
 
 function loadPending() {
-    try {
-        if (fs.existsSync(PENDING_PATH)) {
-            const p = JSON.parse(fs.readFileSync(PENDING_PATH, 'utf8'));
-            if (Array.isArray(p)) pending = p;
-        }
-    } catch (e) { console.error('[Watcher] kuyruk okunamadı:', e.message); }
+    try { if (fs.existsSync(PENDING_PATH)) { const p = JSON.parse(fs.readFileSync(PENDING_PATH, 'utf8')); if (Array.isArray(p)) pending = p; } }
+    catch (e) { console.error('[Watcher] kuyruk okunamadı:', e.message); }
 }
-
 function savePending() {
     try { fs.writeFileSync(PENDING_PATH, JSON.stringify(pending, null, 2), 'utf8'); }
     catch (e) { console.error('[Watcher] kuyruk yazılamadı:', e.message); }
 }
 
 function loadLog() {
-    try {
-        if (fs.existsSync(LOG_PATH)) {
-            const l = JSON.parse(fs.readFileSync(LOG_PATH, 'utf8'));
-            if (Array.isArray(l)) log = l;
-        }
-    } catch (e) { console.error('[Watcher] günlük okunamadı:', e.message); }
+    try { if (fs.existsSync(LOG_PATH)) { const l = JSON.parse(fs.readFileSync(LOG_PATH, 'utf8')); if (Array.isArray(l)) log = l; } }
+    catch (e) { console.error('[Watcher] günlük okunamadı:', e.message); }
 }
-
 function pushLog(entry) {
     log.unshift({ ...entry, at: new Date().toISOString() });
     if (log.length > 200) log.length = 200;
-    try { fs.writeFileSync(LOG_PATH, JSON.stringify(log), 'utf8'); }
-    catch { /* günlük diske yazılamazsa bellekte devam */ }
+    try { fs.writeFileSync(LOG_PATH, JSON.stringify(log), 'utf8'); } catch { /* bellekte devam */ }
 }
 
-// Kuyruğa ekle. ind+phone çifti zaten kuyruktaysa eklenmez (watermark kaydı ile
-// kuyruk kaydı arasında çökme olursa satır tekrar taranabilir — çift mesaj engeli).
-function enqueue(base, phone, text, reason) {
+// Kuyruğa ekle (ind+phone tekilliği). mediaDesc kuralın görselidir (kalıcı yeniden okuma için).
+function enqueue(base, phone, text, reason, mediaDesc) {
     if (pending.some(p => p.ind === base.ind && p.phone === phone)) return;
     pending.push({
-        ind: base.ind, cariInd: base.cariInd, name: base.name, kod: base.kod,
+        ind: base.ind, cariInd: base.cariInd, name: base.name, firma: base.firma, kod: base.kod,
         tutar: base.tutar, evrak: base.evrak, bakiye: base.bakiye, bakiyeDurum: base.bakiyeDurum,
-        phone, text, attempts: 0, noWaCount: 0,
-        queuedAt: new Date().toISOString(), lastError: reason,
+        ruleName: base.ruleName, phone, text, media: mediaDesc || null,
+        attempts: 0, noWaCount: 0, queuedAt: new Date().toISOString(), lastError: reason,
     });
     savePending();
     pushLog({ ...base, phone, status: 'queued', error: reason, message: text });
 }
 
 const pendingBase = (p) => ({
-    ind: p.ind, cariInd: p.cariInd, name: p.name, kod: p.kod, phone: p.phone,
-    tutar: p.tutar, evrak: p.evrak, bakiye: p.bakiye, bakiyeDurum: p.bakiyeDurum,
+    ind: p.ind, cariInd: p.cariInd, name: p.name, firma: p.firma, kod: p.kod, phone: p.phone,
+    tutar: p.tutar, evrak: p.evrak, bakiye: p.bakiye, bakiyeDurum: p.bakiyeDurum, ruleName: p.ruleName,
 });
 
-// Bekleyen kuyruğu boşaltmayı dene. Bağlantı yokken hiç dokunmaz; bağlıyken
-// sırayla doğrula+gönder, başaranı kuyruktan düş. Gönderilen adedini döndürür.
 async function processPending() {
     if (!pending.length || !deps.waStatus().ready) return 0;
-    const media = loadMediaForSend();
     let sentCount = 0;
     for (const item of [...pending]) {
-        if (!deps.waStatus().ready) break; // bağlantı yine koptu — kalanlar sonraki taramada
+        if (!deps.waStatus().ready) break;
+        const media = loadMediaFromDescriptor(item.media);
         if (config.verifyOnWhatsApp) {
             const chk = await deps.checkOnWhatsApp(item.phone);
             if (!chk.exists) {
-                if (chk.transient) {
-                    // Güvenilmez yanıt (bağlantı az önce geldi / sorgu hatası) → sayma, beklet.
-                    item.lastError = chk.error || 'Doğrulama yapılamadı';
-                    savePending();
-                    continue;
-                }
+                if (chk.transient) { item.lastError = chk.error || 'Doğrulama yapılamadı'; savePending(); continue; }
                 item.noWaCount = (item.noWaCount || 0) + 1;
                 if (item.noWaCount >= MAX_VERIFY_ATTEMPTS) {
-                    pending = pending.filter(p => p !== item);
-                    savePending();
+                    pending = pending.filter(p => p !== item); savePending();
                     pushLog({ ...pendingBase(item), status: 'notOnWhatsApp', error: `WhatsApp kullanıcısı değil (${MAX_VERIFY_ATTEMPTS} doğrulama sonrası)` });
-                } else {
-                    item.lastError = 'WhatsApp kullanıcısı değil (tekrar doğrulanacak)';
-                    savePending();
-                }
+                } else { item.lastError = 'WhatsApp kullanıcısı değil (tekrar doğrulanacak)'; savePending(); }
                 continue;
             }
         }
-        const res = await deps.waSend(item.phone, item.text, media, {
-            simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400),
-        });
+        const res = await deps.waSend(item.phone, item.text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
         if (res.success) {
-            pending = pending.filter(p => p !== item);
-            savePending();
-            sentCount++;
+            pending = pending.filter(p => p !== item); savePending(); sentCount++;
             pushLog({ ...pendingBase(item), status: 'sent', message: item.text });
         } else {
-            item.attempts = (item.attempts || 0) + 1;
-            item.lastError = res.error;
+            item.attempts = (item.attempts || 0) + 1; item.lastError = res.error;
             if (item.attempts >= MAX_SEND_ATTEMPTS) {
                 pending = pending.filter(p => p !== item);
                 pushLog({ ...pendingBase(item), status: 'failed', error: `${res.error} (${MAX_SEND_ATTEMPTS} deneme sonrası vazgeçildi)`, message: item.text });
             }
             savePending();
         }
-        await sleep(rand(2500, 6000)); // insansı gecikme (toplu boşaltmada da geçerli)
+        await sleep(rand(2500, 6000));
     }
     return sentCount;
 }
 
 // ─── Yardımcılar ──────────────────────────────────────────────────────────────
 const tableName = () =>
-    config.firmaNo && config.donemNo
-        ? `F${config.firmaNo}D${config.donemNo}TBLCARIHAREKETLERI`
-        : null;
+    config.firmaNo && config.donemNo ? `F${config.firmaNo}D${config.donemNo}TBLCARIHAREKETLERI` : null;
 
 function fmtAmount(n) {
     const num = Number(n) || 0;
@@ -273,30 +272,27 @@ function renderTemplate(tpl, vars) {
     return String(tpl || '')
         .replace(/\{ad\}/gi, vars.ad || '')
         .replace(/\{unvan\}/gi, vars.ad || '')
+        .replace(/\{firma\}/gi, vars.firma || vars.ad || '')
         .replace(/\{tutar\}/gi, vars.tutar || '')
         .replace(/\{kod\}/gi, vars.kod || '')
         .replace(/\{evrak\}/gi, vars.evrak || '')
+        .replace(/\{belge\}/gi, vars.belge || '')
         .replace(/\{tarih\}/gi, vars.tarih || '')
         .replace(/\{bakiye\}/gi, vars.bakiye || '')
-        .replace(/\{borc\}/gi, vars.borc || '')      // kalan bakiye = {bakiye} ile aynı (işaretsiz tutar)
-        .replace(/\{durum\}/gi, vars.durum || '')    // 'Borç' / 'Alacak' (bakiye 0 ise boş)
-        .replace(/ ?\(\s*\)/g, '');                  // bakiye 0 → "({durum})" boş parantez kalmasın
+        .replace(/\{borc\}/gi, vars.bakiye || '')
+        .replace(/\{durum\}/gi, vars.durum || '')
+        .replace(/ ?\(\s*\)/g, '');
 }
 
 async function tableExists(pool, name) {
     const r = pool.request();
     r.input('tbl', deps.sql.NVarChar, name);
-    const res = await r.query(`
-        SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.TABLES
-        WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME=@tbl
-    `);
+    const res = await r.query(`SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME=@tbl`);
     return res.recordset[0].c > 0;
 }
 
-// Fatura başlık tabloları her taramada sorgulanmasın diye varlık bilgisi önbelleğe
-// alınır; günde 1 kez tazelenir (uygulama haftalarca açık kalabiliyor — tray).
 const SCHEMA_CACHE_MS = 24 * 60 * 60 * 1000;
-let tblExistsCache = {};   // name -> { v, at }
+let tblExistsCache = {};
 async function cachedTableExists(pool, name) {
     const hit = tblExistsCache[name];
     if (hit && Date.now() - hit.at < SCHEMA_CACHE_MS) return hit.v;
@@ -305,12 +301,7 @@ async function cachedTableExists(pool, name) {
     return v;
 }
 
-// Carilerin gerçek kalan borcu: dönem hareket tablosundan SUM(BORC)-SUM(ALACAK)
-// (devir satırları dahil → dönem açılışı + tüm hareketler). Vega'nın kendi ekstre
-// raporu da bakiyeyi aynı formülle hesaplar: SUM(BORC-ALACAK) per FIRMANO.
-// Pozitif = cari bize borçlu, negatif = biz cariye borçluyuz (gerçek DB doğrulandı).
-// TBLCARI.BAKIYE Vega tarafından gecikmeli güncellenebildiği için ödeme anında eski
-// değeri verebiliyor; hareket toplamı, az önce okunan ödeme satırıyla her zaman tutarlıdır.
+// Carilerin gerçek kalan borcu: hareket tablosundan SUM(BORC)-SUM(ALACAK).
 async function fetchKalanBorc(pool, tbl, indList) {
     const map = new Map();
     const ids = indList.map(n => parseInt(n, 10)).filter(Number.isFinite);
@@ -323,6 +314,27 @@ async function fetchKalanBorc(pool, tbl, indList) {
     return map;
 }
 
+// Satırı etkin kurallarla eşleştir (ilk eşleşen kazanır). { rule, amount } | null.
+function matchRule(row, rules) {
+    const code = parseInt(row.IZAHAT, 10);
+    const borc = Number(row.BORC) || 0;
+    const alacak = Number(row.ALACAK) || 0;
+    const isFatura = !!row.isFatura;
+    for (const rule of rules) {
+        if (!rule.enabled) continue;
+        let amount;
+        if (rule.direction === 'borc') { if (!(borc > 0)) continue; amount = borc; }
+        else if (rule.direction === 'alacak') { if (!(alacak > 0)) continue; amount = alacak; }
+        else { amount = borc > 0 ? borc : alacak; if (!(amount > 0)) continue; }
+        if (amount < (rule.minAmount || 0)) continue;
+        const codes = rule.izahatCodes || [];
+        if (codes.length && !codes.includes(code)) continue;
+        if (rule.excludeFatura && isFatura) continue;
+        return { rule, amount };
+    }
+    return null;
+}
+
 // ─── Çekirdek: tek tarama ──────────────────────────────────────────────────────
 async function pollOnce() {
     if (polling) return;
@@ -331,8 +343,6 @@ async function pollOnce() {
     lastError = null;
     let sent = 0, skipped = 0, found = 0, queued = 0;
 
-    // Önce birikmiş kuyruk: DB erişimi gerektirmez, bağlantı geldiyse geçmiş
-    // (gönderilememiş) mesajlar yeni satırlardan önce akar.
     try { sent += await processPending(); }
     catch (e) { console.error('[Watcher] kuyruk işleme hatası:', e.message); }
 
@@ -343,7 +353,9 @@ async function pollOnce() {
         if (!tbl) throw new Error('Firma/dönem seçilmemiş.');
         if (!(await tableExists(pool, tbl))) throw new Error(`Tablo bulunamadı: ${tbl}`);
 
-        // İlk görüşte watermark = mevcut MAX(IND); geçmiş tahsilatlara mesaj atma.
+        const rules = (config.rules || []).filter(r => r.enabled);
+
+        // İlk görüşte watermark = mevcut MAX(IND); geçmişe mesaj atma.
         if (state.lastSeenInd[tbl] == null) {
             const mx = (await pool.request().query(`SELECT ISNULL(MAX(IND),0) AS mx FROM [${tbl}]`)).recordset[0].mx;
             state.lastSeenInd[tbl] = mx;
@@ -353,138 +365,109 @@ async function pollOnce() {
         }
 
         const lastSeen = state.lastSeenInd[tbl];
-        const codes = (config.izahatCodes || []).map(c => parseInt(c, 10)).filter(Number.isFinite);
-        // Daima devir hariç; kod listesi verilmişse o kodlarla sınırla.
-        const devirFilter = ` AND TRY_CAST(h.IZAHAT AS INT) NOT IN (${DEVIR_CODES.join(',')})`;
-        const codeFilter = codes.length
-            ? ` AND TRY_CAST(h.IZAHAT AS INT) IN (${codes.join(',')})`
-            : '';
 
-        // Fatura kaynaklı ALACAK satırlarını ele (fatura girişi tahsilat değildir):
-        //  1) Aynı evrak + cari + günde BORC satırı varsa → peşin fatura/fiş çifti.
-        //  2) EVRAKNO alış/satış fatura başlığında kayıtlıysa → fatura kaydı.
-        const pairFilter = `
-            AND NOT EXISTS (SELECT 1 FROM [${tbl}] b
-                WHERE b.FIRMANO = h.FIRMANO AND b.EVRAKNO = h.EVRAKNO AND b.BORC > 0
-                  AND b.IND <> h.IND AND CONVERT(date, b.TARIH) = CONVERT(date, h.TARIH))`;
-        let faturaFilter = '';
-        for (const [suffix, alias] of [['TBLALFATBASLIK', 'fal'], ['TBLSATFATBASLIK', 'fst']]) {
-            const ft = `F${config.firmaNo}D${config.donemNo}${suffix}`;
-            if (await cachedTableExists(pool, ft)) {
-                faturaFilter += `
-            AND NOT EXISTS (SELECT 1 FROM [${ft}] ${alias}
-                WHERE ${alias}.BELGENO = h.EVRAKNO AND ${alias}.FIRMANO = h.FIRMANO)`;
-            }
-        }
-
-        // Yeni satırların tavanı: fatura/BORC satırları filtrelense de watermark ilerleyebilsin.
+        // Watermark tavanı (kural eşleşmese de ilerleyebilsin).
         const rMax = pool.request();
         rMax.input('last', deps.sql.Int, lastSeen);
-        const newMax = (await rMax.query(`
-            SELECT ISNULL(MAX(IND), @last) AS mx FROM [${tbl}] WHERE IND > @last
-        `)).recordset[0].mx;
+        const newMax = (await rMax.query(`SELECT ISNULL(MAX(IND), @last) AS mx FROM [${tbl}] WHERE IND > @last`)).recordset[0].mx;
 
-        const r = pool.request();
-        r.input('last', deps.sql.Int, lastSeen);
-        r.input('minAmt', deps.sql.Decimal(18, 2), config.minAmount || 0);
-        const rows = (await r.query(`
-            SELECT h.IND, h.FIRMANO, h.ALACAK, h.BAKIYE, h.EVRAKNO, h.TARIH, h.IZAHAT, h.PARABIRIMI
-            FROM [${tbl}] h
-            WHERE h.IND > @last AND h.ALACAK > @minAmt${devirFilter}${codeFilter}${pairFilter}${faturaFilter}
-            ORDER BY h.IND ASC
-        `)).recordset;
-
-        found = rows.length;
-        if (!found) {
+        // Hiç etkin kural yoksa: tarama sadece watermark'ı ilerletir (DB yükü minimum).
+        if (!rules.length) {
             if (newMax > lastSeen) { state.lastSeenInd[tbl] = newMax; saveState(); }
-            lastResult = {
-                sent, skipped, found,
-                note: sent ? `Kuyruktan ${sent} gönderildi` : (pending.length ? `Yeni tahsilat yok (kuyrukta ${pending.length})` : 'Yeni tahsilat yok'),
-            };
+            lastResult = { sent, skipped, found: 0, note: sent ? `Kuyruktan ${sent} gönderildi` : 'Etkin belge tipi kuralı yok' };
             return;
         }
 
-        // Cari iletişim bilgilerini topluca çöz (FIRMANO = TBLCARI.IND)
-        const inds = [...new Set(rows.map(x => x.FIRMANO).filter(v => v != null))];
-        const contacts = await deps.resolveCariContacts(config.firmaNo, inds); // Map<ind,{name,kod,phone,valid,bakiye}>
-        // Gerçek kalan borç hareket toplamından; TBLCARI.BAKIYE sadece yedek.
+        const devirFilter = ` AND TRY_CAST(h.IZAHAT AS INT) NOT IN (${DEVIR_CODES.join(',')})`;
+
+        // isFatura bayrağı: peşin fatura oto-ödeme çifti VEYA fatura başlık kaydı.
+        const pairExpr = `EXISTS (SELECT 1 FROM [${tbl}] b
+            WHERE b.FIRMANO = h.FIRMANO AND b.EVRAKNO = h.EVRAKNO AND b.BORC > 0
+              AND b.IND <> h.IND AND CONVERT(date, b.TARIH) = CONVERT(date, h.TARIH))`;
+        const faturaParts = [pairExpr];
+        for (const [suffix, alias] of [['TBLALFATBASLIK', 'fal'], ['TBLSATFATBASLIK', 'fst']]) {
+            const ft = `F${config.firmaNo}D${config.donemNo}${suffix}`;
+            if (await cachedTableExists(pool, ft)) {
+                faturaParts.push(`EXISTS (SELECT 1 FROM [${ft}] ${alias} WHERE ${alias}.BELGENO = h.EVRAKNO AND ${alias}.FIRMANO = h.FIRMANO)`);
+            }
+        }
+        const isFaturaExpr = faturaParts.join(' OR ');
+
+        const r = pool.request();
+        r.input('last', deps.sql.Int, lastSeen);
+        const rows = (await r.query(`
+            SELECT h.IND, h.FIRMANO, h.BORC, h.ALACAK, h.BAKIYE, h.EVRAKNO, h.TARIH, h.IZAHAT, h.PARABIRIMI,
+                   CASE WHEN ${isFaturaExpr} THEN 1 ELSE 0 END AS isFatura
+            FROM [${tbl}] h
+            WHERE h.IND > @last AND (h.BORC > 0 OR h.ALACAK > 0)${devirFilter}
+            ORDER BY h.IND ASC
+        `)).recordset;
+
+        // Kural eşleşen satırları ayıkla
+        const matched = [];
+        for (const row of rows) {
+            const m = matchRule(row, rules);
+            if (m) matched.push({ row, rule: m.rule, amount: m.amount });
+        }
+        found = matched.length;
+        if (!found) {
+            if (newMax > lastSeen) { state.lastSeenInd[tbl] = newMax; saveState(); }
+            lastResult = { sent, skipped, found, note: sent ? `Kuyruktan ${sent} gönderildi` : (pending.length ? `Yeni belge yok (kuyrukta ${pending.length})` : 'Yeni belge yok') };
+            return;
+        }
+
+        // Cari iletişim + kalan borç topluca çöz
+        const inds = [...new Set(matched.map(x => x.row.FIRMANO).filter(v => v != null))];
+        const contacts = await deps.resolveCariContacts(config.firmaNo, inds);
         const borcMap = await fetchKalanBorc(pool, tbl, inds);
 
-        // Opsiyonel görsel/video — bir kez oku, tüm alıcılara aynı buffer.
-        const media = loadMediaForSend();
-
-        // Gönderilemeyen her satır kalıcı kuyruğa alınır (watermark daima ilerler;
-        // satırın sahibi artık kuyruktur). Eski "watermark'ı geri çek" yaklaşımı,
-        // uygulama kapanınca veya doğrulama yanlış "yok" dediğinde mesaj kaybediyordu.
-        for (const row of rows) {
+        for (const { row, rule, amount } of matched) {
             const c = contacts.get(row.FIRMANO) || {};
-            // Kalan borç = hareket toplamı (ödeme satırı dahil, anlık tutarlı). Pozitif = borç.
-            // TBLCARI.BAKIYE gecikmeli güncellenebildiğinden sadece yedek olarak kullanılır.
-            const kalanBorc = borcMap.has(row.FIRMANO) ? borcMap.get(row.FIRMANO)
-                : (c.bakiye != null ? c.bakiye : null);
-            // Bakiye işaretsiz yazılır; yönü {durum} söyler (pozitif = cari borçlu).
+            const kalanBorc = borcMap.has(row.FIRMANO) ? borcMap.get(row.FIRMANO) : (c.bakiye != null ? c.bakiye : null);
             const bakiyeStr = kalanBorc != null ? fmtAmount(Math.abs(kalanBorc)) : '';
             const durum = kalanBorc == null ? '' : (kalanBorc > 0 ? 'Borç' : kalanBorc < 0 ? 'Alacak' : '');
             const base = {
                 ind: row.IND, cariInd: row.FIRMANO, name: c.name || String(row.FIRMANO),
-                kod: c.kod || '', phone: c.phone || null,
-                tutar: fmtAmount(row.ALACAK), evrak: row.EVRAKNO || '',
-                bakiye: bakiyeStr, bakiyeDurum: durum,
+                firma: c.firma || c.name || String(row.FIRMANO), kod: c.kod || '', phone: c.phone || null,
+                tutar: fmtAmount(amount), evrak: row.EVRAKNO || '', bakiye: bakiyeStr, bakiyeDurum: durum,
+                ruleName: rule.name,
             };
 
+            if (config.onlySmsGonder && !c.smsGonder) {
+                skipped++; pushLog({ ...base, status: 'noSmsConsent', error: 'SMS Gönder izni yok (SMSGONDER kapalı)' }); continue;
+            }
             if (!c.phone || !c.valid) {
-                skipped++;
-                pushLog({ ...base, status: 'noPhone', error: 'Geçerli telefon yok' });
-                continue;
+                skipped++; pushLog({ ...base, status: 'noPhone', error: 'Geçerli telefon yok' }); continue;
             }
 
-            const text = renderTemplate(config.template, {
-                ad: c.name, tutar: fmtAmount(row.ALACAK), kod: c.kod,
-                evrak: row.EVRAKNO || '',
+            const text = renderTemplate(rule.template, {
+                ad: c.name, firma: c.firma, tutar: fmtAmount(amount), kod: c.kod, evrak: row.EVRAKNO || '',
+                belge: rule.name,
                 tarih: row.TARIH ? new Date(row.TARIH).toLocaleDateString('tr-TR') : '',
-                bakiye: bakiyeStr, borc: bakiyeStr, durum,
+                bakiye: bakiyeStr, durum,
             });
+            const media = loadMediaFromDescriptor(rule.media);
 
-            // Seçenek açıksa karttaki tüm geçerli numaralara, değilse sadece birincile.
-            const targets = (config.sendAllPhones && Array.isArray(c.phones) && c.phones.length)
-                ? c.phones : [c.phone];
+            const targets = (config.sendAllPhones && Array.isArray(c.phones) && c.phones.length) ? c.phones : [c.phone];
             for (const phone of targets) {
                 if (!deps.waStatus().ready) {
-                    enqueue(base, phone, text, 'WhatsApp bağlı değil — kuyruğa alındı, bağlanınca gönderilecek');
-                    queued++;
-                    continue;
+                    enqueue(base, phone, text, 'WhatsApp bağlı değil — kuyruğa alındı, bağlanınca gönderilecek', rule.media); queued++; continue;
                 }
                 if (config.verifyOnWhatsApp) {
                     const chk = await deps.checkOnWhatsApp(phone);
                     if (!chk.exists) {
-                        if (chk.transient) {
-                            // Yanıt güvenilmez (bağlantı sorunu / boş yanıt) → kalıcı atlama YOK.
-                            enqueue(base, phone, text, `Doğrulanamadı (${chk.error || 'geçici hata'}) — kuyruğa alındı`);
-                            queued++;
-                        } else {
-                            skipped++;
-                            pushLog({ ...base, phone, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' });
-                        }
+                        if (chk.transient) { enqueue(base, phone, text, `Doğrulanamadı (${chk.error || 'geçici hata'}) — kuyruğa alındı`, rule.media); queued++; }
+                        else { skipped++; pushLog({ ...base, phone, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' }); }
                         continue;
                     }
                 }
-
-                const res = await deps.waSend(phone, text, media, {
-                    simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400),
-                });
-                // Gönderilen metin log'a yazılır → arayüzde popup'ta görüntülenir.
+                const res = await deps.waSend(phone, text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
                 if (res.success) { sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
-                else {
-                    // Gönderim hatası çoğunlukla geçici (bağlantı o an koptu) → kuyruğa.
-                    enqueue(base, phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`);
-                    queued++;
-                }
-
-                await sleep(rand(2500, 6000)); // düşük hacim — küçük insansı gecikme
+                else { enqueue(base, phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`, rule.media); queued++; }
+                await sleep(rand(2500, 6000));
             }
         }
 
-        // Watermark daima yeni tavana çekilir; gönderilemeyenler kuyrukta yaşar.
         if (newMax > state.lastSeenInd[tbl]) { state.lastSeenInd[tbl] = newMax; saveState(); }
         const bits = [`${sent} gönderildi`];
         if (queued) bits.push(`${queued} kuyrukta`);
@@ -520,21 +503,20 @@ function stop() {
     saveConfig();
 }
 
-// Sunucu açılışında: kayıtlı config enabled ise otomatik başlat.
 function autoStart() {
     if (config.enabled && config.firmaNo && config.donemNo) start();
 }
 
-function getConfig() {
-    return { ...config };
-}
+function getConfig() { return { ...config }; }
 
 function setConfig(patch) {
-    config = { ...config, ...patch };
-    // izahatCodes string gelebilir → diziye çevir
-    if (typeof config.izahatCodes === 'string') {
-        config.izahatCodes = config.izahatCodes.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).map(Number).filter(Number.isFinite);
+    const prevRules = config.rules || [];
+    const next = { ...config, ...patch };
+    if (patch.rules !== undefined) {
+        const arr = Array.isArray(patch.rules) ? patch.rules : [];
+        next.rules = arr.map(r => normalizeRule(r, prevRules.find(p => p.id === r.id)));
     }
+    config = next;
     saveConfig();
     return getConfig();
 }
@@ -544,11 +526,13 @@ function getStatus() {
         running, enabled: config.enabled,
         firmaNo: config.firmaNo, donemNo: config.donemNo,
         table: tableName(), intervalSec: config.intervalSec,
-        izahatCodes: config.izahatCodes, minAmount: config.minAmount,
-        template: config.template,
         verifyOnWhatsApp: config.verifyOnWhatsApp, simulateTyping: config.simulateTyping,
-        sendAllPhones: config.sendAllPhones === true,
-        media: config.media ? { name: config.media.name, kind: config.media.kind } : null,
+        sendAllPhones: config.sendAllPhones === true, onlySmsGonder: config.onlySmsGonder === true,
+        rules: (config.rules || []).map(r => ({
+            id: r.id, name: r.name, enabled: r.enabled, izahatCodes: r.izahatCodes,
+            direction: r.direction, minAmount: r.minAmount, excludeFatura: r.excludeFatura,
+            template: r.template, media: r.media ? { name: r.media.name, kind: r.media.kind } : null,
+        })),
         lastPollAt, lastError, lastResult,
         watermark: tableName() ? (state.lastSeenInd[tableName()] ?? null) : null,
         pendingCount: pending.length,
@@ -557,7 +541,6 @@ function getStatus() {
 
 function getLog() { return log; }
 
-// Firma/dönem değişince eski watermark karışmasın diye sıfırlamayı çağıran için.
 function resetWatermark() {
     const t = tableName();
     if (t) { delete state.lastSeenInd[t]; saveState(); }
@@ -566,5 +549,5 @@ function resetWatermark() {
 module.exports = {
     configure, autoStart, start, stop,
     getConfig, setConfig, getStatus, getLog, resetWatermark, pollOnce,
-    setMedia, clearMedia,
+    setRuleMedia, clearRuleMedia,
 };
