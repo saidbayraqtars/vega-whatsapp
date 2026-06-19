@@ -42,6 +42,63 @@ let lastResult = null;
 // Devir (yıl başı açılış) kodları — bunlar belge değil, daima hariç tutulur.
 const DEVIR_CODES = [103, 104];
 
+// ─── Belge tipi sınıflandırması (VegaDB ile ampirik doğrulandı 2026-06) ─────────
+// Her cari hareket satırı bir belge tipine sınıflanır. Sınıflama hibrit:
+//   1) EVRAKNO'nun ilgili belge başlık tablosunda olması (AUTORİTE),
+//   2) standart Vega IZAHAT işlem kodu (yedek; tablo üyeliği yoksa).
+// Sıra = öncelik (ilk eşleşen kazanır). Ödeme (cari giriş/çıkış) faturadan önce
+// gelir: peşin satışta tahsilat satırı "ödeme alındı" sınıfını korur.
+//   Standart kodlar (F0101 EXPERT BİLİŞİM ile doğrulandı):
+//     13=Cari Giriş/Tahsilat  11=Cari Çıkış/Tediye  21=Satış Faturası
+//     20=Alış Faturası  33=Stok Çıkış Fişi  32=Stok Giriş Fişi
+// dir: ödeme tipleri yalnız doğru işaretli satırda sınıflanır (peşin stok çıkışı
+// gibi paylaşılan EVRAKNO'lu BORC satırı tahsilat sayılmasın).
+const DOC_PRIORITY = [
+    { docType: 'cariGiris',      suffixes: ['TBLCARGIRBASLIK'], codes: [13], dir: 'alacak' },
+    { docType: 'cariCikis',      suffixes: ['TBLCARCIKBASLIK'], codes: [11], dir: 'borc' },
+    { docType: 'satisFaturasi',  suffixes: ['TBLSATFATBASLIK', 'TBLSATVADFATBASLIK', 'TBLPSATFATBASLIK'], codes: [21] },
+    { docType: 'alisFaturasi',   suffixes: ['TBLALFATBASLIK', 'TBLALVADFATBASLIK'], codes: [20] },
+    { docType: 'satisIrsaliyesi', suffixes: ['TBLSATIRSBASLIK'], codes: [] },
+    { docType: 'alisIrsaliyesi', suffixes: ['TBLALIRSBASLIK'], codes: [] },
+    { docType: 'stokCikis',      suffixes: ['TBLSTKCIKBASLIK'], codes: [33] },
+    { docType: 'stokGiris',      suffixes: ['TBLSTKGIRBASLIK'], codes: [32] },
+];
+// Tek kod → docType (eski kod-bazlı kuralları docType'a göç için).
+const CODE_TO_DOCTYPE = { 13: 'cariGiris', 11: 'cariCikis', 21: 'satisFaturasi', 20: 'alisFaturasi', 33: 'stokCikis', 32: 'stokGiris' };
+
+// ─── Hazır belge-tipi şablonları (kullanıcı bunlar üzerinden düzenler) ──────────
+// Tümü default PASİF. docType belirli olunca yön/kod/fatura-dışlama OTOMATİK
+// (yanlış yapılandırılamaz; örn. stok çıkışı asla "ödeme alındı" sınıfına düşmez).
+const PRESET_RULES = [
+    {
+        id: 'satisFaturasi', docType: 'satisFaturasi', name: 'Satış Faturası',
+        direction: 'borc', izahatCodes: [21], excludeFatura: false, enabled: false,
+        template: 'Sayın {firma}, {tarih} tarihli {tutar} TL tutarındaki satış faturanız düzenlenmiştir. Güncel bakiyeniz: {bakiye} TL ({durum}). Bizi tercih ettiğiniz için teşekkür ederiz.',
+    },
+    {
+        id: 'satisIrsaliyesi', docType: 'satisIrsaliyesi', name: 'Satış İrsaliyesi',
+        direction: 'any', izahatCodes: [], excludeFatura: false, enabled: false,
+        template: 'Sayın {firma}, {tarih} tarihli {tutar} TL tutarındaki satış irsaliyeniz (sevk belgeniz) düzenlenmiştir. Bilginize sunarız.',
+    },
+    {
+        id: 'stokCikis', docType: 'stokCikis', name: 'Stok Çıkış Fişi',
+        direction: 'any', izahatCodes: [33], excludeFatura: false, enabled: false,
+        template: 'Sayın {firma}, {tarih} tarihli {tutar} TL tutarındaki mal/ürün çıkışınız (sevkiyat) gerçekleştirilmiştir. Bilginize sunarız.',
+    },
+    {
+        id: 'cariGiris', docType: 'cariGiris', name: 'Cari Giriş (Tahsilat)',
+        direction: 'alacak', izahatCodes: [13], excludeFatura: true, enabled: false,
+        template: 'Sayın {firma}, {tarih} tarihinde hesabınıza {tutar} TL tutarında ödemeniz alınmıştır. Güncel bakiyeniz: {bakiye} TL ({durum}). Teşekkür ederiz.',
+    },
+    {
+        id: 'cariCikis', docType: 'cariCikis', name: 'Cari Çıkış (Tediye)',
+        direction: 'borc', izahatCodes: [11], excludeFatura: false, enabled: false,
+        template: 'Sayın {firma}, {tarih} tarihinde tarafınıza {tutar} TL tutarında ödeme gerçekleştirilmiştir. Güncel bakiyeniz: {bakiye} TL ({durum}). Bilginize sunarız.',
+    },
+];
+const PRESET_BY_TYPE = Object.fromEntries(PRESET_RULES.map(p => [p.docType, p]));
+const VALID_DOCTYPES = new Set([...PRESET_RULES.map(p => p.docType), 'satisIrsaliyesi', 'alisIrsaliyesi', 'stokGiris', 'alisFaturasi', 'custom']);
+
 const DEFAULT_CONFIG = {
     enabled: false,
     firmaNo: null,
@@ -53,8 +110,8 @@ const DEFAULT_CONFIG = {
     sendAllPhones: false,
     // Sadece SMS Gönder izni (SMSGONDER=1) olanlara gönder.
     onlySmsGonder: false,
-    // Belge tipi kuralları — default BOŞ = hiçbir mesaj gönderilmez.
-    //   { id, name, enabled, izahatCodes:[], direction:'alacak'|'borc'|'any',
+    // Belge tipi kuralları. loadConfig ilk açılışta PRESET_RULES ile doldurur.
+    //   { id, docType, name, enabled, izahatCodes:[], direction:'alacak'|'borc'|'any',
     //     minAmount, excludeFatura, template, media:{path,mime,kind,name}|null }
     rules: [],
 };
@@ -72,24 +129,77 @@ const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
 
 // ─── Kural normalizasyonu ──────────────────────────────────────────────────────
 let ruleSeq = 1;
-function normalizeRule(r, prev) {
-    const direction = ['alacak', 'borc', 'any'].includes(r.direction) ? r.direction : 'alacak';
-    let codes = r.izahatCodes;
+
+function parseCodes(codes) {
     if (typeof codes === 'string') codes = codes.split(/[,\s]+/);
-    codes = (Array.isArray(codes) ? codes : []).map(c => parseInt(c, 10)).filter(Number.isFinite);
+    return (Array.isArray(codes) ? codes : []).map(c => parseInt(c, 10)).filter(Number.isFinite);
+}
+
+// Kuralın belge tipini çöz: açık docType > id > kod eşlemesi > ad ipucu > 'custom'.
+// Eski (docType'sız) kuralları yeni belge-tipi modeline göç ettirir; özellikle
+// boş-kod alacak "Tahsilat" kuralı → 'cariGiris' (stok çıkış bug'ını kapatır).
+function inferDocType(r) {
+    if (r.docType && VALID_DOCTYPES.has(r.docType)) return r.docType;
+    if (PRESET_BY_TYPE[r.id]) return r.id;
+    const codes = parseCodes(r.izahatCodes);
+    if (codes.length) {
+        const set = new Set(codes.map(c => CODE_TO_DOCTYPE[c]).filter(Boolean));
+        if (set.size === 1 && codes.every(c => CODE_TO_DOCTYPE[c])) return [...set][0];
+    }
+    const name = (r.name || '').toLocaleLowerCase('tr-TR');
+    if (/tahsilat|ödeme alın|odeme alin|cari giriş|cari giris/.test(name)) return 'cariGiris';
+    if (/tediye|cari çıkış|cari cikis/.test(name)) return 'cariCikis';
+    if (/satış fat|satis fat/.test(name)) return 'satisFaturasi';
+    if (/alış fat|alis fat/.test(name)) return 'alisFaturasi';
+    if (/satış irs|satis irs/.test(name)) return 'satisIrsaliyesi';
+    if (/stok çıkış|stok cikis/.test(name)) return 'stokCikis';
+    if (/stok giriş|stok giris/.test(name)) return 'stokGiris';
+    return 'custom';
+}
+
+function normalizeRule(r, prev) {
+    const docType = inferDocType(r);
+    const preset = PRESET_BY_TYPE[docType];
+    // Hazır tip seçiliyse yön/kod/fatura-dışlama OTOMATİK (preset'ten); kullanıcı
+    // yalnız ad/şablon/etkin/min tutar/medya değiştirir → yanlış yapılandırma olmaz.
+    let direction, codes, excludeFatura;
+    if (preset) {
+        direction = preset.direction;
+        codes = preset.izahatCodes.slice();
+        excludeFatura = preset.excludeFatura;
+    } else {
+        direction = ['alacak', 'borc', 'any'].includes(r.direction) ? r.direction : 'alacak';
+        codes = parseCodes(r.izahatCodes);
+        excludeFatura = (r.excludeFatura !== undefined) ? !!r.excludeFatura : (direction === 'alacak');
+    }
     // media: gönderilmediyse aynı id'li eski kuraldan koru (UI media'yı ayrı yükler).
     const media = (r.media !== undefined) ? r.media : (prev ? prev.media : null);
+    // template: tanımsızsa (tohumlama) preset'ten; boş string ise kullanıcı sildi → boş.
+    const template = (r.template !== undefined && r.template !== null)
+        ? String(r.template) : (preset ? preset.template : '');
     return {
-        id: r.id || `rule-${Date.now()}-${ruleSeq++}`,
-        name: (r.name || '').toString().trim() || 'Mesaj türü',
+        id: r.id || (preset ? preset.id : `rule-${Date.now()}-${ruleSeq++}`),
+        docType,
+        name: (r.name || '').toString().trim() || (preset ? preset.name : 'Mesaj türü'),
         enabled: r.enabled === true,
         izahatCodes: codes,
         direction,
         minAmount: Math.max(0, Number(r.minAmount) || 0),
-        excludeFatura: (r.excludeFatura !== undefined) ? !!r.excludeFatura : (direction === 'alacak'),
-        template: (r.template || '').toString(),
+        excludeFatura,
+        template,
         media: media || null,
     };
+}
+
+// Eksik hazır tipleri (disabled) ekle — yeni kurulum tüm preset'leri alır; mevcut
+// kullanıcılar güncellemede yeni belge tiplerini kazanır. docType'a göre tekilleştirir.
+function ensurePresets(rules) {
+    const present = new Set(rules.map(r => r.docType).filter(Boolean));
+    const out = [...rules];
+    for (const p of PRESET_RULES) {
+        if (!present.has(p.docType)) out.push(normalizeRule(p));
+    }
+    return out;
 }
 
 // ─── Kalıcılık ───────────────────────────────────────────────────────────────
@@ -154,14 +264,12 @@ function loadConfig() {
         if (fs.existsSync(CONFIG_PATH)) {
             const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
             config = { ...DEFAULT_CONFIG, ...raw };
-            // Göç: eski tek-şablon config → tek "Tahsilat" kuralı (etkinliği korunur).
+            // Göç: eski tek-şablon config → "Cari Giriş (Tahsilat)" kuralı.
             if (!Array.isArray(config.rules) && (raw.template != null || raw.izahatCodes != null)) {
                 config.rules = [{
-                    id: 'tahsilat', name: 'Tahsilat (ödeme alındı)',
-                    enabled: !!raw.enabled, izahatCodes: raw.izahatCodes || [],
-                    direction: 'alacak', minAmount: raw.minAmount || 0,
-                    excludeFatura: true, template: raw.template || '',
-                    media: raw.media || null,
+                    id: 'cariGiris', docType: 'cariGiris', name: 'Cari Giriş (Tahsilat)',
+                    enabled: !!raw.enabled, template: raw.template || '',
+                    minAmount: raw.minAmount || 0, media: raw.media || null,
                 }];
             }
             if (!Array.isArray(config.rules)) config.rules = [];
@@ -170,6 +278,8 @@ function loadConfig() {
             delete config.template; delete config.izahatCodes; delete config.minAmount; delete config.media;
         }
     } catch (e) { console.error('[Watcher] config okunamadı:', e.message); }
+    // Eksik hazır belge tiplerini her zaman ekle (yeni kurulum = tümü; mevcut = yeni olanlar).
+    config.rules = ensurePresets(Array.isArray(config.rules) ? config.rules : []);
 }
 
 function saveConfig() {
@@ -301,6 +411,45 @@ async function cachedTableExists(pool, name) {
     return v;
 }
 
+// Belge başlık tablosu BELGENO+FIRMANO sütunlarıyla cari harekete bağlanabilir mi?
+let docColsCache = {};
+async function cachedHasDocCols(pool, name) {
+    const hit = docColsCache[name];
+    if (hit && Date.now() - hit.at < SCHEMA_CACHE_MS) return hit.v;
+    let v = false;
+    try {
+        const r = pool.request();
+        r.input('tbl', deps.sql.NVarChar, name);
+        const res = await r.query(`SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME=@tbl AND COLUMN_NAME IN ('BELGENO','FIRMANO')`);
+        v = res.recordset[0].c >= 2;
+    } catch { v = false; }
+    docColsCache[name] = { v, at: Date.now() };
+    return v;
+}
+
+// Cari hareket satırını belge tipine sınıflayan SQL CASE'i kur (DOC_PRIORITY sırası).
+// Tablo üyeliği (varsa, BELGENO+FIRMANO ile) + standart IZAHAT kodu yedeği.
+async function buildDocTypeCase(pool) {
+    const whens = [];
+    for (const { docType, suffixes, codes, dir } of DOC_PRIORITY) {
+        const conds = [];
+        for (const suf of suffixes || []) {
+            const ft = `F${config.firmaNo}D${config.donemNo}${suf}`;
+            if (await cachedTableExists(pool, ft) && await cachedHasDocCols(pool, ft)) {
+                conds.push(`EXISTS(SELECT 1 FROM [${ft}] dt WHERE dt.BELGENO=h.EVRAKNO AND dt.FIRMANO=h.FIRMANO)`);
+            }
+        }
+        if (codes && codes.length) conds.push(`TRY_CAST(h.IZAHAT AS INT) IN (${codes.join(',')})`);
+        if (!conds.length) continue;
+        let when = `(${conds.join(' OR ')})`;
+        if (dir === 'alacak') when = `h.ALACAK > 0 AND ${when}`;
+        else if (dir === 'borc') when = `h.BORC > 0 AND ${when}`;
+        whens.push(`WHEN ${when} THEN '${docType}'`);
+    }
+    return whens.length ? `CASE ${whens.join(' ')} ELSE 'diger' END` : `'diger'`;
+}
+
 // Carilerin gerçek kalan borcu: hareket tablosundan SUM(BORC)-SUM(ALACAK).
 async function fetchKalanBorc(pool, tbl, indList) {
     const map = new Map();
@@ -315,11 +464,14 @@ async function fetchKalanBorc(pool, tbl, indList) {
 }
 
 // Satırı etkin kurallarla eşleştir (ilk eşleşen kazanır). { rule, amount } | null.
+// Hazır tip kuralı → satırın sınıflanmış docType'ı ile eşleşir (kod+tablo authority).
+// Özel kural → IZAHAT kodları + yön ile eşleşir (geriye uyum).
 function matchRule(row, rules) {
     const code = parseInt(row.IZAHAT, 10);
     const borc = Number(row.BORC) || 0;
     const alacak = Number(row.ALACAK) || 0;
     const isFatura = !!row.isFatura;
+    const rowDocType = row.docType || 'diger';
     for (const rule of rules) {
         if (!rule.enabled) continue;
         let amount;
@@ -327,8 +479,12 @@ function matchRule(row, rules) {
         else if (rule.direction === 'alacak') { if (!(alacak > 0)) continue; amount = alacak; }
         else { amount = borc > 0 ? borc : alacak; if (!(amount > 0)) continue; }
         if (amount < (rule.minAmount || 0)) continue;
-        const codes = rule.izahatCodes || [];
-        if (codes.length && !codes.includes(code)) continue;
+        if (rule.docType && rule.docType !== 'custom') {
+            if (rowDocType !== rule.docType) continue;
+        } else {
+            const codes = rule.izahatCodes || [];
+            if (codes.length && !codes.includes(code)) continue;
+        }
         if (rule.excludeFatura && isFatura) continue;
         return { rule, amount };
     }
@@ -392,12 +548,14 @@ async function pollOnce() {
             }
         }
         const isFaturaExpr = faturaParts.join(' OR ');
+        const docTypeExpr = await buildDocTypeCase(pool);
 
         const r = pool.request();
         r.input('last', deps.sql.Int, lastSeen);
         const rows = (await r.query(`
             SELECT h.IND, h.FIRMANO, h.BORC, h.ALACAK, h.BAKIYE, h.EVRAKNO, h.TARIH, h.IZAHAT, h.PARABIRIMI,
-                   CASE WHEN ${isFaturaExpr} THEN 1 ELSE 0 END AS isFatura
+                   CASE WHEN ${isFaturaExpr} THEN 1 ELSE 0 END AS isFatura,
+                   ${docTypeExpr} AS docType
             FROM [${tbl}] h
             WHERE h.IND > @last AND (h.BORC > 0 OR h.ALACAK > 0)${devirFilter}
             ORDER BY h.IND ASC
@@ -529,7 +687,7 @@ function getStatus() {
         verifyOnWhatsApp: config.verifyOnWhatsApp, simulateTyping: config.simulateTyping,
         sendAllPhones: config.sendAllPhones === true, onlySmsGonder: config.onlySmsGonder === true,
         rules: (config.rules || []).map(r => ({
-            id: r.id, name: r.name, enabled: r.enabled, izahatCodes: r.izahatCodes,
+            id: r.id, docType: r.docType, name: r.name, enabled: r.enabled, izahatCodes: r.izahatCodes,
             direction: r.direction, minAmount: r.minAmount, excludeFatura: r.excludeFatura,
             template: r.template, media: r.media ? { name: r.media.name, kind: r.media.kind } : null,
         })),

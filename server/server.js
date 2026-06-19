@@ -746,11 +746,13 @@ app.get('/api/watcher/izahat-stats', async (req, res) => {
             HAVING SUM(ALACAK) > 0
             ORDER BY toplamAlacak DESC
         `)).recordset;
-        // Bilinen etiketler — bu DB'de gerçek veriyle doğrulandı (2026-06). Kod→anlam
-        // haritası firmalar arası değişebilir; etiketler sadece bilgilendirme amaçlı.
+        // Standart Vega işlem (evrak) kodları — F0101 EXPERT BİLİŞİM ile ampirik
+        // doğrulandı (2026-06). Belge başlık tablolarına EVRAKNO=BELGENO join ile.
         const KNOWN = {
-            13: 'Visa Giriş Bordrosu', 14: 'Visa Giriş İade Bordrosu', 20: 'Havale Giriş Bordrosu',
-            32: 'Nakit Giriş Bordrosu', 83: 'Manuel Fiş',
+            11: 'Cari Çıkış Bordrosu (Tediye)', 13: 'Cari Giriş Bordrosu (Tahsilat)',
+            20: 'Alış Faturası', 21: 'Satış Faturası', 22: 'Alış İade / İrsaliye',
+            23: 'Satış İade Faturası', 32: 'Stok Giriş Fişi', 33: 'Stok Çıkış Fişi',
+            83: 'Manuel / Mahsup Fiş',
             103: 'Cari Devir (açılış)', 104: 'Cari Devir (borç)',
         };
         const data = rows.map(r => ({ ...r, label: KNOWN[r.code] || '', devir: [103, 104].includes(r.code) }));

@@ -556,6 +556,18 @@ document.querySelectorAll('.tab').forEach(t => {
 // Belge tipi şablonunda kullanılabilir değişkenler (kart başına chip).
 const WC_VARS = ['{firma}', '{ad}', '{tutar}', '{kod}', '{evrak}', '{tarih}', '{bakiye}', '{durum}', '{belge}'];
 
+// Hazır belge türleri (backend PRESET_RULES ile birebir) + Özel.
+const WC_DOCTYPES = [
+    { v: 'satisFaturasi', t: 'Satış Faturası' },
+    { v: 'satisIrsaliyesi', t: 'Satış İrsaliyesi' },
+    { v: 'stokCikis', t: 'Stok Çıkış Fişi' },
+    { v: 'cariGiris', t: 'Cari Giriş (Tahsilat / ödeme alındı)' },
+    { v: 'cariCikis', t: 'Cari Çıkış (Tediye / ödeme yapıldı)' },
+    { v: 'alisFaturasi', t: 'Alış Faturası' },
+    { v: 'stokGiris', t: 'Stok Giriş Fişi' },
+    { v: 'custom', t: 'Özel (IZAHAT kodu ile)' },
+];
+
 let wcLoaded = false;
 let wcLogTimer = null;
 
@@ -572,7 +584,7 @@ async function initWatcherView() {
         sel.onchange = () => loadWatcherDonemler();
         $('wc_addRule').onclick = () => {
             const empty = $('wc_rules').querySelector('.muted'); if (empty) empty.remove();
-            $('wc_rules').appendChild(createRuleCard({ enabled: true, direction: 'alacak', excludeFatura: true }));
+            $('wc_rules').appendChild(createRuleCard({ enabled: true, docType: 'custom', direction: 'alacak', excludeFatura: true }));
         };
         wcLoaded = true;
     }
@@ -633,6 +645,7 @@ function createRuleCard(rule) {
     rule = rule || {};
     const id = rule.id || `rule-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
     const dir = rule.direction || 'alacak';
+    const docType = rule.docType || 'custom';
     const card = document.createElement('div');
     card.className = 'rule-card';
     card.dataset.id = id;
@@ -644,23 +657,31 @@ function createRuleCard(rule) {
             <input class="rc_name" placeholder="Tür adı (örn: Satış Faturası)" value="${esc(rule.name || '')}" />
             <button class="btn ghost xs rc_del" title="Bu türü sil">✕</button>
         </div>
-        <div class="row">
-            <div class="field"><label>Yön</label>
-                <select class="rc_dir">
-                    <option value="alacak">Tahsilat / Ödeme (ALACAK)</option>
-                    <option value="borc">Fatura / Borçlandırma (BORC)</option>
-                    <option value="any">Her ikisi</option>
-                </select>
-            </div>
-            <div class="field" style="flex:.55"><label>Min tutar</label><input class="rc_min" type="number" min="0" value="${Number(rule.minAmount) || 0}" /></div>
-        </div>
         <div class="field">
-            <label>IZAHAT kodları (virgülle; boş = bu yöndeki tüm kodlar)</label>
-            <input class="rc_codes" placeholder="örn: 13, 32, 83" value="${esc((rule.izahatCodes || []).join(', '))}" />
-            <div class="hint"><a href="#" class="rc_showCodes">Bu dönemdeki kodları göster</a></div>
-            <div class="rc_codesList muted" style="font-size:12px; margin-top:6px"></div>
+            <label>Belge türü</label>
+            <select class="rc_docType">${WC_DOCTYPES.map(d => `<option value="${d.v}">${d.t}</option>`).join('')}</select>
+            <div class="hint rc_docHint"></div>
         </div>
-        <label class="check"><input type="checkbox" class="rc_excludeFatura" /> Fatura kaynaklı satırları dışla <span class="muted">(tahsilat için önerilir)</span></label>
+        <div class="rc_advanced" style="display:none">
+            <div class="row">
+                <div class="field"><label>Yön</label>
+                    <select class="rc_dir">
+                        <option value="alacak">Tahsilat / Ödeme (ALACAK)</option>
+                        <option value="borc">Fatura / Borçlandırma (BORC)</option>
+                        <option value="any">Her ikisi</option>
+                    </select>
+                </div>
+                <div class="field" style="flex:.55"><label>Min tutar</label><input class="rc_min" type="number" min="0" value="${Number(rule.minAmount) || 0}" /></div>
+            </div>
+            <div class="field">
+                <label>IZAHAT kodları (virgülle; boş = bu yöndeki tüm kodlar)</label>
+                <input class="rc_codes" placeholder="örn: 13, 32, 83" value="${esc((rule.izahatCodes || []).join(', '))}" />
+                <div class="hint"><a href="#" class="rc_showCodes">Bu dönemdeki kodları göster</a></div>
+                <div class="rc_codesList muted" style="font-size:12px; margin-top:6px"></div>
+            </div>
+            <label class="check"><input type="checkbox" class="rc_excludeFatura" /> Fatura kaynaklı satırları dışla <span class="muted">(tahsilat için önerilir)</span></label>
+        </div>
+        <div class="field rc_minSimple"><label>Min tutar (TL)</label><input class="rc_min2" type="number" min="0" value="${Number(rule.minAmount) || 0}" /></div>
         <div class="field">
             <label>Mesaj şablonu</label>
             <textarea class="rc_template" placeholder="Sayın {firma} müşterimiz, ...">${esc(rule.template || '')}</textarea>
@@ -673,7 +694,28 @@ function createRuleCard(rule) {
             <div class="rc_mediaInfo hint" style="${mediaInfo ? '' : 'display:none'}">${mediaInfo}</div>
         </div>`;
     card.querySelector('.rc_dir').value = dir;
+    card.querySelector('.rc_docType').value = docType;
     card.querySelector('.rc_excludeFatura').checked = (rule.excludeFatura !== undefined) ? !!rule.excludeFatura : (dir === 'alacak');
+    // Hazır tip → gelişmiş alanlar (yön/kod/fatura) otomatik, gizli; özel → göster.
+    const DOC_HINTS = {
+        satisFaturasi: 'Satış faturası kesildiğinde (müşteri borçlanır) gönderilir.',
+        satisIrsaliyesi: 'Satış irsaliyesi (sevk) düzenlendiğinde gönderilir.',
+        stokCikis: 'Stok çıkış fişi (mal/ürün çıkışı) düzenlendiğinde gönderilir.',
+        cariGiris: 'Cari giriş bordrosu = müşteriden ödeme/tahsilat alındığında gönderilir.',
+        cariCikis: 'Cari çıkış bordrosu = tedarikçiye ödeme (tediye) yapıldığında gönderilir.',
+        alisFaturasi: 'Alış faturası girildiğinde gönderilir.',
+        stokGiris: 'Stok giriş fişi düzenlendiğinde gönderilir.',
+        custom: 'IZAHAT kodlarını elle girerek özel bir kural tanımlayın.',
+    };
+    const applyDocTypeUI = () => {
+        const dt = card.querySelector('.rc_docType').value;
+        const custom = dt === 'custom';
+        card.querySelector('.rc_advanced').style.display = custom ? '' : 'none';
+        card.querySelector('.rc_minSimple').style.display = custom ? 'none' : '';
+        card.querySelector('.rc_docHint').textContent = DOC_HINTS[dt] || '';
+    };
+    applyDocTypeUI();
+    card.querySelector('.rc_docType').onchange = applyDocTypeUI;
     card.querySelector('.rc_del').onclick = () => card.remove();
     card.querySelectorAll('.rc_chips .chip').forEach(ch => ch.onclick = () => {
         const ta = card.querySelector('.rc_template');
@@ -732,16 +774,23 @@ function renderWatcherState(s) {
 }
 
 function collectRules() {
-    return [...document.querySelectorAll('#wc_rules .rule-card')].map(card => ({
-        id: card.dataset.id,
-        name: card.querySelector('.rc_name').value.trim(),
-        enabled: card.querySelector('.rc_enabled').checked,
-        direction: card.querySelector('.rc_dir').value,
-        minAmount: Math.max(0, +card.querySelector('.rc_min').value || 0),
-        izahatCodes: card.querySelector('.rc_codes').value.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n)),
-        excludeFatura: card.querySelector('.rc_excludeFatura').checked,
-        template: card.querySelector('.rc_template').value,
-    }));
+    return [...document.querySelectorAll('#wc_rules .rule-card')].map(card => {
+        const docType = card.querySelector('.rc_docType').value;
+        const custom = docType === 'custom';
+        const minAmount = Math.max(0, +(custom ? card.querySelector('.rc_min').value : card.querySelector('.rc_min2').value) || 0);
+        return {
+            id: card.dataset.id,
+            docType,
+            name: card.querySelector('.rc_name').value.trim(),
+            enabled: card.querySelector('.rc_enabled').checked,
+            // Yön/kod/fatura-dışlama yalnız özel kuralda kullanıcıdan; hazır tipte backend belirler.
+            direction: card.querySelector('.rc_dir').value,
+            minAmount,
+            izahatCodes: card.querySelector('.rc_codes').value.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n)),
+            excludeFatura: card.querySelector('.rc_excludeFatura').checked,
+            template: card.querySelector('.rc_template').value,
+        };
+    });
 }
 
 function collectWatcherConfig() {
