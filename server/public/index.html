@@ -76,6 +76,13 @@
                 <input type="text" id="searchInput" placeholder="Ünvan, kod veya telefon ara..." />
                 <button class="btn sm" id="searchBtn">Ara</button>
                 <label class="check" title="Vega cari kartında 'SMS Gönder' işaretli (SMSGONDER=1) cariler — telefon TELEFON1/2/3'ten alınır"><input type="checkbox" id="onlySms" checked /> SMS Gönder izni olanlar</label>
+                <select id="cariTypeSel" title="Cari tipi (FIRMATIPI): Alıcı=müşteri, Satıcı=tedarikçi">
+                    <option value="hepsi">Hepsi (alıcı+satıcı)</option>
+                    <option value="alici">Alıcı (müşteri)</option>
+                    <option value="satici">Satıcı (tedarikçi)</option>
+                    <option value="diger">Diğer (personel vb.)</option>
+                </select>
+                <label class="check" title="Yalnızca güncel bakiyesi 0 olmayan cariler"><input type="checkbox" id="onlyBalance" /> Sadece bakiyeli</label>
             </div>
 
             <div class="tablewrap">
@@ -160,6 +167,16 @@
             <div class="row">
                 <div class="field"><label>Firma</label><select id="wc_firma"></select></div>
                 <div class="field"><label>Dönem</label><select id="wc_donem"></select></div>
+            </div>
+
+            <div class="field" style="margin-top:10px">
+                <label>Hedef cari tipi (alıcı / satıcı ayrımı)</label>
+                <select id="wc_cariType" title="Belge mesajları yalnız seçilen cari tipine gönderilir (FIRMATIPI)">
+                    <option value="hepsi">Hepsi (alıcı + satıcı)</option>
+                    <option value="alici">Sadece Alıcı (müşteri)</option>
+                    <option value="satici">Sadece Satıcı (tedarikçi)</option>
+                    <option value="diger">Sadece Diğer (personel vb.)</option>
+                </select>
             </div>
 
             <div id="wc_rules"></div>

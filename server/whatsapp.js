@@ -116,12 +116,20 @@ const scheduleInit = (ms) => {
         if (!isReady && !isInitializing) initializeWhatsApp();
     }, ms);
 };
+// Bekleyen otomatik yeniden-bağlanmayı iptal et. Kullanıcı elle "QR oluştur"a
+// bastığında çağrılır: zamanlanmış reconnect ile elle başlatma yarışmasın.
+const clearRetry = () => { if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; } };
 
 // Üst üste kopmalarda bekleme süresini artır (3s → 6s → 12s ... 60s tavan).
 // Sabit 3sn ile sorunlu ağda saniyede bir el sıkışma denenip WhatsApp tarafında
 // şüpheli trafik oluşuyordu; başarılı bağlantı sayacı sıfırlar.
 let reconnectFails = 0;
 const backoffMs = () => Math.min(3000 * Math.pow(2, Math.min(reconnectFails, 5)), 60_000);
+
+// badSession (500) üst üste kaç kez geldi? İlk gelişte oturum silinmez (geçici
+// senkron hatası olabilir), 2. üst üste gelişte gerçekten bozuk sayılıp silinir.
+// Başarılı "open" sayacı sıfırlar.
+let badSessionFails = 0;
 
 const makeLogger = () => {
     const log = {
@@ -224,6 +232,7 @@ const initializeWhatsApp = async () => {
                 lastError = null;
                 meId = sock?.user?.id || null;
                 reconnectFails = 0;
+                badSessionFails = 0;
                 clearQrTimer();
                 console.log('[WhatsApp] Bağlantı kuruldu!', meId || '');
                 waEvent(`open ${meId || ''}`);
@@ -239,10 +248,16 @@ const initializeWhatsApp = async () => {
                 isReady = false;
                 cleanupSocket();
 
+                // badSession (500) çoğu zaman geçici senkron hatası; ilk gelişte
+                // oturumu SİLMEDEN diskten yeniden bağlan, ÜST ÜSTE 2. kez gelirse
+                // gerçekten bozuk say ve auth'u sil (yeni QR). open olunca sıfırlanır.
+                const isBadSession = statusCode === DisconnectReason.badSession;
+                if (isBadSession) badSessionFails++;
+                else badSessionFails = 0; // araya başka kod girerse "üst üste" sıfırlanır
                 const shouldWipe =
                     statusCode === DisconnectReason.loggedOut ||
-                    statusCode === DisconnectReason.badSession ||
-                    statusCode === 401;
+                    statusCode === 401 ||
+                    (isBadSession && badSessionFails >= 2);
 
                 // 440: aynı oturum başka yerde açıldı (WhatsApp Web/ikinci kopya).
                 // Hemen geri bağlanmak karşı tarafı düşürür, o da bizi düşürür →
@@ -259,6 +274,7 @@ const initializeWhatsApp = async () => {
                     currentQR = null;
                     lastError = null;
                     reconnectFails = 0;
+                    badSessionFails = 0;
                     scheduleInit(1500);
                 } else {
                     isInitializing = false;
@@ -295,6 +311,7 @@ const initializeWhatsApp = async () => {
 
 const refreshWhatsApp = async () => {
     console.log('[WhatsApp] Manuel yenileme (oturum sıfırlanır).');
+    clearRetry();          // bekleyen otomatik reconnect'i kır — elle QR'a öncelik ver
     cleanupSocket();
     clearQrTimer();
     isReady = false;
@@ -302,16 +319,23 @@ const refreshWhatsApp = async () => {
     currentQR = null;
     lastError = null;
     meId = null;
+    reconnectFails = 0;
+    badSessionFails = 0;
     wipeAuth();
     return initializeWhatsApp();
 };
 
 // Çıkış yap ama auth'u koru (sadece bağlantıyı kapat).
 const logoutWhatsApp = async () => {
+    clearRetry();
+    clearQrTimer();
     try { if (sock) await sock.logout(); } catch { /* yok say */ }
     cleanupSocket();
     isReady = false;
+    isInitializing = false;
     meId = null;
+    reconnectFails = 0;
+    badSessionFails = 0;
     wipeAuth();
     return getStatus();
 };

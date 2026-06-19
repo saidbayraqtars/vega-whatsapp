@@ -110,6 +110,8 @@ const DEFAULT_CONFIG = {
     sendAllPhones: false,
     // Sadece SMS Gönder izni (SMSGONDER=1) olanlara gönder.
     onlySmsGonder: false,
+    // Cari tipi hedefleme (FIRMATIPI): hepsi | alici | satici | diger.
+    cariType: 'hepsi',
     // Belge tipi kuralları. loadConfig ilk açılışta PRESET_RULES ile doldurur.
     //   { id, docType, name, enabled, izahatCodes:[], direction:'alacak'|'borc'|'any',
     //     minAmount, excludeFatura, template, media:{path,mime,kind,name}|null }
@@ -126,6 +128,16 @@ const MAX_SEND_ATTEMPTS = 8;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
+
+// Cari tipi filtresi (config.cariType): resolveCariContacts c.tip ('alici'|'satici'|
+// 'her_ikisi'|'diger') döner. 'her_ikisi' hem alıcı hem satıcı filtresine uyar.
+function cariTipMatches(filter, tip) {
+    if (!filter || filter === 'hepsi') return true;
+    if (filter === 'alici')  return tip === 'alici'  || tip === 'her_ikisi';
+    if (filter === 'satici') return tip === 'satici' || tip === 'her_ikisi';
+    if (filter === 'diger')  return tip === 'diger';
+    return true;
+}
 
 // ─── Kural normalizasyonu ──────────────────────────────────────────────────────
 let ruleSeq = 1;
@@ -591,6 +603,9 @@ async function pollOnce() {
                 ruleName: rule.name,
             };
 
+            if (!cariTipMatches(config.cariType, c.tip)) {
+                skipped++; pushLog({ ...base, status: 'wrongType', error: `Cari tipi filtre dışı (${c.tip || 'bilinmiyor'})` }); continue;
+            }
             if (config.onlySmsGonder && !c.smsGonder) {
                 skipped++; pushLog({ ...base, status: 'noSmsConsent', error: 'SMS Gönder izni yok (SMSGONDER kapalı)' }); continue;
             }
@@ -686,6 +701,7 @@ function getStatus() {
         table: tableName(), intervalSec: config.intervalSec,
         verifyOnWhatsApp: config.verifyOnWhatsApp, simulateTyping: config.simulateTyping,
         sendAllPhones: config.sendAllPhones === true, onlySmsGonder: config.onlySmsGonder === true,
+        cariType: config.cariType || 'hepsi',
         rules: (config.rules || []).map(r => ({
             id: r.id, docType: r.docType, name: r.name, enabled: r.enabled, izahatCodes: r.izahatCodes,
             direction: r.direction, minAmount: r.minAmount, excludeFatura: r.excludeFatura,

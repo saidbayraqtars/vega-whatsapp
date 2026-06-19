@@ -320,6 +320,16 @@ textarea { min-height: 130px; resize: vertical; line-height: 1.55; }
     border: 1px solid rgba(37, 211, 102, .4); border-radius: 6px; padding: 0 5px; margin-left: 6px;
     vertical-align: middle;
 }
+/* Cari tipi rozeti (alıcı/satıcı/diğer) — renk satır içi style ile gelir */
+.tipbadge {
+    display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .3px;
+    color: #fff; border-radius: 6px; padding: 0 6px; margin-left: 6px; vertical-align: middle;
+}
+/* Cari güncel bakiyesi (+ borç / − alacak) */
+.bakiye { font-size: 11px; font-weight: 600; margin-left: 6px; vertical-align: middle; color: var(--muted); }
+.bakiye.borc { color: var(--danger); }
+.bakiye.alacak { color: var(--primary); }
+
 /* Gönderilen mesaj popup'ındaki firma/cari bilgi bloğu */
 .cariinfo {
     margin-bottom: 12px; padding: 10px 12px; background: var(--bg3);

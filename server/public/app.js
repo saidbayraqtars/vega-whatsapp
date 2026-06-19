@@ -128,13 +128,17 @@ $('firmaSel').onchange = async () => { await saveContext($('firmaSel').value, st
 $('searchBtn').onclick = loadCari;
 $('searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadCari(); });
 $('onlySms').onchange = loadCari;
+$('cariTypeSel').onchange = loadCari;
+$('onlyBalance').onchange = loadCari;
 
 async function loadCari() {
     if (!state.firmaNo) return;
     $('cariBody').innerHTML = `<tr><td colspan="4" class="muted" style="padding:18px">Yükleniyor...</td></tr>`;
     const search = encodeURIComponent($('searchInput').value.trim());
     const onlySms = $('onlySms').checked ? '1' : '0';
-    const r = await api(`/cari?firmaNo=${state.firmaNo}&search=${search}&onlySmsGonder=${onlySms}&pageSize=1000`);
+    const cariType = $('cariTypeSel').value || 'hepsi';
+    const onlyBalance = $('onlyBalance').checked ? '1' : '0';
+    const r = await api(`/cari?firmaNo=${state.firmaNo}&search=${search}&onlySmsGonder=${onlySms}&cariType=${cariType}&onlyWithBalance=${onlyBalance}&pageSize=1000`);
     if (!r.success) {
         $('cariBody').innerHTML = `<tr><td colspan="4" class="nophone" style="padding:18px">${r.message}</td></tr>`;
         return;
@@ -151,6 +155,19 @@ setInterval(() => {
     if (state.firmaNo && state.cariLoadedAt && Date.now() - state.cariLoadedAt > 24 * 60 * 60 * 1000) loadCari();
 }, 60 * 60 * 1000);
 
+// Cari tipi rozeti (FIRMATIPI bit-maskesi → etiket+renk).
+const TIP_BADGE = {
+    alici:     ['Alıcı', '#1d4ed8'],
+    satici:    ['Satıcı', '#b45309'],
+    her_ikisi: ['Alıcı+Satıcı', '#6d28d9'],
+    diger:     ['Diğer', '#6b7280'],
+};
+function tipBadge(tip) {
+    const x = TIP_BADGE[tip] || TIP_BADGE.diger;
+    return ` <span class="tipbadge" style="background:${x[1]}" title="Cari tipi (FIRMATIPI): ${x[0]}">${x[0]}</span>`;
+}
+const fmtBakiye = (b) => b == null ? '' : ` <span class="bakiye ${b > 0 ? 'borc' : (b < 0 ? 'alacak' : '')}" title="Güncel bakiye (+ borç / − alacak)">${b.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₺</span>`;
+
 function renderCari() {
     const body = $('cariBody');
     if (!state.rows.length) {
@@ -164,7 +181,7 @@ function renderCari() {
         if (checked) tr.classList.add('sel');
         tr.innerHTML = `
             <td class="c"><input type="checkbox" ${checked ? 'checked' : ''} ${row.phone ? '' : 'disabled'} /></td>
-            <td>${esc(row.unvan)}${row.smsGonder ? ' <span class="smsbadge" title="SMS Gönder izni var (SMSGONDER)">SMS</span>' : ''}</td>
+            <td>${esc(row.unvan)}${row.smsGonder ? ' <span class="smsbadge" title="SMS Gönder izni var (SMSGONDER)">SMS</span>' : ''}${tipBadge(row.tip)}${fmtBakiye(row.bakiye)}</td>
             <td class="muted">${esc(row.kod)}</td>
             <td>${row.phone ? `<span title="${esc(row.phoneRaw)}">${esc(row.phone)}</span>${row.valid ? '' : ' <span class="nophone">?</span>'}` : '<span class="nophone">telefon yok</span>'}</td>
         `;
@@ -626,6 +643,7 @@ async function loadWatcherConfig() {
     $('wc_typing').checked = s.simulateTyping !== false;
     $('wc_allPhones').checked = s.sendAllPhones === true;
     $('wc_onlySms').checked = s.onlySmsGonder === true;
+    $('wc_cariType').value = s.cariType || 'hepsi';
     renderWatcherRules(s.rules || []);
     renderWatcherState(s);
 }
@@ -802,6 +820,7 @@ function collectWatcherConfig() {
         simulateTyping: $('wc_typing').checked,
         sendAllPhones: $('wc_allPhones').checked,
         onlySmsGonder: $('wc_onlySms').checked,
+        cariType: $('wc_cariType').value || 'hepsi',
         rules: collectRules(),
     };
 }

@@ -69,23 +69,27 @@ const upload = multer({
 // machine-id, license.js ile paylaşılan kalıcı dosya (data/machine-id).
 const APP_SALT = 'vega-wa-machine-key-2026';
 const MACHINE_ID_PATH = path.join(baseDir, 'data', 'machine-id');
-function getMachineSecret() {
+// DB parola anahtarı makinenin KARARLI kimliğinden türetilir (hostname|platform|
+// arch) — disk'teki rastgele machine-id dosyasından DEĞİL. Eski şemada anahtar o
+// dosyanın içeriğine bağlıydı; dosya güncelleme/yeniden kurulumda kaybolunca eski
+// rastgele kimlik bir daha üretilemiyor, parola çözülemiyor ve kullanıcıdan HER
+// güncellemede yeniden isteniyordu. Kararlı parmak izi her zaman aynı türetilir;
+// machine-id dosyası kaybolsa bile parola çözülür (yeniden giriş gerekmez).
+function machineKey() {
+    return crypto.createHash('sha256')
+        .update(`${os.hostname()}|${os.platform()}|${os.arch()}|${APP_SALT}`)
+        .digest();
+}
+// Eski şema (rastgele machine-id) anahtarı — yalnızca yükseltmede eski parolayı bir
+// kez çözüp yeni kararlı anahtarla yeniden kaydetmek (göç) için. Dosya yoksa null.
+function legacyMachineKey() {
     try {
         if (fs.existsSync(MACHINE_ID_PATH)) {
             const id = fs.readFileSync(MACHINE_ID_PATH, 'utf8').trim();
-            if (id) return id;
+            if (id) return crypto.createHash('sha256').update(id + APP_SALT).digest();
         }
     } catch { /* yok say */ }
-    const seed = `${os.hostname()}|${os.platform()}|${os.arch()}|${crypto.randomBytes(8).toString('hex')}`;
-    const id = crypto.createHash('sha256').update(seed).digest('hex').slice(0, 32).toUpperCase();
-    try {
-        fs.mkdirSync(path.dirname(MACHINE_ID_PATH), { recursive: true });
-        fs.writeFileSync(MACHINE_ID_PATH, id, 'utf8');
-    } catch { /* yok say */ }
-    return id;
-}
-function machineKey() {
-    return crypto.createHash('sha256').update(getMachineSecret() + APP_SALT).digest();
+    return null;
 }
 function encryptSecret(text, key = machineKey()) {
     const iv = crypto.randomBytes(16);
@@ -132,14 +136,24 @@ function readStoredConfig() {
     const c = loadConfigFile();
     if (!c) return { exists: false };
     const legacy = !c.v && !!c.pinHash;
-    let password = null, needsReauth = false;
+    let password = null, needsReauth = false, rekey = false;
     if (c.v === 2 && c.password) {
-        try { password = decryptSecret(c.password); }
-        catch { needsReauth = true; }
+        try {
+            password = decryptSecret(c.password); // yeni kararlı anahtar
+        } catch {
+            // Eski rastgele-id anahtarıyla dene; çözülürse göç işaretle (yeniden kaydedilecek).
+            const lk = legacyMachineKey();
+            if (lk) {
+                try { password = decryptSecret(c.password, lk); rekey = true; }
+                catch { needsReauth = true; }
+            } else {
+                needsReauth = true;
+            }
+        }
     } else {
         needsReauth = true; // eski v1 (PIN gerekli) veya bozuk
     }
-    return { exists: true, config: c, password, needsReauth, legacy };
+    return { exists: true, config: c, password, needsReauth, legacy, rekey };
 }
 
 // Kayıtlı config varsa PIN'siz otomatik bağlan (boot + /api/connect).
@@ -153,6 +167,11 @@ async function autoConnectFromConfig() {
         if (pool) { try { await pool.close(); } catch { /* yok say */ } pool = null; }
         pool = await createPool(config);
         currentConfig = config;
+        // Eski anahtarla çözüldüyse yeni kararlı anahtarla yeniden kaydet (tek seferlik göç).
+        if (st.rekey) {
+            try { persistConfig({ server: c.server, database: c.database, username: c.username, port: c.port, password: st.password }); }
+            catch (e) { console.error('parola yeniden anahtarlama hatası:', e.message); }
+        }
         watcher.autoStart();
         try { reminders.autoStart(); } catch { /* Faz 6 */ }
         return true;
@@ -435,10 +454,35 @@ async function detectCariColumns(firmaNo) {
         hasFirmakodu: colSet.has('FIRMAKODU'),
         // SMSGONDER = Vega "SMS Gönder" izni biti; mesaj göndermede onay/öncelik kapısı.
         hasSmsGonder: colSet.has('SMSGONDER'),
+        // FIRMATIPI = alıcı/satıcı bit-maskesi, BAKIYE = güncel kalan bakiye.
+        hasFirmaTipi: colSet.has('FIRMATIPI'),
+        hasBakiye: colSet.has('BAKIYE'),
         phoneCols, emailCols, all: cols,
     };
     phoneColCache[firmaNo] = { info, at: Date.now() };
     return info;
+}
+
+// ─── Cari tipi (alıcı / satıcı) sınıflaması ──────────────────────────────────
+// Vega FIRMATIPI bir BİT-MASKESİ: bit0(1)=alıcı, bit1(2)=satıcı. Yüksek bitler
+// (4,8…) personel/diğer kategoriler — alıcı/satıcı sayılmaz. F0101 ile doğrulandı
+// (tipler: 1,2,3,5,6,11,12). NOT: 'FIRMATIPI IN (1,3)' eksik kalır (5,11 de alıcı),
+// bu yüzden bitwise test kullanılır. NULL → 0 → 'diğer'.
+function cariTypeWhere(type) {
+    switch (type) {
+        case 'alici':  return '(ISNULL(FIRMATIPI,0) & 1) = 1';
+        case 'satici': return '(ISNULL(FIRMATIPI,0) & 2) = 2';
+        case 'diger':  return '(ISNULL(FIRMATIPI,0) & 1) = 0 AND (ISNULL(FIRMATIPI,0) & 2) = 0';
+        default:       return null; // 'hepsi'/tanımsız → filtre yok
+    }
+}
+function cariTypeLabel(firmaTipi) {
+    const t = Number(firmaTipi) || 0;
+    const a = (t & 1) === 1, s = (t & 2) === 2;
+    if (a && s) return 'her_ikisi';
+    if (a) return 'alici';
+    if (s) return 'satici';
+    return 'diger';
 }
 
 app.get('/api/cari/columns', async (req, res) => {
@@ -467,6 +511,9 @@ app.get('/api/cari', async (req, res) => {
     const onlyWithPhone = req.query.onlyWithPhone === '1';
     // SMS Gönder izni (SMSGONDER=1) olanları listele — "telefonu olanlar" filtresinin yerini alır.
     const onlySmsGonder = req.query.onlySmsGonder === '1';
+    // Alıcı/satıcı filtresi (FIRMATIPI bit-maskesi) + sadece bakiyeli filtresi.
+    const cariType = req.query.cariType || 'hepsi';      // hepsi|alici|satici|diger
+    const onlyWithBalance = req.query.onlyWithBalance === '1';
     if (!firmaNo) return res.status(400).json({ success: false, message: 'firmaNo gerekli.' });
 
     try {
@@ -488,6 +535,8 @@ app.get('/api/cari', async (req, res) => {
         // Firma adı: kullanıcı mesajda "Sayın {firma} müşterimiz" için FIRMAADI sütununu ister.
         const firmaExpr = info.hasFirmaadi ? `NULLIF(LTRIM(RTRIM(FIRMAADI)),'')` : nameExpr;
         const smsSelect = info.hasSmsGonder ? 'ISNULL(SMSGONDER,0) AS SMSGONDER' : 'CAST(0 AS BIT) AS SMSGONDER';
+        const tipSelect = info.hasFirmaTipi ? 'ISNULL(FIRMATIPI,0) AS FIRMATIPI' : 'CAST(0 AS INT) AS FIRMATIPI';
+        const bakiyeSelect = info.hasBakiye ? 'BAKIYE AS BAKIYE' : 'CAST(NULL AS DECIMAL(18,2)) AS BAKIYE';
         const phoneSelect = info.phoneCols.map(c => `[${c}] AS [PH_${c}]`).join(', ');
         const emailSelect = info.emailCols.map(c => `[${c}] AS [EM_${c}]`).join(', ');
 
@@ -497,6 +546,8 @@ app.get('/api/cari', async (req, res) => {
             `${nameExpr} AS UNVAN`,
             `${firmaExpr} AS FIRMA`,
             smsSelect,
+            tipSelect,
+            bakiyeSelect,
             phoneSelect,
             emailSelect,
         ].filter(Boolean).join(', ');
@@ -505,6 +556,9 @@ app.get('/api/cari', async (req, res) => {
         const whereParts = [];
         if (info.hasDeleted) whereParts.push('ISNULL(DELETED,0)=0');
         if (onlySmsGonder && info.hasSmsGonder) whereParts.push('ISNULL(SMSGONDER,0)=1');
+        const typeWhere = info.hasFirmaTipi ? cariTypeWhere(cariType) : null;
+        if (typeWhere) whereParts.push(typeWhere);
+        if (onlyWithBalance && info.hasBakiye) whereParts.push('ISNULL(BAKIYE,0) <> 0');
         if (search.trim()) {
             r.input('s', sql.NVarChar, `%${search.trim()}%`);
             const searchCols = [
@@ -551,6 +605,9 @@ app.get('/api/cari', async (req, res) => {
                 unvan: row.UNVAN,
                 firma: row.FIRMA || row.UNVAN || null,
                 smsGonder: !!row.SMSGONDER,
+                firmaTipi: row.FIRMATIPI != null ? Number(row.FIRMATIPI) : 0,
+                tip: cariTypeLabel(row.FIRMATIPI),
+                bakiye: row.BAKIYE != null ? Number(row.BAKIYE) : null,
                 phones: normalized,
                 phone: primary,
                 phoneRaw: rawPhones.join(' / '),
@@ -593,7 +650,8 @@ async function resolveCariContacts(firmaNo, indList) {
     // burada saklanır). Pozitif = borç (müşteri bize borçlu).
     const hasBakiye = info.all.some(c => c.toUpperCase() === 'BAKIYE');
     const bakiyeSelect = hasBakiye ? 'BAKIYE AS BAKIYE' : 'CAST(NULL AS DECIMAL(18,2)) AS BAKIYE';
-    const cols = ['IND', `${kodExpr} AS KOD`, `${nameExpr} AS UNVAN`, `${firmaExpr} AS FIRMA`, smsSelect, bakiyeSelect, phoneSelect].filter(Boolean).join(', ');
+    const tipSelect = info.hasFirmaTipi ? 'ISNULL(FIRMATIPI,0) AS FIRMATIPI' : 'CAST(0 AS INT) AS FIRMATIPI';
+    const cols = ['IND', `${kodExpr} AS KOD`, `${nameExpr} AS UNVAN`, `${firmaExpr} AS FIRMA`, smsSelect, tipSelect, bakiyeSelect, phoneSelect].filter(Boolean).join(', ');
 
     const rows = (await pool.request().query(`SELECT ${cols} FROM ${T} WHERE IND IN (${ids.join(',')})`)).recordset;
     for (const row of rows) {
@@ -614,6 +672,8 @@ async function resolveCariContacts(firmaNo, indList) {
             phones: normalized.filter(isLikelyValid),
             valid: primary ? isLikelyValid(primary) : false,
             bakiye: row.BAKIYE != null ? Number(row.BAKIYE) : null,
+            firmaTipi: row.FIRMATIPI != null ? Number(row.FIRMATIPI) : 0,
+            tip: cariTypeLabel(row.FIRMATIPI),
         });
     }
     return map;
@@ -688,7 +748,7 @@ app.get('/api/watcher', (req, res) => {
 });
 
 app.post('/api/watcher', (req, res) => {
-    const allowed = ['firmaNo', 'donemNo', 'intervalSec', 'verifyOnWhatsApp', 'simulateTyping', 'sendAllPhones', 'onlySmsGonder', 'rules'];
+    const allowed = ['firmaNo', 'donemNo', 'intervalSec', 'verifyOnWhatsApp', 'simulateTyping', 'sendAllPhones', 'onlySmsGonder', 'cariType', 'rules'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
     const prev = watcher.getConfig();
