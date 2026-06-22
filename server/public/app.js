@@ -1257,19 +1257,75 @@ async function refreshRemindersLog() {
         const box = $('rm_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz hatırlatma gönderilmedi.</div>'; return; }
         const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', notOnWhatsApp: 'WA yok' };
-        box.innerHTML = r.log.map(e => `
-            <div class="logline">
-                <span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
+        box.innerHTML = r.log.map(e => {
+            const meta = `<span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
                     ${e.reminder ? `<span class="muted">[${esc(e.reminder)}]</span>` : ''}
                     ${e.bakiye ? `<b>${esc(e.bakiye)} TL${e.bakiyeDurum ? ` ${esc(e.bakiyeDurum)}` : ''}</b>` : ''}
                     ${e.gecikmeGun != null ? `<span class="muted">${esc(e.gecikmeGun)} gün gecikme</span>` : ''}
                     ${e.error ? `<span class="muted">— ${esc(e.error)}</span>` : ''}
                     <span class="muted" style="font-size:11px">${e.at ? new Date(e.at).toLocaleTimeString('tr-TR') : ''}</span>
-                </span>
-                <span class="st ${e.status === 'sent' ? 'sent' : (e.status === 'failed' ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>
-            </div>`).join('');
+                </span>`;
+            const badge = `<span class="st ${e.status === 'sent' ? 'sent' : (e.status === 'failed' ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>`;
+            // Telefonu olmayan kayıt → elle numara ekle + yeniden dene (Önizle ile aynı akış).
+            if (e.status === 'noPhone' && e.ind != null) {
+                const ind = esc(String(e.ind));
+                const rid = e.id != null ? esc(String(e.id)) : '';
+                const done = rmResentKeys.has(rid + ':' + ind);
+                const actions = done
+                    ? `<span class="st sent">✓ yeniden gönderildi</span>`
+                    : `<button class="btn ghost xs" data-act="edit" data-ind="${ind}" title="Elle telefon ekle">✎ No. ekle</button>${rid ? ` <button class="btn ghost xs" data-act="send" data-id="${rid}" data-ind="${ind}" title="Numara ekledikten sonra yeniden gönder">Yeniden dene</button>` : ''}`;
+                return `
+            <div class="logline" data-ind="${ind}" style="display:block">
+                <div style="display:flex; justify-content:space-between; gap:10px; align-items:baseline; flex-wrap:wrap">${meta}${badge}</div>
+                <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-top:6px">${actions}</div>
+                <div class="rmlog_editor" data-ind="${ind}" style="display:none; gap:6px; align-items:center; flex-wrap:wrap; margin-top:6px">
+                    <input type="text" class="rmlog_phone" placeholder="05xx xxx xx xx" style="max-width:200px" />
+                    <button class="btn xs" data-act="save" data-id="${rid}" data-ind="${ind}">Kaydet</button>
+                    <span class="muted" style="font-size:11px">DB'ye yazılmaz, uygulamada saklanır</span>
+                </div>
+            </div>`;
+            }
+            return `
+            <div class="logline">${meta}${badge}</div>`;
+        }).join('');
     } catch { /* yok say */ }
 }
+
+// Log satırında elle numara ekle + yeniden dene (Önizle modalıyla aynı akış).
+let rmResentKeys = new Set();
+$('rm_log').onclick = async (e) => {
+    const btn = e.target.closest('button[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act, ind = btn.dataset.ind, id = btn.dataset.id;
+    const line = btn.closest('.logline');
+    if (act === 'edit') {
+        const ed = line && line.querySelector('.rmlog_editor');
+        if (ed) { ed.style.display = ed.style.display === 'none' ? 'flex' : 'none'; const inp = ed.querySelector('.rmlog_phone'); if (inp) inp.focus(); }
+        return;
+    }
+    if (act === 'save') {
+        const ed = line && line.querySelector('.rmlog_editor');
+        const phone = ed ? ed.querySelector('.rmlog_phone').value.trim() : '';
+        if (!phone) return;
+        btn.disabled = true;
+        try {
+            const r = await api('/reminders/manual-phone', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ind, phone }) });
+            if (!r.success) { alert(r.message || 'Numara kaydedilemedi.'); btn.disabled = false; return; }
+            refreshRemindersLog(); // numara saklandı → "Yeniden dene" ile gönder
+        } catch (err) { alert('Hata: ' + err.message); btn.disabled = false; }
+        return;
+    }
+    if (act === 'send') {
+        if (!id) { alert('Bu kayıt için hatırlatma kimliği yok; Önizle ekranından gönderin.'); return; }
+        btn.disabled = true; const old = btn.textContent; btn.textContent = 'Gönderiliyor...';
+        try {
+            const r = await api('/reminders/send-one', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, ind }) });
+            if (r.success) { rmResentKeys.add(id + ':' + ind); refreshRemindersLog(); }
+            else { btn.disabled = false; btn.textContent = old; alert(r.message || 'Gönderilemedi.'); }
+        } catch (err) { btn.disabled = false; btn.textContent = old; alert('Hata: ' + err.message); }
+        return;
+    }
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Lisans (çevrimiçi lisans altyapısı — scaffold; şu an kısıtlamaz)

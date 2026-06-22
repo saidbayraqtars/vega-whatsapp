@@ -325,7 +325,7 @@ async function runReminder(rem) {
         if (last && (Date.now() - new Date(last).getTime()) < (rem.intervalDays || 7) * DAY_MS) { skipped++; continue; }
 
         if (rem.onlySmsGonder && !contact.smsGonder) { skipped++; continue; }
-        if (!contact.phone || !contact.valid) { skipped++; pushLog({ reminder: rem.name, ind: c.IND, name: contact.name, firma: contact.firma, status: 'noPhone', error: 'Geçerli telefon yok' }); continue; }
+        if (!contact.phone || !contact.valid) { skipped++; pushLog({ reminder: rem.name, id: rem.id, ind: c.IND, name: contact.name, firma: contact.firma, status: 'noPhone', error: 'Geçerli telefon yok' }); continue; }
 
         const bakStr = bakiye != null ? fmtAmount(Math.abs(bakiye)) : '';
         const vadeStr = ag && ag.enEskiVade ? new Date(ag.enEskiVade).toLocaleDateString('tr-TR') : '';
