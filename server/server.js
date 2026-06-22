@@ -848,6 +848,17 @@ app.post('/api/reminders/run', async (req, res) => {
     }
 });
 
+// Kuru çalıştırma / önizleme: GÖNDERMEZ, kime ne gideceğini döner (onay öncesi).
+app.post('/api/reminders/preview', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    try {
+        const out = await reminders.preview(req.body && req.body.id);
+        res.json({ success: out.ok !== false, message: out.reason, ...out });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 app.get('/api/reminders/log', (req, res) => {
     res.json({ success: true, log: reminders.getLog(), status: reminders.getStatus() });
 });

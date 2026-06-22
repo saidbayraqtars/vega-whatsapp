@@ -288,6 +288,78 @@ async function runReminder(rem) {
     return { sent, skipped, total: cands.length, interrupted };
 }
 
+// ─── Kuru çalıştırma / önizleme (GÖNDERMEZ) ──────────────────────────────────
+// runReminder ile AYNI aday seçimi + vade/gecikme + filtre mantığını uygular ama
+// hiç mesaj GÖNDERMEZ, dedup'ı (perCariLastSent) GÜNCELLEMEZ. Kime, hangi
+// bakiye/vade/gecikme ile, hangi metnin gideceğini satır satır döner. WhatsApp
+// numara kontrolü atlanır (yalnız "telefon var/geçerli mi" gösterilir) — onay öncesi.
+async function previewReminder(rem) {
+    const pool = deps.getPool();
+    if (!pool || !pool.connected) return { ok: false, reason: 'Veritabanı bağlantısı yok' };
+    const firmaNo = config.firmaNo;
+    if (!firmaNo) return { ok: false, reason: 'Firma seçilmemiş' };
+
+    const cands = await deps.reminderCandidateInds(firmaNo, rem.type, rem.minAmount || 0);
+    if (!cands.length) return { ok: true, total: 0, willSend: 0, rows: [], note: 'Aday cari yok' };
+
+    const contacts = await deps.resolveCariContacts(firmaNo, cands.map(c => c.IND));
+    let agingMap = new Map();
+    if (rem.type === 'overdueBuyer' || rem.type === 'anyBalance') {
+        agingMap = await fetchAging(pool, firmaNo, config.donemNo, cands.map(c => ({ ind: c.IND, vadeGun: c.OPSIYON })), rem.vadeGunDefault || 90);
+    }
+
+    const rows = [];
+    let willSend = 0;
+    for (const c of cands) {
+        const contact = contacts.get(c.IND) || {};
+        const bakiye = c.BAKIYE != null ? Number(c.BAKIYE) : (contact.bakiye != null ? contact.bakiye : null);
+        const durum = bakiye == null ? '' : (bakiye > 0 ? 'Borç' : bakiye < 0 ? 'Alacak' : '');
+        const ag = agingMap.get(c.IND);
+
+        let skip = null;
+        if (rem.type === 'overdueBuyer' && (!ag || ag.gecikmeGun <= 0)) skip = 'Vadesi geçmemiş';
+        else if (rem.type === 'anyBalance' && ag && ag.gecikmeGun > 0) skip = 'Vadesi geçmiş (geciken kategorisine ait)';
+        else {
+            const last = rem.perCariLastSent[c.IND];
+            if (last && (Date.now() - new Date(last).getTime()) < (rem.intervalDays || 7) * DAY_MS) skip = 'Sıklık içinde zaten gönderildi';
+            else if (rem.onlySmsGonder && !contact.smsGonder) skip = 'Sadece SMS izinli seçili — izin yok';
+            else if (!contact.phone || !contact.valid) skip = 'Geçerli telefon yok';
+        }
+
+        const bakStr = bakiye != null ? fmtAmount(Math.abs(bakiye)) : '';
+        const vadeStr = ag && ag.enEskiVade ? new Date(ag.enEskiVade).toLocaleDateString('tr-TR') : '';
+        const vadeNot = vadeStr ? `Son ödeme tarihi ${vadeStr}. ` : '';
+        const message = renderTemplate(rem.template, {
+            ad: contact.name, firma: contact.firma || contact.name, kod: contact.kod,
+            bakiye: bakStr, kalan: bakStr, tutar: bakStr, durum,
+            gecikmeGun: ag ? String(ag.gecikmeGun) : '',
+            enEskiVade: vadeStr, vade: vadeStr, vadeNot,
+        });
+
+        if (!skip) willSend++;
+        rows.push({
+            ind: c.IND,
+            name: contact.name || String(c.IND),
+            firma: contact.firma || contact.name || '',
+            phone: contact.phone || '',
+            valid: !!contact.valid,
+            bakiye, bakiyeStr: bakStr, durum,
+            vade: vadeStr, gecikmeGun: ag ? ag.gecikmeGun : null,
+            willSend: !skip, skipReason: skip,
+            message,
+        });
+    }
+    // Gönderilecekler üste.
+    rows.sort((a, b) => (a.willSend === b.willSend) ? 0 : (a.willSend ? -1 : 1));
+    return { ok: true, total: cands.length, willSend, donemNo: config.donemNo, rows };
+}
+
+async function preview(id) {
+    const rem = (config.reminders || []).find(r => r.id === id);
+    if (!rem) return { ok: false, reason: 'Hatırlatma bulunamadı.' };
+    return previewReminder(rem);
+}
+
 // ─── Zamanlayıcı ────────────────────────────────────────────────────────────────
 function isDue(rem, now = new Date()) {
     if (!rem.enabled) return false;
@@ -370,7 +442,7 @@ function getStatus() {
 function getLog() { return log; }
 
 module.exports = {
-    configure, autoStart, start, stop, tick, runNow,
+    configure, autoStart, start, stop, tick, runNow, preview,
     getConfig, setConfig, getStatus, getLog,
     setReminderMedia, clearReminderMedia,
 };

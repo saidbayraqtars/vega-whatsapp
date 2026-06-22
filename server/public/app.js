@@ -1022,6 +1022,7 @@ function createReminderCard(rem) {
         <div class="rule-head">
             <label class="check"><input type="checkbox" class="rm_enabled" ${rem.enabled ? 'checked' : ''} /> <b>Etkin</b></label>
             <input class="rm_name" value="${esc(rem.name || RM_TYPE_LABEL[rem.type] || '')}" />
+            <button class="btn ghost xs rm_preview" title="Göndermeden önce: kime ne gidecek (bakiye/vade) göster">Önizle</button>
             <button class="btn ghost xs rm_test" title="Şimdi bir kez gönder (test)">Şimdi gönder</button>
         </div>
         <div class="muted" style="font-size:12px; margin:-2px 0 8px">${esc(RM_TYPE_LABEL[rem.type] || rem.type)}</div>
@@ -1053,6 +1054,7 @@ function createReminderCard(rem) {
         ta.focus();
     });
     card.querySelector('.rm_test').onclick = () => testReminder(card);
+    card.querySelector('.rm_preview').onclick = () => previewReminderCard(card);
     const mc = card.querySelector('.rm_mediaClear');
     if (mc) mc.onclick = async (e) => {
         e.preventDefault();
@@ -1122,6 +1124,57 @@ async function testReminder(card) {
     } catch (e) { $('rm_err').textContent = 'Hata: ' + e.message; }
     btn.disabled = false; btn.textContent = 'Şimdi gönder';
 }
+
+// ─── Önizleme (göndermeden: kime ne gidecek) ─────────────────────────────────
+let rmPreviewId = null;
+async function previewReminderCard(card) {
+    $('rm_err').textContent = '';
+    const btn = card.querySelector('.rm_preview');
+    btn.disabled = true; const old = btn.textContent; btn.textContent = 'Hazırlanıyor...';
+    try {
+        await saveRemindersConfig(); // firma/dönem + güncel şablonla önizle
+        const r = await api('/reminders/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: card.dataset.id }) });
+        if (!r.success) { $('rm_err').textContent = r.message || 'Önizlenemedi.'; return; }
+        rmPreviewId = card.dataset.id;
+        renderReminderPreview(r);
+        $('rmPreviewModal').classList.remove('hidden');
+    } catch (e) { $('rm_err').textContent = 'Hata: ' + e.message; }
+    finally { btn.disabled = false; btn.textContent = old; }
+}
+
+function renderReminderPreview(r) {
+    const rows = r.rows || [];
+    const willSend = r.willSend || 0;
+    $('rmpvMeta').innerHTML = `Toplam aday: <b>${r.total || 0}</b> &nbsp;•&nbsp; Gönderilecek: <b>${willSend}</b> &nbsp;•&nbsp; Atlanacak: <b>${(r.total || 0) - willSend}</b>${r.donemNo ? ` &nbsp;•&nbsp; Dönem: ${esc(String(r.donemNo))}` : ''} &nbsp;—&nbsp; <span class="muted">hiçbiri henüz GÖNDERİLMEDİ</span>`;
+    if (!rows.length) { $('rmpvBody').innerHTML = `<div class="muted" style="padding:12px">${esc(r.note || 'Aday cari yok.')}</div>`; $('rmpvConfirm').disabled = true; return; }
+    $('rmpvConfirm').disabled = willSend === 0;
+    $('rmpvBody').innerHTML = rows.map(x => `
+        <div class="logline" style="display:block; padding:10px 12px; opacity:${x.willSend ? '1' : '0.55'}">
+            <div style="display:flex; gap:8px; align-items:baseline; flex-wrap:wrap">
+                <b>${esc(x.name)}</b>
+                <span class="muted">${esc(x.phone || 'telefon yok')}</span>
+                ${x.bakiyeStr ? `<span><b>${esc(x.bakiyeStr)} TL</b>${x.durum ? ` ${esc(x.durum)}` : ''}</span>` : ''}
+                ${x.vade ? `<span class="muted">son ödeme: ${esc(x.vade)}</span>` : ''}
+                ${x.gecikmeGun != null ? `<span class="muted">${esc(String(x.gecikmeGun))} gün gecikme</span>` : ''}
+                <span class="st ${x.willSend ? 'sent' : 'info'}" style="margin-left:auto">${x.willSend ? 'Gönderilecek' : 'Atlanacak: ' + esc(x.skipReason || '')}</span>
+            </div>
+            <div style="white-space:pre-wrap; font-size:13px; line-height:1.5; margin-top:6px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--bg3)">${esc(x.message)}</div>
+        </div>`).join('');
+}
+
+$('rmpvClose').onclick = () => { $('rmPreviewModal').classList.add('hidden'); rmPreviewId = null; };
+$('rmpvConfirm').onclick = async () => {
+    if (!rmPreviewId) return;
+    const btn = $('rmpvConfirm'); btn.disabled = true; btn.textContent = 'Gönderiliyor...';
+    try {
+        const r = await api('/reminders/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: rmPreviewId }) });
+        if (!r.success) $('rm_err').textContent = r.message || 'Gönderilemedi.';
+        if (r.status) renderRemindersStatus(r.status);
+        refreshRemindersLog();
+    } catch (e) { $('rm_err').textContent = 'Hata: ' + e.message; }
+    $('rmPreviewModal').classList.add('hidden'); rmPreviewId = null;
+    btn.disabled = false; btn.textContent = 'Onayla ve gönder';
+};
 
 function renderRemindersStatus(s) {
     const active = (s.reminders || []).filter(r => r.enabled).length;
