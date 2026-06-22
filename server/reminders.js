@@ -279,9 +279,16 @@ async function fetchNetBalances(pool, firma, donem, ids) {
 async function debtorCandidates(pool, firmaNo, donem, minAmount) {
     const netMap = await fetchNetBalances(pool, firmaNo, donem);
     const min = Math.max(0, Number(minAmount) || 0);
+    const debtorIds = [];
+    for (const [ind, net] of netMap) if (net > 0 && net >= min) debtorIds.push(ind);
+    // Pasif (STATUS=2) / silinmiş carileri KAYNAKTA süz: aday listesine hiç girmesin
+    // (hem önizleme listesinden hem gönderimden düşer). Net bakiye TBLCARI.STATUS'ü
+    // bilmez; aktif IND kümesiyle kesiştir. activeCariInds yoksa eski davranış.
+    const active = deps.activeCariInds ? await deps.activeCariInds(firmaNo, debtorIds) : null;
     const out = [];
-    for (const [ind, net] of netMap) {
-        if (net > 0 && net >= min) out.push({ IND: ind, BAKIYE: net, FIRMATIPI: null, OPSIYON: null });
+    for (const ind of debtorIds) {
+        if (active && !active.has(ind)) continue;
+        out.push({ IND: ind, BAKIYE: netMap.get(ind), FIRMATIPI: null, OPSIYON: null });
     }
     return out;
 }
@@ -358,7 +365,15 @@ async function _runReminder(rem) {
         if (rem.verifyOnWhatsApp !== false) {
             const chk = await deps.checkOnWhatsApp(contact.phone);
             if (!chk.exists) {
-                if (chk.transient) { interrupted = true; break; } // güvenilmez → sonra tekrar
+                if (chk.transient) {
+                    // WA GERÇEKTEN koptuysa turu kes (lastRunAt ilerlemez → sonra baştan dener).
+                    // Ama WA bağlıyken tek numaranın doğrulaması geçici hata verdiyse (onWhatsApp
+                    // boş yanıt vb.) TÜM turu KESME: kesersek lastRunAt ilerlemez, scheduler
+                    // 60sn'de baştan tarar = sonsuz döngü + numarasız carileri tekrar tekrar loglar.
+                    // O cariyi bu turda atla, çalıştırma normal bitsin, lastRunAt ilerlesin.
+                    if (!deps.waStatus().ready) { interrupted = true; break; }
+                    skipped++; continue;
+                }
                 skipped++; pushLog({ reminder: rem.name, name: contact.name, phone: contact.phone, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' }); continue;
             }
         }

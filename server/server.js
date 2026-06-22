@@ -714,6 +714,24 @@ async function reminderCandidateInds(firmaNo, category, minAmount) {
     return rows.map(x => ({ IND: x.IND, BAKIYE: x.BAKIYE != null ? Number(x.BAKIYE) : null, FIRMATIPI: x.FIRMATIPI, OPSIYON: x.OPSIYON }));
 }
 
+// ─── Aktif cari süzgeci (reminders için) ─────────────────────────────────────
+// Verilen IND'ler içinden AKTİF carileri (DELETED=0 AND STATUS<>2) döner. anyBalance
+// adayları cari HAREKET net bakiyesinden üretildiği için TBLCARI.STATUS'ü bilmez;
+// pasif/silinmiş cariler aday listesine hiç girmesin diye kaynakta kesişim alınır.
+async function activeCariInds(firmaNo, indList) {
+    const set = new Set();
+    if (!pool || !pool.connected || !Array.isArray(indList) || !indList.length) return set;
+    const ids = indList.map(n => parseInt(n, 10)).filter(Number.isFinite);
+    if (!ids.length) return set;
+    const info = await detectCariColumns(firmaNo);
+    const where = [`IND IN (${ids.join(',')})`];
+    if (info.hasDeleted) where.push('ISNULL(DELETED,0)=0');
+    if (info.hasStatus) where.push('ISNULL(STATUS,1)<>2'); // pasif (STATUS=2) hariç
+    const rows = (await pool.request().query(`SELECT IND FROM [${info.table}] WHERE ${where.join(' AND ')}`)).recordset;
+    for (const row of rows) set.add(row.IND);
+    return set;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  DÖNEMLER (cari hareket tabloları → dönem listesi)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1216,6 +1234,7 @@ reminders.configure({
     sql,
     resolveCariContacts,
     reminderCandidateInds,
+    activeCariInds,
     waSend,
     checkOnWhatsApp,
     waStatus,
