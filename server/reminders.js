@@ -29,6 +29,9 @@ let MEDIA_DIR = null;
 
 let timer = null;
 let ticking = false;
+// Aynı hatırlatmanın aynı anda iki kez çalışmasını engeller (scheduler + elle "Şimdi gönder"
+// / Önizle-onayla çakışınca aynı cariye çift gönderim olmasın).
+const runningReminderIds = new Set();
 let lastTickAt = null;
 let lastError = null;
 let lastResult = null;
@@ -285,11 +288,24 @@ async function debtorCandidates(pool, firmaNo, donem, minAmount) {
 
 // ─── Tek hatırlatma çalıştır ───────────────────────────────────────────────────
 async function runReminder(rem) {
+    // Eşzamanlı çalışma kilidi: aynı hatırlatma zaten çalışıyorsa (scheduler vs elle) atla.
+    if (runningReminderIds.has(rem.id)) return { aborted: true, reason: 'Bu hatırlatma zaten çalışıyor' };
+    runningReminderIds.add(rem.id);
+    try {
+        return await _runReminder(rem);
+    } finally {
+        runningReminderIds.delete(rem.id);
+    }
+}
+
+async function _runReminder(rem) {
     const pool = deps.getPool();
-    if (!pool || !pool.connected) return { skipped: true, reason: 'Veritabanı bağlantısı yok' };
-    if (!deps.waStatus().ready) return { skipped: true, reason: 'WhatsApp bağlı değil' };
+    // aborted = çalıştırma hiç yapılamadı (DB/WA/firma yok) → lastRunAt İLERLEMEZ, sonraki tick'te tekrar.
+    // skipped (aşağıda) = çalıştı ama N cari atlandı (telefonsuz/pasif/dedup) → lastRunAt İLERLER.
+    if (!pool || !pool.connected) return { aborted: true, reason: 'Veritabanı bağlantısı yok' };
+    if (!deps.waStatus().ready) return { aborted: true, reason: 'WhatsApp bağlı değil' };
     const firmaNo = config.firmaNo;
-    if (!firmaNo) return { skipped: true, reason: 'Firma seçilmemiş' };
+    if (!firmaNo) return { aborted: true, reason: 'Firma seçilmemiş' };
 
     // anyBalance: bakiye = cari hareket net (belge mesajlarıyla AYNI). overdueBuyer (askıda): eski yol.
     const cands = rem.type === 'anyBalance'
@@ -317,8 +333,9 @@ async function runReminder(rem) {
         // Gecikme kategorisinde (overdueBuyer, askıda) vadesi geçmemişleri atla.
         if (rem.type === 'overdueBuyer' && (!ag || ag.gecikmeGun <= 0)) continue;
 
-        // Pasif cari (TBLCARI.STATUS=2) → hiç gönderme.
-        if (contact.pasif) { skipped++; continue; }
+        // Pasif cari (TBLCARI.STATUS=2) → hiç gönderme. Log'a yazılır ki "atlandı" görünür
+        // olsun (görünmüyorsa o carinin STATUS'u 2 değildir → gerçek pasiflik kaynağı farklı).
+        if (contact.pasif) { skipped++; pushLog({ reminder: rem.name, id: rem.id, ind: c.IND, name: contact.name, firma: contact.firma, status: 'pasif', error: 'Cari pasif (STATUS=2) — gönderilmez' }); continue; }
 
         // intervalDays içinde aynı cariye tekrar gönderme (dedup).
         const last = rem.perCariLastSent[c.IND];
@@ -353,7 +370,10 @@ async function runReminder(rem) {
             pushLog({ reminder: rem.name, name: contact.name, phone: contact.phone, status: 'failed', error: res.error });
         }
         saveConfig(); // perCariLastSent kalıcı
-        await sleep(rand(4000, 9000)); // düşük hacim, biraz daha insansı bekleme
+        // Anti-ban: tahsilat mesajı yüksek riskli → insansı, yavaş tempo (toplu gönderimden
+        // daha temkinli). Her mesaj arası 12-30 sn; her 20 başarılı gönderimde 1-2.5 dk mola.
+        if (res.success && sent % 20 === 0) await sleep(rand(60000, 150000));
+        else await sleep(rand(12000, 30000));
     }
     const note = `${sent} gönderildi${skipped ? `, ${skipped} atlandı` : ''}${interrupted ? ' (yarıda kesildi, sürecek)' : ''}`;
     lastResult = { id: rem.id, sent, skipped, total: cands.length, interrupted, note, at: new Date().toISOString() };
@@ -508,8 +528,9 @@ async function tick() {
         for (const rem of config.reminders || []) {
             if (!isDue(rem)) continue;
             const res = await runReminder(rem);
-            // WA/DB yok ya da yarıda kesildi → lastRunAt ilerletme, sonraki tick'te tekrar.
-            if (res && !res.skipped && !res.interrupted) { rem.lastRunAt = new Date().toISOString(); saveConfig(); }
+            // WA/DB yok (aborted) ya da yarıda kesildi (interrupted) → lastRunAt ilerletme, sonraki tick'te tekrar.
+            // Atlanan cari olması (skipped>0) çalıştırmayı geçersiz kılmaz; lastRunAt ilerler.
+            if (res && !res.aborted && !res.interrupted) { rem.lastRunAt = new Date().toISOString(); saveConfig(); }
         }
     } catch (e) { lastError = e.message; console.error('[Reminders] tick hata:', e.message); }
     finally { ticking = false; }
@@ -530,8 +551,8 @@ async function runNow(id) {
     const rem = (config.reminders || []).find(r => r.id === id);
     if (!rem) return { success: false, message: 'Hatırlatma bulunamadı.' };
     const res = await runReminder(rem);
-    if (res && !res.skipped && !res.interrupted) { rem.lastRunAt = new Date().toISOString(); saveConfig(); }
-    return { success: !res.skipped, message: res.skipped ? res.reason : (res.note || `${res.sent} gönderildi`), result: res };
+    if (res && !res.aborted && !res.interrupted) { rem.lastRunAt = new Date().toISOString(); saveConfig(); }
+    return { success: !res.aborted, message: res.aborted ? res.reason : (res.note || `${res.sent} gönderildi`), result: res };
 }
 
 function getConfig() { return { ...config }; }

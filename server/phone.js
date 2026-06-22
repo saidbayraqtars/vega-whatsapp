@@ -9,6 +9,10 @@ const normalizePhone = (phone) => {
     // İlk geçerli bloğu al: ayraçtan böl, ilk parçayı kullan.
     // (replace ile rakam dışı zaten gittiği için burada uzunluk bazlı kırpıyoruz.)
 
+    if (digits.startsWith('00')) {
+        digits = digits.slice(2); // 00 = uluslararası arama öneki (0090...) → at, 90... kalır
+    }
+
     if (digits.startsWith('0')) {
         digits = '90' + digits.slice(1);
     } else if (digits.length === 10 && digits.startsWith('5')) {

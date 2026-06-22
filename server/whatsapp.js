@@ -9,6 +9,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { normalizePhone } = require('./phone');
 
 // pkg altında exe dizinini, geliştirmede klasörü kullan.
 const isPkg = typeof process.pkg !== 'undefined';
@@ -340,7 +341,9 @@ const logoutWhatsApp = async () => {
     return getStatus();
 };
 
-const toJid = (phone) => `${String(phone).replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+// TR normalizasyonu: +90.../90.../0... hepsi tek biçime (905...) iner — aksi halde
+// 05350786101@s.whatsapp.net gibi geçersiz JID "gönderildi" görünüp teslim olmaz.
+const toJid = (phone) => `${normalizePhone(phone)}@s.whatsapp.net`;
 
 // Numara WhatsApp'ta kayıtlı mı? Kayıtlı değilse gönderme (ban sinyalini azaltır).
 // transient=true → sonuç güvenilmez (bağlantı yok / sorgu hatası / boş yanıt);
@@ -350,7 +353,8 @@ const toJid = (phone) => `${String(phone).replace(/[^0-9]/g, '')}@s.whatsapp.net
 const checkOnWhatsApp = async (phone) => {
     if (!isReady || !sock) return { exists: false, transient: true, error: 'WhatsApp bağlı değil.' };
     try {
-        const clean = String(phone).replace(/[^0-9]/g, '');
+        const clean = normalizePhone(phone);
+        if (!clean) return { exists: false, transient: false, error: 'Geçersiz numara.' };
         const results = await sock.onWhatsApp(clean);
         if (!Array.isArray(results) || !results.length) {
             return { exists: false, transient: true, error: 'Sorgu boş yanıt verdi' };
@@ -375,7 +379,7 @@ const simulateTyping = async (jid, ms = 1500) => {
 // Tek mesaj gönder. media: { kind:'image'|'video'|'document', buffer, mimetype, fileName } | null
 const sendMessage = async (phone, text, media = null, opts = {}) => {
     if (!isReady || !sock) return { success: false, error: 'WhatsApp bağlı değil.' };
-    const clean = String(phone).replace(/[^0-9]/g, '');
+    const clean = normalizePhone(phone);
     if (!clean) return { success: false, error: 'Geçersiz numara.' };
     const jid = `${clean}@s.whatsapp.net`;
 

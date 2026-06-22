@@ -1256,7 +1256,7 @@ async function refreshRemindersLog() {
         renderRemindersStatus(r.status);
         const box = $('rm_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz hatırlatma gönderilmedi.</div>'; return; }
-        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', notOnWhatsApp: 'WA yok' };
+        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', notOnWhatsApp: 'WA yok', pasif: 'Cari pasif' };
         box.innerHTML = r.log.map(e => {
             const meta = `<span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
                     ${e.reminder ? `<span class="muted">[${esc(e.reminder)}]</span>` : ''}
