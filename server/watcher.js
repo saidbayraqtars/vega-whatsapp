@@ -603,6 +603,9 @@ async function pollOnce() {
                 ruleName: rule.name,
             };
 
+            if (c.pasif) {
+                skipped++; pushLog({ ...base, status: 'pasif', error: 'Cari pasif (STATUS=2)' }); continue;
+            }
             if (!cariTipMatches(config.cariType, c.tip)) {
                 skipped++; pushLog({ ...base, status: 'wrongType', error: `Cari tipi filtre dışı (${c.tip || 'bilinmiyor'})` }); continue;
             }

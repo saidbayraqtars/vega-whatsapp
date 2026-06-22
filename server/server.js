@@ -449,6 +449,8 @@ async function detectCariColumns(firmaNo) {
     const info = {
         table,
         hasDeleted: colSet.has('DELETED'),
+        // STATUS = cari aktiflik durumu (1=aktif, 2=pasif). Pasif carilere mesaj yok.
+        hasStatus: colSet.has('STATUS'),
         hasUnvan: colSet.has('UNVAN'),
         hasFirmaadi: colSet.has('FIRMAADI'),
         hasFirmakodu: colSet.has('FIRMAKODU'),
@@ -555,6 +557,7 @@ app.get('/api/cari', async (req, res) => {
         const r = pool.request();
         const whereParts = [];
         if (info.hasDeleted) whereParts.push('ISNULL(DELETED,0)=0');
+        if (info.hasStatus) whereParts.push('ISNULL(STATUS,1)<>2'); // pasif (STATUS=2) hariç
         if (onlySmsGonder && info.hasSmsGonder) whereParts.push('ISNULL(SMSGONDER,0)=1');
         const typeWhere = info.hasFirmaTipi ? cariTypeWhere(cariType) : null;
         if (typeWhere) whereParts.push(typeWhere);
@@ -651,7 +654,9 @@ async function resolveCariContacts(firmaNo, indList) {
     const hasBakiye = info.all.some(c => c.toUpperCase() === 'BAKIYE');
     const bakiyeSelect = hasBakiye ? 'BAKIYE AS BAKIYE' : 'CAST(NULL AS DECIMAL(18,2)) AS BAKIYE';
     const tipSelect = info.hasFirmaTipi ? 'ISNULL(FIRMATIPI,0) AS FIRMATIPI' : 'CAST(0 AS INT) AS FIRMATIPI';
-    const cols = ['IND', `${kodExpr} AS KOD`, `${nameExpr} AS UNVAN`, `${firmaExpr} AS FIRMA`, smsSelect, tipSelect, bakiyeSelect, phoneSelect].filter(Boolean).join(', ');
+    // STATUS=2 = pasif cari → mesaj gönderilmez (caller pasif bayrağıyla atlar).
+    const statusSelect = info.hasStatus ? 'ISNULL(STATUS,1) AS STATUS' : 'CAST(1 AS INT) AS STATUS';
+    const cols = ['IND', `${kodExpr} AS KOD`, `${nameExpr} AS UNVAN`, `${firmaExpr} AS FIRMA`, smsSelect, tipSelect, bakiyeSelect, statusSelect, phoneSelect].filter(Boolean).join(', ');
 
     const rows = (await pool.request().query(`SELECT ${cols} FROM ${T} WHERE IND IN (${ids.join(',')})`)).recordset;
     for (const row of rows) {
@@ -674,6 +679,7 @@ async function resolveCariContacts(firmaNo, indList) {
             bakiye: row.BAKIYE != null ? Number(row.BAKIYE) : null,
             firmaTipi: row.FIRMATIPI != null ? Number(row.FIRMATIPI) : 0,
             tip: cariTypeLabel(row.FIRMATIPI),
+            pasif: Number(row.STATUS) === 2, // pasif cari → mesaj yok
         });
     }
     return map;
@@ -697,6 +703,7 @@ async function reminderCandidateInds(firmaNo, category, minAmount) {
     // Her iki kategori de yalnızca borçlu carileri (BAKIYE > 0) hedefler.
     const where = ['ISNULL(BAKIYE,0) > 0'];
     if (info.hasDeleted) where.push('ISNULL(DELETED,0)=0');
+    if (info.hasStatus) where.push('ISNULL(STATUS,1)<>2'); // pasif (STATUS=2) hariç
     if (category === 'overdueBuyer' && hasTipi) where.push('FIRMATIPI IN (1,3)');
     if (minAmount > 0) where.push('ABS(BAKIYE) >= @minAmt');
 
@@ -854,6 +861,29 @@ app.post('/api/reminders/preview', async (req, res) => {
     try {
         const out = await reminders.preview(req.body && req.body.id);
         res.json({ success: out.ok !== false, message: out.reason, ...out });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Elle telefon ekle/sil (UYGULAMA İÇİ — DB'ye yazılmaz). phone boşsa kaydı siler.
+app.post('/api/reminders/manual-phone', (req, res) => {
+    const { ind, phone } = req.body || {};
+    if (ind == null) return res.status(400).json({ success: false, message: 'Cari (ind) gerekli.' });
+    if (phone == null || String(phone).trim() === '') {
+        return res.json({ success: true, ...reminders.setManualPhone(ind, null) });
+    }
+    const norm = normalizePhone(String(phone));
+    if (!norm || !isLikelyValid(norm)) return res.status(400).json({ success: false, message: 'Geçersiz telefon numarası.' });
+    res.json({ success: true, ...reminders.setManualPhone(ind, norm), normalized: norm });
+});
+
+// Tek cariye elle gönder ("Yeniden dene").
+app.post('/api/reminders/send-one', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    try {
+        const r = await reminders.sendOne(req.body && req.body.id, req.body && req.body.ind);
+        res.json(r);
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }

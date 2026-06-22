@@ -869,7 +869,7 @@ async function refreshWatcherLog() {
         const box = $('wc_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz otomatik gönderim yok.</div>'; return; }
         wcLogEntries = r.log;
-        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', noSmsConsent: 'SMS izni yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta' };
+        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', noSmsConsent: 'SMS izni yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta', pasif: 'Cari pasif', wrongType: 'Tip dışı' };
         box.innerHTML = r.log.map((e, i) => `
             <div class="logline">
                 <span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
@@ -1151,19 +1151,77 @@ function renderReminderPreview(r) {
     $('rmpvMeta').innerHTML = `Toplam aday: <b>${r.total || 0}</b> &nbsp;•&nbsp; Gönderilecek: <b>${willSend}</b> &nbsp;•&nbsp; Atlanacak: <b>${(r.total || 0) - willSend}</b>${r.donemNo ? ` &nbsp;•&nbsp; Dönem: ${esc(String(r.donemNo))}` : ''} &nbsp;—&nbsp; <span class="muted">hiçbiri henüz GÖNDERİLMEDİ</span>`;
     if (!rows.length) { $('rmpvBody').innerHTML = `<div class="muted" style="padding:12px">${esc(r.note || 'Aday cari yok.')}</div>`; $('rmpvConfirm').disabled = true; return; }
     $('rmpvConfirm').disabled = willSend === 0;
-    $('rmpvBody').innerHTML = rows.map(x => `
-        <div class="logline" style="display:block; padding:10px 12px; opacity:${x.willSend ? '1' : '0.55'}">
-            <div style="display:flex; gap:8px; align-items:baseline; flex-wrap:wrap">
+    $('rmpvBody').innerHTML = rows.map(x => {
+        const ind = esc(String(x.ind));
+        const hasPhone = x.phone && x.valid;
+        const phoneLabel = hasPhone
+            ? `<span class="muted">${esc(x.phone)}${x.phoneManual ? ' <b>(elle)</b>' : ''}</span>`
+            : `<span class="muted" style="color:#d33">telefon yok</span> <button class="btn ghost xs" data-act="edit" data-ind="${ind}" title="Elle telefon ekle">✎ No. ekle</button>`;
+        const sendBtn = hasPhone
+            ? `<button class="btn ghost xs" data-act="send" data-ind="${ind}" title="Bu cariye şimdi gönder">${x.willSend ? 'Gönder' : 'Yine de gönder'}</button>`
+            : '';
+        return `
+        <div class="logline" data-ind="${ind}" style="display:block; padding:10px 12px; opacity:${(x.willSend || hasPhone) ? '1' : '0.6'}">
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
                 <b>${esc(x.name)}</b>
-                <span class="muted">${esc(x.phone || 'telefon yok')}</span>
+                ${phoneLabel}
                 ${x.bakiyeStr ? `<span><b>${esc(x.bakiyeStr)} TL</b>${x.durum ? ` ${esc(x.durum)}` : ''}</span>` : ''}
                 ${x.vade ? `<span class="muted">son ödeme: ${esc(x.vade)}</span>` : ''}
                 ${x.gecikmeGun != null ? `<span class="muted">${esc(String(x.gecikmeGun))} gün gecikme</span>` : ''}
                 <span class="st ${x.willSend ? 'sent' : 'info'}" style="margin-left:auto">${x.willSend ? 'Gönderilecek' : 'Atlanacak: ' + esc(x.skipReason || '')}</span>
+                ${sendBtn}
+            </div>
+            <div class="rmpv_editor" data-ind="${ind}" style="display:none; margin-top:6px; gap:6px; align-items:center; flex-wrap:wrap">
+                <input type="text" class="rmpv_phone" placeholder="05xx xxx xx xx" style="max-width:200px" />
+                <button class="btn xs" data-act="save" data-ind="${ind}">Kaydet</button>
+                <span class="muted" style="font-size:11px">DB'ye yazılmaz, uygulamada saklanır</span>
             </div>
             <div style="white-space:pre-wrap; font-size:13px; line-height:1.5; margin-top:6px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--bg3)">${esc(x.message)}</div>
-        </div>`).join('');
+        </div>`;
+    }).join('');
 }
+
+// Önizlemeyi yeniden çek (elle numara / gönderim sonrası willSend güncellensin).
+async function reloadPreview() {
+    if (!rmPreviewId) return;
+    try { const r = await api('/reminders/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: rmPreviewId }) });
+        if (r.success) renderReminderPreview(r);
+    } catch { /* yok say */ }
+}
+
+// Satır içi aksiyonlar: pencil (düzenle) / Kaydet (elle no) / Gönder (tek cari).
+$('rmpvBody').onclick = async (e) => {
+    const btn = e.target.closest('button[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act, ind = btn.dataset.ind;
+    if (act === 'edit') {
+        const ed = $('rmpvBody').querySelector(`.rmpv_editor[data-ind="${ind}"]`);
+        if (ed) { ed.style.display = ed.style.display === 'none' ? 'flex' : 'none'; const inp = ed.querySelector('.rmpv_phone'); if (inp) inp.focus(); }
+        return;
+    }
+    if (act === 'save') {
+        const ed = $('rmpvBody').querySelector(`.rmpv_editor[data-ind="${ind}"]`);
+        const phone = ed ? ed.querySelector('.rmpv_phone').value.trim() : '';
+        if (!phone) return;
+        btn.disabled = true;
+        try {
+            const r = await api('/reminders/manual-phone', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ind, phone }) });
+            if (!r.success) { alert(r.message || 'Numara kaydedilemedi.'); btn.disabled = false; return; }
+            await reloadPreview(); // numara artık görünür + Gönder çıkar
+        } catch (err) { alert('Hata: ' + err.message); btn.disabled = false; }
+        return;
+    }
+    if (act === 'send') {
+        btn.disabled = true; const old = btn.textContent; btn.textContent = 'Gönderiliyor...';
+        try {
+            const r = await api('/reminders/send-one', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: rmPreviewId, ind }) });
+            btn.textContent = r.success ? '✓ Gönderildi' : 'Başarısız';
+            if (!r.success) { btn.disabled = false; alert(r.message || 'Gönderilemedi.'); }
+            refreshRemindersLog();
+        } catch (err) { btn.disabled = false; btn.textContent = old; alert('Hata: ' + err.message); }
+        return;
+    }
+};
 
 $('rmpvClose').onclick = () => { $('rmPreviewModal').classList.add('hidden'); rmPreviewId = null; };
 $('rmpvConfirm').onclick = async () => {

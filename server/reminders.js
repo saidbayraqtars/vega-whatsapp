@@ -24,6 +24,7 @@ const path = require('path');
 let deps = null;
 let CONFIG_PATH = null;
 let LOG_PATH = null;
+let MANUAL_PHONES_PATH = null;
 let MEDIA_DIR = null;
 
 let timer = null;
@@ -57,9 +58,42 @@ function configure(d) {
     if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
     CONFIG_PATH = path.join(dataDir, 'reminders.json');
     LOG_PATH = path.join(dataDir, 'reminders-log.json');
+    MANUAL_PHONES_PATH = path.join(dataDir, 'manual-phones.json');
     MEDIA_DIR = dataDir;
     loadConfig();
     loadLog();
+    loadManualPhones();
+}
+
+// ─── Elle eklenen telefonlar (UYGULAMA İÇİ — DB'ye YAZILMAZ) ──────────────────
+// Telefonu olmayan carilere, kullanıcının uygulama içinden girdiği numaralar.
+// Anahtar: `${firmaNo}:${ind}` → normalize edilmiş numara. data/manual-phones.json.
+let manualPhones = {};
+function loadManualPhones() {
+    try { if (fs.existsSync(MANUAL_PHONES_PATH)) { const m = JSON.parse(fs.readFileSync(MANUAL_PHONES_PATH, 'utf8')); if (m && typeof m === 'object') manualPhones = m; } }
+    catch (e) { console.error('[Reminders] elle telefonlar okunamadı:', e.message); }
+}
+function saveManualPhones() {
+    try { fs.writeFileSync(MANUAL_PHONES_PATH, JSON.stringify(manualPhones, null, 2), 'utf8'); }
+    catch (e) { console.error('[Reminders] elle telefonlar yazılamadı:', e.message); }
+}
+function manualKey(firmaNo, ind) { return `${firmaNo}:${ind}`; }
+function getManualPhone(firmaNo, ind) { return manualPhones[manualKey(firmaNo, ind)] || null; }
+// Aktif firmaya (config.firmaNo) elle numara kaydet/sil. phone boşsa siler.
+function setManualPhone(ind, phone) {
+    if (!config.firmaNo) return { ok: false, message: 'Firma seçilmemiş' };
+    const key = manualKey(config.firmaNo, ind);
+    if (phone) manualPhones[key] = String(phone);
+    else delete manualPhones[key];
+    saveManualPhones();
+    return { ok: true, ind, phone: phone || null };
+}
+// Telefonu/geçerli numarası yoksa elle eklenen numarayı uygula (DB'ye dokunmaz).
+function withManualPhone(firmaNo, ind, contact) {
+    if (contact && contact.phone && contact.valid) return contact;
+    const mp = getManualPhone(firmaNo, ind);
+    if (mp) return { ...contact, phone: mp, valid: true, phoneManual: true };
+    return contact || {};
 }
 
 function normalizeReminder(r, prev) {
@@ -275,13 +309,16 @@ async function runReminder(rem) {
 
     for (const c of cands) {
         if (!deps.waStatus().ready) { interrupted = true; break; }
-        const contact = contacts.get(c.IND) || {};
+        const contact = withManualPhone(firmaNo, c.IND, contacts.get(c.IND) || {});
         const bakiye = c.BAKIYE != null ? Number(c.BAKIYE) : (contact.bakiye != null ? contact.bakiye : null);
         const durum = bakiye == null ? '' : (bakiye > 0 ? 'Borç' : bakiye < 0 ? 'Alacak' : '');
         const ag = agingMap.get(c.IND);
 
         // Gecikme kategorisinde (overdueBuyer, askıda) vadesi geçmemişleri atla.
         if (rem.type === 'overdueBuyer' && (!ag || ag.gecikmeGun <= 0)) continue;
+
+        // Pasif cari (TBLCARI.STATUS=2) → hiç gönderme.
+        if (contact.pasif) { skipped++; continue; }
 
         // intervalDays içinde aynı cariye tekrar gönderme (dedup).
         const last = rem.perCariLastSent[c.IND];
@@ -348,13 +385,14 @@ async function previewReminder(rem) {
     const rows = [];
     let willSend = 0;
     for (const c of cands) {
-        const contact = contacts.get(c.IND) || {};
+        const contact = withManualPhone(firmaNo, c.IND, contacts.get(c.IND) || {});
         const bakiye = c.BAKIYE != null ? Number(c.BAKIYE) : (contact.bakiye != null ? contact.bakiye : null);
         const durum = bakiye == null ? '' : (bakiye > 0 ? 'Borç' : bakiye < 0 ? 'Alacak' : '');
         const ag = agingMap.get(c.IND);
 
         let skip = null;
         if (rem.type === 'overdueBuyer' && (!ag || ag.gecikmeGun <= 0)) skip = 'Vadesi geçmemiş';
+        else if (contact.pasif) skip = 'Cari pasif (STATUS=2)';
         else {
             const last = rem.perCariLastSent[c.IND];
             if (last && (Date.now() - new Date(last).getTime()) < (rem.intervalDays || 7) * DAY_MS) skip = 'Sıklık içinde zaten gönderildi';
@@ -379,6 +417,7 @@ async function previewReminder(rem) {
             firma: contact.firma || contact.name || '',
             phone: contact.phone || '',
             valid: !!contact.valid,
+            phoneManual: !!contact.phoneManual,
             bakiye, bakiyeStr: bakStr, durum,
             vade: vadeStr, gecikmeGun: ag ? ag.gecikmeGun : null,
             willSend: !skip, skipReason: skip,
@@ -394,6 +433,54 @@ async function preview(id) {
     const rem = (config.reminders || []).find(r => r.id === id);
     if (!rem) return { ok: false, reason: 'Hatırlatma bulunamadı.' };
     return previewReminder(rem);
+}
+
+// Tek cariye elle gönder ("Yeniden dene"). Elle eklenen numara da kullanılır.
+// Elle numarada WhatsApp varlık doğrulaması atlanır (kullanıcı bizzat girdi).
+async function sendOne(id, ind) {
+    const rem = (config.reminders || []).find(r => r.id === id);
+    if (!rem) return { success: false, message: 'Hatırlatma bulunamadı.' };
+    const pool = deps.getPool();
+    if (!pool || !pool.connected) return { success: false, message: 'Veritabanı bağlantısı yok' };
+    if (!deps.waStatus().ready) return { success: false, message: 'WhatsApp bağlı değil' };
+    const firmaNo = config.firmaNo;
+    if (!firmaNo) return { success: false, message: 'Firma seçilmemiş' };
+    const indNum = parseInt(ind, 10);
+    if (!Number.isFinite(indNum)) return { success: false, message: 'Geçersiz cari' };
+
+    let bakiye = null;
+    if (rem.type === 'anyBalance') {
+        const netMap = await fetchNetBalances(pool, firmaNo, config.donemNo, [indNum]);
+        bakiye = netMap.has(indNum) ? netMap.get(indNum) : null;
+    }
+    const contacts = await deps.resolveCariContacts(firmaNo, [indNum]);
+    const contact = withManualPhone(firmaNo, indNum, contacts.get(indNum) || {});
+    if (bakiye == null && contact.bakiye != null) bakiye = contact.bakiye;
+    if (contact.pasif) return { success: false, message: 'Cari pasif (STATUS=2) — gönderilmez' };
+    if (!contact.phone || !contact.valid) return { success: false, message: 'Geçerli telefon yok' };
+
+    const durum = bakiye == null ? '' : (bakiye > 0 ? 'Borç' : bakiye < 0 ? 'Alacak' : '');
+    const bakStr = bakiye != null ? fmtAmount(Math.abs(bakiye)) : '';
+    const text = renderTemplate(rem.template, {
+        ad: contact.name, firma: contact.firma || contact.name, kod: contact.kod,
+        bakiye: bakStr, kalan: bakStr, tutar: bakStr, durum,
+        gecikmeGun: '', enEskiVade: '', vade: '', vadeNot: '',
+    });
+
+    // DB numarası ise (elle değil) WA doğrulaması yap; elle numarayı doğrudan gönder.
+    if (rem.verifyOnWhatsApp !== false && !contact.phoneManual) {
+        const chk = await deps.checkOnWhatsApp(contact.phone);
+        if (!chk.exists) return { success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin' : 'Numara WhatsApp kullanıcısı değil' };
+    }
+    const media = loadMediaFromDescriptor(rem.media);
+    const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
+    if (res.success) {
+        rem.perCariLastSent[indNum] = new Date().toISOString(); saveConfig();
+        pushLog({ reminder: rem.name, name: contact.name, firma: contact.firma, phone: contact.phone, bakiye: bakStr, bakiyeDurum: durum, status: 'sent', message: text, manual: !!contact.phoneManual });
+        return { success: true, message: 'Gönderildi', phone: contact.phone };
+    }
+    pushLog({ reminder: rem.name, name: contact.name, phone: contact.phone, status: 'failed', error: res.error });
+    return { success: false, message: res.error || 'Gönderilemedi' };
 }
 
 // ─── Zamanlayıcı ────────────────────────────────────────────────────────────────
@@ -478,7 +565,8 @@ function getStatus() {
 function getLog() { return log; }
 
 module.exports = {
-    configure, autoStart, start, stop, tick, runNow, preview,
+    configure, autoStart, start, stop, tick, runNow, preview, sendOne,
+    setManualPhone, getManualPhone,
     getConfig, setConfig, getStatus, getLog,
     setReminderMedia, clearReminderMedia,
 };
