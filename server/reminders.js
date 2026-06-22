@@ -39,8 +39,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 function defaultReminders() {
     const common = { intervalDays: 7, sendTime: '10:00', startDate: null, minAmount: 0, onlySmsGonder: false, verifyOnWhatsApp: true, vadeGunDefault: 90, media: null, lastRunAt: null, perCariLastSent: {} };
     return [
-        { id: 'anyBalance', type: 'anyBalance', name: 'Bakiye hatırlatma (borçlular, vadesi gelmemiş)', enabled: false,
-            template: 'Sayın {firma}, güncel borç bakiyeniz {bakiye} TL. {vadeNot}Ödemenizi rica ederiz.', ...common },
+        { id: 'anyBalance', type: 'anyBalance', name: 'Bakiye hatırlatma (kalan borç)', enabled: false,
+            template: 'Sayın {firma}, güncel borç bakiyeniz {bakiye} TL. Ödemenizi rica ederiz.', ...common },
+        // NOT: overdueBuyer (geciken/vade) şu an ASKIDA — UI'da gizli, default pasif.
+        // Vade hesabı düzeltilince geri açılır. Kod korunur.
         { id: 'overdueBuyer', type: 'overdueBuyer', name: 'Geciken borç hatırlatma (borçlular)', enabled: false,
             template: 'Sayın {firma}, {kalan} TL tutarında, {gecikmeGun} gün vadesi geçmiş borcunuz bulunmaktadır (en eski vade: {enEskiVade}). Ödemenizi rica ederiz.', ...common },
     ];
@@ -87,8 +89,11 @@ function loadConfig() {
     try {
         if (fs.existsSync(CONFIG_PATH)) {
             const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-            // Göç: alacaklılara mesaj atan eski 'creditorSupplier' kategorisi kaldırıldı.
-            const rawRems = Array.isArray(raw.reminders) ? raw.reminders.filter(r => r && r.type !== 'creditorSupplier') : [];
+            // Göç: alacaklılara mesaj atan eski 'creditorSupplier' kaldırıldı.
+            // Göç: overdueBuyer (geciken/vade) şu an askıda → zorla pasif (kart gizli).
+            const rawRems = (Array.isArray(raw.reminders) ? raw.reminders : [])
+                .filter(r => r && r.type !== 'creditorSupplier')
+                .map(r => r && r.type === 'overdueBuyer' ? { ...r, enabled: false } : r);
             config = {
                 firmaNo: raw.firmaNo || null, donemNo: raw.donemNo || null,
                 reminders: rawRems.length ? rawRems.map(r => normalizeReminder(r)) : defaultReminders(),
@@ -214,6 +219,36 @@ async function fetchAging(pool, firma, donem, cands, vadeGunDefault) {
     return map;
 }
 
+// Gerçek kalan bakiye: cari hareketten SUM(BORC)-SUM(ALACAK) (belge mesajlarıyla
+// AYNI kaynak — watcher.fetchKalanBorc ile birebir). TBLCARI.BAKIYE güvenilmez.
+// ids verilmezse dönemdeki tüm carileri döner. Map<ind, net> (net>0 = borçlu).
+async function fetchNetBalances(pool, firma, donem, ids) {
+    const map = new Map();
+    if (!donem) return map;
+    const tbl = `F${firma}D${donem}TBLCARIHAREKETLERI`;
+    if (!(await tableExists(pool, tbl))) return map;
+    const idNums = (ids || []).map(n => parseInt(n, 10)).filter(Number.isFinite);
+    const idFilter = idNums.length ? ` WHERE FIRMANO IN (${idNums.join(',')})` : '';
+    const rows = (await pool.request().query(`
+        SELECT FIRMANO, CAST(SUM(BORC) - SUM(ALACAK) AS DECIMAL(18,2)) AS NET
+        FROM [${tbl}]${idFilter} GROUP BY FIRMANO
+    `)).recordset;
+    for (const r of rows) map.set(r.FIRMANO, Number(r.NET));
+    return map;
+}
+
+// anyBalance adayları: cari hareket net bakiyesi > 0 olan borçlular (belge ile aynı
+// kaynak). [{IND,BAKIYE,FIRMATIPI,OPSIYON}] biçiminde — runReminder/preview ortak.
+async function debtorCandidates(pool, firmaNo, donem, minAmount) {
+    const netMap = await fetchNetBalances(pool, firmaNo, donem);
+    const min = Math.max(0, Number(minAmount) || 0);
+    const out = [];
+    for (const [ind, net] of netMap) {
+        if (net > 0 && net >= min) out.push({ IND: ind, BAKIYE: net, FIRMATIPI: null, OPSIYON: null });
+    }
+    return out;
+}
+
 // ─── Tek hatırlatma çalıştır ───────────────────────────────────────────────────
 async function runReminder(rem) {
     const pool = deps.getPool();
@@ -222,14 +257,16 @@ async function runReminder(rem) {
     const firmaNo = config.firmaNo;
     if (!firmaNo) return { skipped: true, reason: 'Firma seçilmemiş' };
 
-    const cands = await deps.reminderCandidateInds(firmaNo, rem.type, rem.minAmount || 0); // [{IND,BAKIYE,FIRMATIPI,OPSIYON}]
+    // anyBalance: bakiye = cari hareket net (belge mesajlarıyla AYNI). overdueBuyer (askıda): eski yol.
+    const cands = rem.type === 'anyBalance'
+        ? await debtorCandidates(pool, firmaNo, config.donemNo, rem.minAmount || 0)
+        : await deps.reminderCandidateInds(firmaNo, rem.type, rem.minAmount || 0); // [{IND,BAKIYE,FIRMATIPI,OPSIYON}]
     if (!cands.length) { lastResult = { id: rem.id, sent: 0, total: 0, note: 'Aday cari yok', at: new Date().toISOString() }; return { sent: 0, skipped: 0, total: 0 }; }
 
     const contacts = await deps.resolveCariContacts(firmaNo, cands.map(c => c.IND));
-    // İki kategori de vade/gecikme bilgisine ihtiyaç duyar: overdueBuyer gecikmeyi,
-    // anyBalance ise hem gecikenleri elemek hem de son ödeme tarihini ({vade}) yazmak için.
+    // Vade/gecikme yalnız overdueBuyer (askıda) için. anyBalance vade kullanmaz.
     let agingMap = new Map();
-    if (rem.type === 'overdueBuyer' || rem.type === 'anyBalance') {
+    if (rem.type === 'overdueBuyer') {
         agingMap = await fetchAging(pool, firmaNo, config.donemNo, cands.map(c => ({ ind: c.IND, vadeGun: c.OPSIYON })), rem.vadeGunDefault || 90);
     }
     const media = loadMediaFromDescriptor(rem.media);
@@ -243,10 +280,8 @@ async function runReminder(rem) {
         const durum = bakiye == null ? '' : (bakiye > 0 ? 'Borç' : bakiye < 0 ? 'Alacak' : '');
         const ag = agingMap.get(c.IND);
 
-        // Gecikme kategorisinde vadesi geçmemişleri atla.
+        // Gecikme kategorisinde (overdueBuyer, askıda) vadesi geçmemişleri atla.
         if (rem.type === 'overdueBuyer' && (!ag || ag.gecikmeGun <= 0)) continue;
-        // Normal bakiye kategorisinde vadesi GEÇMİŞ olanları atla (onlar overdueBuyer'a ait).
-        if (rem.type === 'anyBalance' && ag && ag.gecikmeGun > 0) continue;
 
         // intervalDays içinde aynı cariye tekrar gönderme (dedup).
         const last = rem.perCariLastSent[c.IND];
@@ -299,12 +334,14 @@ async function previewReminder(rem) {
     const firmaNo = config.firmaNo;
     if (!firmaNo) return { ok: false, reason: 'Firma seçilmemiş' };
 
-    const cands = await deps.reminderCandidateInds(firmaNo, rem.type, rem.minAmount || 0);
+    const cands = rem.type === 'anyBalance'
+        ? await debtorCandidates(pool, firmaNo, config.donemNo, rem.minAmount || 0)
+        : await deps.reminderCandidateInds(firmaNo, rem.type, rem.minAmount || 0);
     if (!cands.length) return { ok: true, total: 0, willSend: 0, rows: [], note: 'Aday cari yok' };
 
     const contacts = await deps.resolveCariContacts(firmaNo, cands.map(c => c.IND));
     let agingMap = new Map();
-    if (rem.type === 'overdueBuyer' || rem.type === 'anyBalance') {
+    if (rem.type === 'overdueBuyer') {
         agingMap = await fetchAging(pool, firmaNo, config.donemNo, cands.map(c => ({ ind: c.IND, vadeGun: c.OPSIYON })), rem.vadeGunDefault || 90);
     }
 
@@ -318,7 +355,6 @@ async function previewReminder(rem) {
 
         let skip = null;
         if (rem.type === 'overdueBuyer' && (!ag || ag.gecikmeGun <= 0)) skip = 'Vadesi geçmemiş';
-        else if (rem.type === 'anyBalance' && ag && ag.gecikmeGun > 0) skip = 'Vadesi geçmiş (geciken kategorisine ait)';
         else {
             const last = rem.perCariLastSent[c.IND];
             if (last && (Date.now() - new Date(last).getTime()) < (rem.intervalDays || 7) * DAY_MS) skip = 'Sıklık içinde zaten gönderildi';

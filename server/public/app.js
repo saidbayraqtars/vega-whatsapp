@@ -1011,10 +1011,10 @@ function createReminderCard(rem) {
     card.dataset.id = rem.id;
     card.dataset.type = rem.type;
     const isOverdue = rem.type === 'overdueBuyer';
-    // Geciken: gecikmeGun/enEskiVade. Normal: vade/vadeNot. Diğeri gizlenir.
+    // Normal bakiye: vade YOK (sadece kalan borç). Geciken (askıda): gecikmeGun/enEskiVade.
     const vars = RM_VARS.filter(v => isOverdue
         ? (v !== '{vade}' && v !== '{vadeNot}')
-        : (v !== '{gecikmeGun}' && v !== '{enEskiVade}'));
+        : (v !== '{gecikmeGun}' && v !== '{enEskiVade}' && v !== '{vade}' && v !== '{vadeNot}'));
     const mediaInfo = (rem.media && rem.media.name)
         ? `Kayıtlı: <b>${esc(rem.media.name)}</b>${rem.media.kind ? ` (${esc(rem.media.kind)})` : ''} <a href="#" class="rm_mediaClear">Kaldır</a>` : '';
     const startVal = rem.startDate ? String(rem.startDate).slice(0, 10) : '';
@@ -1030,7 +1030,7 @@ function createReminderCard(rem) {
             <label>Mesaj şablonu</label>
             <textarea class="rm_template" placeholder="Sayın {firma} müşterimiz, ...">${esc(rem.template || '')}</textarea>
             <div class="chips rm_chips">${vars.map(v => `<span class="chip" data-v="${v}">${v}</span>`).join('')}</div>
-            ${isOverdue ? '<div class="hint">{kalan}=geciken borç tutarı, {gecikmeGun}=gün, {enEskiVade}=en eski vade tarihi.</div>' : '<div class="hint">{bakiye}=güncel borç (işaretsiz). {vade}=son ödeme tarihi (boş olabilir). {vadeNot}=vade varsa hazır cümle, yoksa boş — vade belirsizse mesajdan düşer.</div>'}
+            ${isOverdue ? '<div class="hint">{kalan}=geciken borç tutarı, {gecikmeGun}=gün, {enEskiVade}=en eski vade tarihi.</div>' : '<div class="hint">{bakiye}=kalan borç (cari hareketten, işaretsiz; belge mesajıyla aynı). {durum}=Borç/Alacak.</div>'}
         </div>
         <div class="grid2">
             <div><label>Gün sıklığı</label><input class="rm_interval" type="number" min="1" value="${Number(rem.intervalDays) || 7}" /></div>
@@ -1055,6 +1055,9 @@ function createReminderCard(rem) {
     });
     card.querySelector('.rm_test').onclick = () => testReminder(card);
     card.querySelector('.rm_preview').onclick = () => previewReminderCard(card);
+    // overdueBuyer (geciken/vade) ŞU AN ASKIDA: kart gizli ama DOM'da kalır →
+    // collectReminders config'te korur (pasif). Vade düzeltilince bu satır kalkar.
+    if (isOverdue) card.style.display = 'none';
     const mc = card.querySelector('.rm_mediaClear');
     if (mc) mc.onclick = async (e) => {
         e.preventDefault();

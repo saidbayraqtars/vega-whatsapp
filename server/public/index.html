@@ -217,11 +217,11 @@
         <!-- SOL: Kategoriler -->
         <div class="card">
             <h2>📅 Bakiye / Borç Hatırlatma</h2>
-            <p class="sub">Belirlenen <b>gün sıklığı + saat + başlangıç tarihiyle</b> carilere otomatik borç hatırlatması gönderilir. İki hazır kategori: <b>normal bakiye</b> (vadesi gelmemiş borçlular, vade tarihini söyler) ve <b>geciken borç</b>. Yalnızca <b>borçlulara</b> gider; alacaklılara asla. <b>Varsayılan: hepsi pasif</b> — açtığını gönderir. Vade/gecikme hesabı için dönem seçilmelidir.</p>
+            <p class="sub">Belirlenen <b>gün sıklığı + saat + başlangıç tarihiyle</b> borçlulara otomatik <b>kalan borç</b> hatırlatması gönderilir. Bakiye, belge mesajlarıyla <b>aynı kaynaktan</b> (cari hareket) hesaplanır — bu yüzden <b>dönem seçimi zorunlu</b>. Yalnızca <b>borçlulara</b> (kalan borç > 0) gider; alacaklılara asla. <b>Varsayılan: pasif</b> — açtığını gönderir. <b>Önizle</b> ile göndermeden kime ne gideceğini gör.</p>
 
             <div class="row">
                 <div class="field"><label>Firma</label><select id="rm_firma"></select></div>
-                <div class="field"><label>Dönem <span class="muted">(gecikme için)</span></label><select id="rm_donem"></select></div>
+                <div class="field"><label>Dönem <span class="muted">(bakiye için zorunlu)</span></label><select id="rm_donem"></select></div>
             </div>
 
             <div id="rm_cards"></div>
