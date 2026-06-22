@@ -944,8 +944,8 @@ $('msgModalClose').onclick = () => $('msgModal').classList.add('hidden');
 // ═══════════════════════════════════════════════════════════════════════════
 //  Bakiye / Borç Hatırlatma (periyodik)
 // ═══════════════════════════════════════════════════════════════════════════
-const RM_VARS = ['{firma}', '{ad}', '{bakiye}', '{kalan}', '{durum}', '{gecikmeGun}', '{enEskiVade}'];
-const RM_TYPE_LABEL = { anyBalance: 'Bakiyesi olan tüm cariler', overdueBuyer: 'Alıcı borç hatırlatma (geciken)', creditorSupplier: 'Satıcı alacak bildirimi' };
+const RM_VARS = ['{firma}', '{ad}', '{bakiye}', '{kalan}', '{durum}', '{vade}', '{vadeNot}', '{gecikmeGun}', '{enEskiVade}'];
+const RM_TYPE_LABEL = { anyBalance: 'Bakiye hatırlatma (borçlular, vadesi gelmemiş)', overdueBuyer: 'Geciken borç hatırlatma (borçlular)' };
 let rmLoaded = false;
 let rmLogTimer = null;
 
@@ -1011,7 +1011,10 @@ function createReminderCard(rem) {
     card.dataset.id = rem.id;
     card.dataset.type = rem.type;
     const isOverdue = rem.type === 'overdueBuyer';
-    const vars = isOverdue ? RM_VARS : RM_VARS.filter(v => v !== '{gecikmeGun}' && v !== '{enEskiVade}');
+    // Geciken: gecikmeGun/enEskiVade. Normal: vade/vadeNot. Diğeri gizlenir.
+    const vars = RM_VARS.filter(v => isOverdue
+        ? (v !== '{vade}' && v !== '{vadeNot}')
+        : (v !== '{gecikmeGun}' && v !== '{enEskiVade}'));
     const mediaInfo = (rem.media && rem.media.name)
         ? `Kayıtlı: <b>${esc(rem.media.name)}</b>${rem.media.kind ? ` (${esc(rem.media.kind)})` : ''} <a href="#" class="rm_mediaClear">Kaldır</a>` : '';
     const startVal = rem.startDate ? String(rem.startDate).slice(0, 10) : '';
@@ -1026,7 +1029,7 @@ function createReminderCard(rem) {
             <label>Mesaj şablonu</label>
             <textarea class="rm_template" placeholder="Sayın {firma} müşterimiz, ...">${esc(rem.template || '')}</textarea>
             <div class="chips rm_chips">${vars.map(v => `<span class="chip" data-v="${v}">${v}</span>`).join('')}</div>
-            ${isOverdue ? '<div class="hint">{kalan}=geciken borç tutarı, {gecikmeGun}=gün, {enEskiVade}=en eski vade tarihi.</div>' : '<div class="hint">{bakiye}=güncel bakiye (işaretsiz), {durum}=Borç/Alacak.</div>'}
+            ${isOverdue ? '<div class="hint">{kalan}=geciken borç tutarı, {gecikmeGun}=gün, {enEskiVade}=en eski vade tarihi.</div>' : '<div class="hint">{bakiye}=güncel borç (işaretsiz). {vade}=son ödeme tarihi (boş olabilir). {vadeNot}=vade varsa hazır cümle, yoksa boş — vade belirsizse mesajdan düşer.</div>'}
         </div>
         <div class="grid2">
             <div><label>Gün sıklığı</label><input class="rm_interval" type="number" min="1" value="${Number(rem.intervalDays) || 7}" /></div>
@@ -1034,7 +1037,7 @@ function createReminderCard(rem) {
             <div><label>Başlangıç tarihi</label><input class="rm_start" type="date" value="${esc(startVal)}" /></div>
             <div><label>Min tutar (TL)</label><input class="rm_min" type="number" min="0" value="${Number(rem.minAmount) || 0}" /></div>
         </div>
-        ${isOverdue ? `<div class="field"><label>Varsayılan vade günü (cari vadesi boşsa)</label><input class="rm_vade" type="number" min="0" value="${Number(rem.vadeGunDefault) || 90}" /></div>` : ''}
+        <div class="field"><label>Varsayılan vade günü (cari vadesi boşsa)</label><input class="rm_vade" type="number" min="0" value="${Number(rem.vadeGunDefault) || 90}" /></div>
         <label class="check"><input type="checkbox" class="rm_onlySms" ${rem.onlySmsGonder ? 'checked' : ''} /> Sadece <b>SMS Gönder izni</b> olan carilere</label>
         <label class="check"><input type="checkbox" class="rm_verify" ${rem.verifyOnWhatsApp !== false ? 'checked' : ''} /> Numara WhatsApp'ta mı kontrol et</label>
         <div class="field">

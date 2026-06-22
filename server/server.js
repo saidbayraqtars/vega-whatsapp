@@ -682,9 +682,9 @@ async function resolveCariContacts(firmaNo, indList) {
 // ─── Hatırlatma aday carileri (kategori + bakiye filtresi) ───────────────────
 // reminders.js için: FIRMATIPI + BAKIYE kategorisine uyan carilerin IND/BAKIYE/
 // FIRMATIPI/OPSIYON(vade günü) listesi. Telefon/isim resolveCariContacts ile çözülür.
-//   anyBalance       → BAKIYE <> 0
-//   overdueBuyer     → FIRMATIPI 1/3 (alıcı) & BAKIYE > 0
-//   creditorSupplier → FIRMATIPI 2/3 (satıcı) & BAKIYE < 0
+//   anyBalance   → BAKIYE > 0 (borçlular; vade ayrımı reminders.js'te yapılır)
+//   overdueBuyer → FIRMATIPI 1/3 (alıcı) & BAKIYE > 0
+//   Alacaklılara (BAKIYE < 0) hiçbir kategoride mesaj gönderilmez.
 async function reminderCandidateInds(firmaNo, category, minAmount) {
     if (!pool || !pool.connected) return [];
     const info = await detectCariColumns(firmaNo);
@@ -694,10 +694,10 @@ async function reminderCandidateInds(firmaNo, category, minAmount) {
     const hasTipi = up.includes('FIRMATIPI');
     const hasOps = up.includes('OPSIYON');
 
-    const where = ['ISNULL(BAKIYE,0) <> 0'];
+    // Her iki kategori de yalnızca borçlu carileri (BAKIYE > 0) hedefler.
+    const where = ['ISNULL(BAKIYE,0) > 0'];
     if (info.hasDeleted) where.push('ISNULL(DELETED,0)=0');
-    if (category === 'overdueBuyer') where.push(`${hasTipi ? 'FIRMATIPI IN (1,3) AND ' : ''}BAKIYE > 0`);
-    else if (category === 'creditorSupplier') where.push(`${hasTipi ? 'FIRMATIPI IN (2,3) AND ' : ''}BAKIYE < 0`);
+    if (category === 'overdueBuyer' && hasTipi) where.push('FIRMATIPI IN (1,3)');
     if (minAmount > 0) where.push('ABS(BAKIYE) >= @minAmt');
 
     const sel = `IND, BAKIYE, ${hasTipi ? 'FIRMATIPI' : 'CAST(NULL AS INT) AS FIRMATIPI'}, ${hasOps ? 'OPSIYON' : 'CAST(NULL AS INT) AS OPSIYON'}`;

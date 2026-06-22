@@ -1,14 +1,17 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  Periyodik Bakiye/Borç Hatırlatma (scheduler)
 //  Olaydan bağımsız zamanlayıcı: belirli gün-sıklığı + saat + başlangıç tarihiyle
-//  carilere bakiye/borç hatırlatması gönderir. 3 hazır kategori (hepsi default pasif):
-//    • anyBalance       — bakiyesi olan tüm cariler (BAKIYE<>0)
-//    • overdueBuyer     — ALICI (FIRMATIPI 1/3) borç bakiyesi (BAKIYE>0), VADE/GECİKME bazlı
-//    • creditorSupplier — SATICI (FIRMATIPI 2/3) alacak bakiyesi (BAKIYE<0)
+//  carilere bakiye/borç hatırlatması gönderir. 2 hazır kategori (hepsi default pasif).
+//  HER İKİSİ DE SADECE BORÇLULARA (BAKIYE>0) gönderir; alacaklılara (BAKIYE<0) asla:
+//    • anyBalance   — bakiyesi olan borçlular, VADESİ HENÜZ GEÇMEMİŞ (gecikmeGun<=0);
+//                     mesajda son ödeme tarihini ({vade}) söyler, varsa.
+//    • overdueBuyer — ALICI (FIRMATIPI 1/3) borç bakiyesi (BAKIYE>0), VADESİ GEÇMİŞ.
 //
-//  Gecikme (overdueBuyer): cari hareketten FIFO yaşlandırma — ödemeler en eski
-//  borçlara mahsup edilir; kalan en eski ödenmemiş borcun vadesi (belge tarihi +
-//  cari OPSIYON günü, yoksa vadeGunDefault) geçmişse "gecikmiş" sayılır.
+//  Vade/gecikme: cari hareketten FIFO yaşlandırma — ödemeler en eski borçlara
+//  mahsup edilir; kalan en eski ödenmemiş borcun vadesi (belge tarihi + cari
+//  OPSIYON günü, yoksa vadeGunDefault). geçmişse "gecikmiş", değilse "vadesi
+//  gelecek" sayılır. anyBalance gecikenleri atlar, overdueBuyer vadesi
+//  gelmemişleri atlar — aynı cariye çift mesaj gitmez.
 //
 //  Bağımlılıklar enjekte edilir:
 //    configure({ getPool, sql, resolveCariContacts, reminderCandidateInds,
@@ -36,12 +39,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 function defaultReminders() {
     const common = { intervalDays: 7, sendTime: '10:00', startDate: null, minAmount: 0, onlySmsGonder: false, verifyOnWhatsApp: true, vadeGunDefault: 90, media: null, lastRunAt: null, perCariLastSent: {} };
     return [
-        { id: 'anyBalance', type: 'anyBalance', name: 'Bakiyesi olan tüm cariler', enabled: false,
-            template: 'Sayın {firma}, güncel hesap bakiyeniz {bakiye} TL ({durum}). Bilginize sunarız.', ...common },
-        { id: 'overdueBuyer', type: 'overdueBuyer', name: 'Alıcı borç hatırlatma (geciken)', enabled: false,
+        { id: 'anyBalance', type: 'anyBalance', name: 'Bakiye hatırlatma (borçlular, vadesi gelmemiş)', enabled: false,
+            template: 'Sayın {firma}, güncel borç bakiyeniz {bakiye} TL. {vadeNot}Ödemenizi rica ederiz.', ...common },
+        { id: 'overdueBuyer', type: 'overdueBuyer', name: 'Geciken borç hatırlatma (borçlular)', enabled: false,
             template: 'Sayın {firma}, {kalan} TL tutarında, {gecikmeGun} gün vadesi geçmiş borcunuz bulunmaktadır (en eski vade: {enEskiVade}). Ödemenizi rica ederiz.', ...common },
-        { id: 'creditorSupplier', type: 'creditorSupplier', name: 'Satıcı alacak bildirimi', enabled: false,
-            template: 'Sayın {firma}, tarafınıza {bakiye} TL alacak bakiyeniz görünmektedir. Bilgilerinize.', ...common },
     ];
 }
 
@@ -60,7 +61,7 @@ function configure(d) {
 }
 
 function normalizeReminder(r, prev) {
-    const type = ['anyBalance', 'overdueBuyer', 'creditorSupplier'].includes(r.type) ? r.type : 'anyBalance';
+    const type = ['anyBalance', 'overdueBuyer'].includes(r.type) ? r.type : 'anyBalance';
     const media = (r.media !== undefined) ? r.media : (prev ? prev.media : null);
     return {
         id: r.id || type,
@@ -86,9 +87,11 @@ function loadConfig() {
     try {
         if (fs.existsSync(CONFIG_PATH)) {
             const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+            // Göç: alacaklılara mesaj atan eski 'creditorSupplier' kategorisi kaldırıldı.
+            const rawRems = Array.isArray(raw.reminders) ? raw.reminders.filter(r => r && r.type !== 'creditorSupplier') : [];
             config = {
                 firmaNo: raw.firmaNo || null, donemNo: raw.donemNo || null,
-                reminders: Array.isArray(raw.reminders) && raw.reminders.length ? raw.reminders.map(r => normalizeReminder(r)) : defaultReminders(),
+                reminders: rawRems.length ? rawRems.map(r => normalizeReminder(r)) : defaultReminders(),
             };
         }
     } catch (e) { console.error('[Reminders] config okunamadı:', e.message); }
@@ -160,7 +163,12 @@ function renderTemplate(tpl, v) {
         .replace(/\{durum\}/gi, v.durum || '')
         .replace(/\{gecikmeGun\}/gi, v.gecikmeGun || '')
         .replace(/\{enEskiVade\}/gi, v.enEskiVade || '')
-        .replace(/ ?\(\s*\)/g, '');
+        .replace(/\{vade\}/gi, v.vade || '')
+        .replace(/\{vadeNot\}/gi, v.vadeNot || '')
+        .replace(/ ?\(\s*\)/g, '')      // boş parantez temizle: "( )"
+        .replace(/[ \t]{2,}/g, ' ')     // {vadeNot} boşsa kalan çift boşluğu topla
+        .replace(/[ \t]+([.,;:])/g, '$1')
+        .trim();
 }
 async function tableExists(pool, name) {
     const r = pool.request();
@@ -218,8 +226,10 @@ async function runReminder(rem) {
     if (!cands.length) { lastResult = { id: rem.id, sent: 0, total: 0, note: 'Aday cari yok', at: new Date().toISOString() }; return { sent: 0, skipped: 0, total: 0 }; }
 
     const contacts = await deps.resolveCariContacts(firmaNo, cands.map(c => c.IND));
+    // İki kategori de vade/gecikme bilgisine ihtiyaç duyar: overdueBuyer gecikmeyi,
+    // anyBalance ise hem gecikenleri elemek hem de son ödeme tarihini ({vade}) yazmak için.
     let agingMap = new Map();
-    if (rem.type === 'overdueBuyer') {
+    if (rem.type === 'overdueBuyer' || rem.type === 'anyBalance') {
         agingMap = await fetchAging(pool, firmaNo, config.donemNo, cands.map(c => ({ ind: c.IND, vadeGun: c.OPSIYON })), rem.vadeGunDefault || 90);
     }
     const media = loadMediaFromDescriptor(rem.media);
@@ -235,6 +245,8 @@ async function runReminder(rem) {
 
         // Gecikme kategorisinde vadesi geçmemişleri atla.
         if (rem.type === 'overdueBuyer' && (!ag || ag.gecikmeGun <= 0)) continue;
+        // Normal bakiye kategorisinde vadesi GEÇMİŞ olanları atla (onlar overdueBuyer'a ait).
+        if (rem.type === 'anyBalance' && ag && ag.gecikmeGun > 0) continue;
 
         // intervalDays içinde aynı cariye tekrar gönderme (dedup).
         const last = rem.perCariLastSent[c.IND];
@@ -244,11 +256,14 @@ async function runReminder(rem) {
         if (!contact.phone || !contact.valid) { skipped++; pushLog({ reminder: rem.name, ind: c.IND, name: contact.name, firma: contact.firma, status: 'noPhone', error: 'Geçerli telefon yok' }); continue; }
 
         const bakStr = bakiye != null ? fmtAmount(Math.abs(bakiye)) : '';
+        const vadeStr = ag && ag.enEskiVade ? new Date(ag.enEskiVade).toLocaleDateString('tr-TR') : '';
+        // {vadeNot}: vade biliniyorsa hazır cümle, yoksa boş (mesajdan tamamen düşer).
+        const vadeNot = vadeStr ? `Son ödeme tarihi ${vadeStr}. ` : '';
         const text = renderTemplate(rem.template, {
             ad: contact.name, firma: contact.firma || contact.name, kod: contact.kod,
             bakiye: bakStr, kalan: bakStr, tutar: bakStr, durum,
             gecikmeGun: ag ? String(ag.gecikmeGun) : '',
-            enEskiVade: ag && ag.enEskiVade ? new Date(ag.enEskiVade).toLocaleDateString('tr-TR') : '',
+            enEskiVade: vadeStr, vade: vadeStr, vadeNot,
         });
 
         if (rem.verifyOnWhatsApp !== false) {
