@@ -40,6 +40,15 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// Atomik JSON yazımı: önce .tmp'ye yaz, sonra rename. quitAndInstall (oto-güncelleme)
+// process'i tam dosya yazılırken öldürürse yarım/bozuk JSON kalmasın → açılışta
+// JSON.parse patlayıp config DEFAULT'a (perCariLastSent boş) düşmesin = TEKRAR gönderim.
+function writeJsonAtomic(file, data) {
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, data, 'utf8');
+    fs.renameSync(tmp, file);
+}
+
 function defaultReminders() {
     const common = { intervalDays: 7, sendTime: '10:00', startDate: null, minAmount: 0, onlySmsGonder: false, verifyOnWhatsApp: true, vadeGunDefault: 90, media: null, lastRunAt: null, perCariLastSent: {} };
     return [
@@ -66,6 +75,8 @@ function configure(d) {
     loadConfig();
     loadLog();
     loadManualPhones();
+    // Config sıfırlansa/bozulsa bile log dururken dedup'ı geri kur (tekrar gönderim önler).
+    try { rebuildDedupFromLog(); } catch (e) { console.error('[Reminders] dedup onarımı:', e.message); }
 }
 
 // ─── Elle eklenen telefonlar (UYGULAMA İÇİ — DB'ye YAZILMAZ) ──────────────────
@@ -77,7 +88,7 @@ function loadManualPhones() {
     catch (e) { console.error('[Reminders] elle telefonlar okunamadı:', e.message); }
 }
 function saveManualPhones() {
-    try { fs.writeFileSync(MANUAL_PHONES_PATH, JSON.stringify(manualPhones, null, 2), 'utf8'); }
+    try { writeJsonAtomic(MANUAL_PHONES_PATH, JSON.stringify(manualPhones, null, 2)); }
     catch (e) { console.error('[Reminders] elle telefonlar yazılamadı:', e.message); }
 }
 function manualKey(firmaNo, ind) { return `${firmaNo}:${ind}`; }
@@ -139,7 +150,7 @@ function loadConfig() {
     } catch (e) { console.error('[Reminders] config okunamadı:', e.message); }
 }
 function saveConfig() {
-    try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8'); }
+    try { writeJsonAtomic(CONFIG_PATH, JSON.stringify(config, null, 2)); }
     catch (e) { console.error('[Reminders] config yazılamadı:', e.message); }
 }
 
@@ -151,7 +162,29 @@ function loadLog() {
 function pushLog(entry) {
     log.unshift({ ...entry, at: new Date().toISOString() });
     if (log.length > 200) log.length = 200;
-    try { fs.writeFileSync(LOG_PATH, JSON.stringify(log), 'utf8'); } catch { /* bellekte devam */ }
+    try { writeJsonAtomic(LOG_PATH, JSON.stringify(log)); } catch { /* bellekte devam */ }
+}
+
+// Dedup'ı (perCariLastSent) gönderim LOG'undan yeniden kur. config dosyası
+// güncelleme/restart sırasında sıfırlanır/bozulursa ama log dururken, daha önce
+// gönderilen cariler buradan geri yüklenir → planlı tur tekrar çalışsa bile o
+// carilere TEKRAR mesaj gitmez. Log 'sent' kayıtları artık {id, ind, at} taşır.
+function rebuildDedupFromLog() {
+    if (!Array.isArray(log) || !log.length) return;
+    let changed = false;
+    for (const rem of config.reminders || []) {
+        rem.perCariLastSent = rem.perCariLastSent || {};
+        for (const e of log) {
+            if (!e || e.status !== 'sent' || e.ind == null) continue;
+            if (e.id !== rem.id && e.reminder !== rem.name) continue; // hangi hatırlatma
+            if (!e.at) continue;
+            const cur = rem.perCariLastSent[e.ind];
+            if (!cur || new Date(e.at).getTime() > new Date(cur).getTime()) {
+                rem.perCariLastSent[e.ind] = e.at; changed = true;
+            }
+        }
+    }
+    if (changed) saveConfig();
 }
 
 // ─── Görsel/video (hatırlatma başına) ─────────────────────────────────────────
@@ -380,7 +413,7 @@ async function _runReminder(rem) {
         const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
         if (res.success) {
             sent++; rem.perCariLastSent[c.IND] = nowIso;
-            pushLog({ reminder: rem.name, name: contact.name, firma: contact.firma, phone: contact.phone, bakiye: bakStr, bakiyeDurum: durum, gecikmeGun: ag ? ag.gecikmeGun : undefined, status: 'sent', message: text });
+            pushLog({ reminder: rem.name, id: rem.id, ind: c.IND, name: contact.name, firma: contact.firma, phone: contact.phone, bakiye: bakStr, bakiyeDurum: durum, gecikmeGun: ag ? ag.gecikmeGun : undefined, status: 'sent', message: text });
         } else {
             pushLog({ reminder: rem.name, name: contact.name, phone: contact.phone, status: 'failed', error: res.error });
         }
@@ -511,7 +544,7 @@ async function sendOne(id, ind) {
     const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
     if (res.success) {
         rem.perCariLastSent[indNum] = new Date().toISOString(); saveConfig();
-        pushLog({ reminder: rem.name, name: contact.name, firma: contact.firma, phone: contact.phone, bakiye: bakStr, bakiyeDurum: durum, status: 'sent', message: text, manual: !!contact.phoneManual });
+        pushLog({ reminder: rem.name, id: rem.id, ind: indNum, name: contact.name, firma: contact.firma, phone: contact.phone, bakiye: bakStr, bakiyeDurum: durum, status: 'sent', message: text, manual: !!contact.phoneManual });
         return { success: true, message: 'Gönderildi', phone: contact.phone };
     }
     pushLog({ reminder: rem.name, name: contact.name, phone: contact.phone, status: 'failed', error: res.error });
