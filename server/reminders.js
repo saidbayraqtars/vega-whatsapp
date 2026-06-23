@@ -26,9 +26,14 @@ let CONFIG_PATH = null;
 let LOG_PATH = null;
 let MANUAL_PHONES_PATH = null;
 let MEDIA_DIR = null;
+let DATA_DIR = null;
 
 let timer = null;
 let ticking = false;
+// Zamanlayıcının bu process'te ilk başladığı an (≈ uygulama açılışı). isDue catch-up
+// engelinde kullanılır: planlanan saat zamanlayıcı başlamadan ÖNCE geçtiyse o döngü
+// atlanır (restart/güncelleme sonrası geçmiş pencereye toplu gönderim yapılmaz).
+let schedulerStartedAt = null;
 // Aynı hatırlatmanın aynı anda iki kez çalışmasını engeller (scheduler + elle "Şimdi gönder"
 // / Önizle-onayla çakışınca aynı cariye çift gönderim olmasın).
 const runningReminderIds = new Set();
@@ -68,6 +73,7 @@ function configure(d) {
     deps = d;
     const dataDir = path.join(d.baseDir, 'data');
     if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+    DATA_DIR = dataDir;
     CONFIG_PATH = path.join(dataDir, 'reminders.json');
     LOG_PATH = path.join(dataDir, 'reminders-log.json');
     MANUAL_PHONES_PATH = path.join(dataDir, 'manual-phones.json');
@@ -77,6 +83,28 @@ function configure(d) {
     loadManualPhones();
     // Config sıfırlansa/bozulsa bile log dururken dedup'ı geri kur (tekrar gönderim önler).
     try { rebuildDedupFromLog(); } catch (e) { console.error('[Reminders] dedup onarımı:', e.message); }
+    // Tek seferlik baz çizgisi (bu güncellemeye özel): geçmiş logu temizle + mevcut
+    // döngüyü "çalışmış" say → güncelleme sonrası geçmiş tarihli gönderim TEKRARLANMAZ.
+    try { applyOneTimeBaseline(); } catch (e) { console.error('[Reminders] baz çizgisi:', e.message); }
+}
+
+// Tek seferlik geçiş (yalnız bir kez, marker dosyasıyla): kullanıcının isteğiyle bu
+// güncellemede geçmiş gönderim log'u temizlenir ve her hatırlatma "bu döngü için
+// çalışmış" işaretlenir (lastRunAt=now). Böylece gönderim günü/saati geçmiş olduğu
+// için güncelleme/yeniden başlatma anında ne tekrar gönderim ne de gönderilemeyenlere
+// yeniden deneme olur; hatırlatma bir SONRAKİ periyotta normal saatinde devam eder.
+const BASELINE_MARKER = '.rm-baseline-v1';
+function applyOneTimeBaseline() {
+    if (!DATA_DIR) return;
+    const marker = path.join(DATA_DIR, BASELINE_MARKER);
+    if (fs.existsSync(marker)) return; // zaten uygulandı
+    const now = new Date().toISOString();
+    log = [];
+    try { writeJsonAtomic(LOG_PATH, JSON.stringify(log)); } catch { /* yok say */ }
+    for (const rem of config.reminders || []) rem.lastRunAt = now;
+    saveConfig();
+    try { fs.writeFileSync(marker, now, 'utf8'); } catch { /* yok say */ }
+    console.log('[Reminders] tek seferlik baz çizgisi: geçmiş log temizlendi, mevcut döngü kapatıldı (tekrar gönderim yok).');
 }
 
 // ─── Elle eklenen telefonlar (UYGULAMA İÇİ — DB'ye YAZILMAZ) ──────────────────
@@ -555,11 +583,17 @@ async function sendOne(id, ind) {
 function isDue(rem, now = new Date()) {
     if (!rem.enabled) return false;
     if (rem.startDate) { const sd = new Date(rem.startDate); if (!isNaN(sd) && now < sd) return false; }
+    let target = null;
     if (rem.sendTime) {
         const [h, m] = String(rem.sendTime).split(':').map(Number);
-        const target = new Date(now); target.setHours(h || 0, m || 0, 0, 0);
+        target = new Date(now); target.setHours(h || 0, m || 0, 0, 0);
         if (now < target) return false; // bugünün saati henüz gelmedi
     }
+    // Catch-up engeli: planlanan saat zamanlayıcı başlamadan ÖNCE geçtiyse (uygulama
+    // o saatten SONRA açıldı/güncellendi) bu döngüyü ATLA. 7/24 tray uygulaması saatinde
+    // zaten çalışır → normal gönderir; sadece "kaçırılmış geçmiş pencere" atlanır, böylece
+    // güncelleme/yeniden başlatma anında geçmiş tarihli toplu tekrar gönderim olmaz.
+    if (target && schedulerStartedAt && schedulerStartedAt > target.getTime()) return false;
     if (rem.lastRunAt) {
         const diff = now.getTime() - new Date(rem.lastRunAt).getTime();
         if (diff < (rem.intervalDays || 7) * DAY_MS) return false;
@@ -586,6 +620,9 @@ async function tick() {
 
 function start() {
     stop();
+    // İlk başlama anını bir kez sabitle (reconnect'lerde kaymasın) — catch-up engeli
+    // bunu "uygulama ne zaman ayağa kalktı" referansı olarak kullanır.
+    if (schedulerStartedAt == null) schedulerStartedAt = Date.now();
     tick();
     timer = setInterval(tick, 60 * 1000);
     if (timer.unref) timer.unref();
