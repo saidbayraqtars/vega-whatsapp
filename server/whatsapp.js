@@ -379,6 +379,18 @@ const simulateTyping = async (jid, ms = 1500) => {
 // Tek mesaj gönder. media: { kind:'image'|'video'|'document', buffer, mimetype, fileName } | null
 const sendMessage = async (phone, text, media = null, opts = {}) => {
     if (!isReady || !sock) return { success: false, error: 'WhatsApp bağlı değil.' };
+    // Zombi bağlantı koruması: connection.update 'open' geldi ama alttaki WebSocket
+    // temiz bir 'close' olayı gelmeden sessizce kapandıysa isReady bayrağı yanıltıcı
+    // kalır → sock.sendMessage throw ETMEDEN çözülür, "gönderildi" loglanır ama mesaj
+    // TESLİM OLMAZ. Gerçek WS durumunu kontrol et: kapalıysa başarısız say + yeniden
+    // bağlanmayı tetikle (üst katman kuyruğa alır/yeniden dener). isOpen yalnız KESİN
+    // false ise müdahale et (tanımsız/ara durumda eski davranışı koru).
+    if (sock.ws && sock.ws.isOpen === false) {
+        isReady = false;
+        waEvent('send-abort ws-not-open (zombie)');
+        scheduleInit(500);
+        return { success: false, error: 'WhatsApp bağlantısı kopuk (yeniden bağlanılıyor).' };
+    }
     const clean = normalizePhone(phone);
     if (!clean) return { success: false, error: 'Geçersiz numara.' };
     const jid = `${clean}@s.whatsapp.net`;
