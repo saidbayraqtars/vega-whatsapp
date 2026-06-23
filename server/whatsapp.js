@@ -211,9 +211,25 @@ const initializeWhatsApp = async () => {
             defaultQueryTimeoutMs: 60_000,
             keepAliveIntervalMs: 25_000,
             browser: ['Vega Toplu Mesaj', 'Chrome', '120.0'],
+            // Baileys mesaj yeniden gönderimi için gerekli (yoksa retry/decrypt uyarıları);
+            // geçmişi tutmuyoruz, undefined dönmek güvenli.
+            getMessage: async () => undefined,
         });
 
         sock.ev.on('creds.update', saveCreds);
+
+        // Gönderim TANILAMA: gönderdiğimiz mesajların gerçek teslim durumunu (ack) günlüğe
+        // yaz. status: 1=PENDING 2=SERVER_ACK(WhatsApp aldı) 3=DELIVERY_ACK(karşıya ulaştı)
+        // 4=READ. "gönderildi deyip ulaşmıyor" şikayetinde: SERVER_ACK var ama DELIVERY_ACK
+        // hiç gelmiyorsa WhatsApp kabul edip düşürüyor (shadow/anti-bot); hiç ack yoksa relay
+        // olmuyor (protokol/sürüm). Teşhis için kritik.
+        sock.ev.on('messages.update', (updates) => {
+            for (const u of (updates || [])) {
+                if (u?.key?.fromMe && u?.update && u.update.status != null) {
+                    waEvent(`ack id=${u.key.id} to=${u.key.remoteJid} status=${u.update.status}`);
+                }
+            }
+        });
 
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect, qr } = update;
@@ -417,11 +433,15 @@ const sendMessage = async (phone, text, media = null, opts = {}) => {
             content = { text: caption };
         }
 
-        await sock.sendMessage(jid, content);
+        const sent = await sock.sendMessage(jid, content);
         bumpDailySent();
-        return { success: true };
+        // TANILAMA: relay sonucu. id varsa Baileys WA sunucusuna iletti; ardından gelen
+        // 'ack' satırları (messages.update) gerçek teslimi gösterir. id YOKSA relay olmadı.
+        waEvent(`send-ok to=${clean} id=${sent?.key?.id || 'YOK'}`);
+        return { success: true, id: sent?.key?.id || null };
     } catch (err) {
         console.error('[WhatsApp] Gönderim hatası →', clean, err.message);
+        waEvent(`send-fail to=${clean} err=${err.message}`);
         return { success: false, error: err.message };
     }
 };
