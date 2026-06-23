@@ -349,8 +349,37 @@ const pendingBase = (p) => ({
 async function processPending() {
     if (!pending.length || !deps.waStatus().ready) return 0;
     let sentCount = 0;
+
+    // Kuyruktaki carileri DB'de YENİDEN doğrula: kuyruk phone+text snapshot tutar ve
+    // körlemesine retry eder; cari sonradan PASİF olduysa (STATUS=2) ya da DB'den
+    // SİLİNDİYSE kuyruktan düşür, tekrar gönderme. Yalnız DB bağlıyken doğrula
+    // (bağlı değilken boş Map'i "hepsi silinmiş" sanıp kuyruğu yanlışlıkla boşaltma).
+    const pool = deps.getPool();
+    let contacts = null;
+    if (pool && pool.connected) {
+        const inds = [...new Set(pending.map(p => p.cariInd).filter(v => v != null))];
+        if (inds.length) {
+            try { contacts = await deps.resolveCariContacts(config.firmaNo, inds); }
+            catch { contacts = null; }
+        }
+    }
+
     for (const item of [...pending]) {
         if (!deps.waStatus().ready) break;
+        // Pasif/silinmiş cariyi kuyruktan at (doğrulama yapılabildiyse).
+        if (contacts && item.cariInd != null) {
+            const c = contacts.get(item.cariInd);
+            if (!c) {
+                pending = pending.filter(p => p !== item); savePending();
+                pushLog({ ...pendingBase(item), status: 'dropped', error: 'Cari veritabanında yok (silinmiş) — kuyruktan çıkarıldı' });
+                continue;
+            }
+            if (c.pasif) {
+                pending = pending.filter(p => p !== item); savePending();
+                pushLog({ ...pendingBase(item), status: 'dropped', error: 'Cari pasif (STATUS=2) — kuyruktan çıkarıldı' });
+                continue;
+            }
+        }
         const media = loadMediaFromDescriptor(item.media);
         if (config.verifyOnWhatsApp) {
             const chk = await deps.checkOnWhatsApp(item.phone);
