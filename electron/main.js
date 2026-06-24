@@ -20,11 +20,14 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) { app.quit(); process.exit(0); }
 
 let mainWindow = null;
+let floatWindow = null;
 let tray = null;
 let isQuitting = false;
 
 const userDataDir = app.getPath('userData');
 const AUTH_BIN = path.join(userDataDir, 'auth.bin'); // safeStorage ile şifreli PIN
+const FLOAT_POS = path.join(userDataDir, 'float-pos.json'); // yüzen buton konumu
+const FLOAT_HIDDEN = path.join(userDataDir, '.float-hidden'); // kullanıcı gizlediyse marker
 
 // ─── Sunucuyu aynı process'te başlat ───────────────────────────────────────────
 function startServer() {
@@ -137,6 +140,51 @@ function createWindow() {
     });
 }
 
+// ─── Yüzen "Bakiyeyi Gönder" butonu ────────────────────────────────────────────
+// Arctos'un üstünde duran küçük, her zaman üstte, çerçevesiz pencere. Arctos'ta
+// açık cariyi (server plan-cache ile tespit eder) gösterir; tıkla → önizle → gönder.
+function loadFloatPos() {
+    try { if (fs.existsSync(FLOAT_POS)) return JSON.parse(fs.readFileSync(FLOAT_POS, 'utf8')); } catch { /* yok say */ }
+    return null;
+}
+function saveFloatPos() {
+    if (!floatWindow || floatWindow.isDestroyed()) return;
+    try { const [x, y] = floatWindow.getPosition(); fs.writeFileSync(FLOAT_POS, JSON.stringify({ x, y })); } catch { /* yok say */ }
+}
+
+function createFloatWindow() {
+    if (floatWindow && !floatWindow.isDestroyed()) { floatWindow.show(); return; }
+    const pos = loadFloatPos();
+    floatWindow = new BrowserWindow({
+        width: 300, height: 170,
+        x: pos ? pos.x : undefined, y: pos ? pos.y : undefined,
+        frame: false, transparent: true, hasShadow: false,
+        resizable: true, maximizable: false, minimizable: false, fullscreenable: false,
+        skipTaskbar: true, alwaysOnTop: true,
+        title: 'Bakiyeyi Gönder',
+        webPreferences: { preload: path.join(__dirname, 'float-preload.js'), contextIsolation: true },
+    });
+    floatWindow.setAlwaysOnTop(true, 'screen-saver');
+    floatWindow.setVisibleOnAllWorkspaces?.(true);
+    floatWindow.loadURL(`${URL}/float.html`);
+    if (!pos) {
+        // İlk açılış: ekranın sağ-altına yerleştir.
+        const { screen } = require('electron');
+        const wa = screen.getPrimaryDisplay().workArea;
+        floatWindow.setPosition(wa.x + wa.width - 320, wa.y + wa.height - 200);
+    }
+    floatWindow.on('moved', saveFloatPos);
+    floatWindow.on('closed', () => { floatWindow = null; });
+}
+
+function showFloat() { try { fs.existsSync(FLOAT_HIDDEN) && fs.unlinkSync(FLOAT_HIDDEN); } catch { /* yok say */ } createFloatWindow(); refreshTrayMenu(); }
+function hideFloat() {
+    try { fs.writeFileSync(FLOAT_HIDDEN, '1'); } catch { /* yok say */ }
+    if (floatWindow && !floatWindow.isDestroyed()) floatWindow.hide();
+    refreshTrayMenu();
+}
+function floatVisible() { return !!(floatWindow && !floatWindow.isDestroyed() && floatWindow.isVisible()); }
+
 function refreshTrayMenu() {
     if (!tray) return;
     const showWin = () => { mainWindow ? (mainWindow.show(), mainWindow.focus()) : createWindow(); };
@@ -151,6 +199,11 @@ function refreshTrayMenu() {
     }
     items.push(
         { type: 'separator' },
+        {
+            label: 'Bakiye butonu (Arctos üstünde)', type: 'checkbox',
+            checked: floatVisible(),
+            click: (item) => { item.checked ? showFloat() : hideFloat(); },
+        },
         {
             label: 'Windows açılışında başlat', type: 'checkbox',
             checked: app.getLoginItemSettings().openAtLogin,
@@ -177,6 +230,14 @@ ipcMain.handle('pin:clear', () => { clearPin(); return true; });
 ipcMain.handle('autostart:get', () => app.getLoginItemSettings().openAtLogin);
 ipcMain.handle('autostart:set', (_e, on) => { app.setLoginItemSettings({ openAtLogin: !!on, args: ['--hidden'] }); return true; });
 
+// Yüzen buton: pencere boyutu (önizleme açılınca büyür) + gizle.
+ipcMain.on('float:size', (_e, { w, h } = {}) => {
+    if (floatWindow && !floatWindow.isDestroyed() && w && h) {
+        floatWindow.setSize(Math.round(w), Math.round(h));
+    }
+});
+ipcMain.on('float:hide', () => hideFloat());
+
 app.on('second-instance', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
 
 app.whenReady().then(async () => {
@@ -192,6 +253,9 @@ app.whenReady().then(async () => {
     const ok = await waitForServer();
     if (!ok) console.error('[Electron] Sunucu başlatılamadı.');
     await autoConnect();
+
+    // Yüzen "Bakiyeyi Gönder" butonu — kullanıcı daha önce gizlemediyse göster.
+    if (!fs.existsSync(FLOAT_HIDDEN)) createFloatWindow();
 
     // --hidden ile (oto-başlatma) açıldıysa pencereyi gösterme, tray'de kal.
     const hidden = process.argv.includes('--hidden');

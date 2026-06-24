@@ -33,6 +33,7 @@ const {
 const { normalizePhone, isLikelyValid } = require('./phone');
 const watcher = require('./watcher');
 const reminders = require('./reminders');
+const activeCari = require('./activeCari');
 const license = require('./license');
 
 const QRCode = require('qrcode');
@@ -174,6 +175,7 @@ async function autoConnectFromConfig() {
         }
         watcher.autoStart();
         try { reminders.autoStart(); } catch { /* Faz 6 */ }
+        try { activeCari.autoStart(); } catch { /* yok say */ }
         return true;
     } catch (e) { console.error('oto-bağlantı hata:', e.message); return false; }
 }
@@ -239,6 +241,7 @@ app.post('/api/setup', async (req, res) => {
         persistConfig({ server, database, username, port: port || '1433', password });
         watcher.autoStart();
         try { reminders.autoStart(); } catch { /* yok say */ }
+        try { activeCari.autoStart(); } catch { /* yok say */ }
         res.json({ success: true, message: 'Kurulum tamamlandı.' });
     } catch (err) {
         console.error('setup hatası:', err.message);
@@ -281,6 +284,7 @@ app.post('/api/login', async (req, res) => {
         if (st.legacy) persistConfig({ server: c.server, database: c.database, username: c.username, port: c.port, password }); // v2'ye yükselt
         watcher.autoStart();
         try { reminders.autoStart(); } catch { /* Faz 6 */ }
+        try { activeCari.autoStart(); } catch { /* yok say */ }
         res.json({ success: true, message: 'Bağlandı.' });
     } catch (err) {
         console.error('login hatası:', err.message);
@@ -921,6 +925,101 @@ app.post('/api/reminders/:id/media/clear', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  AKTİF CARİ → "BAKİYEYİ GÖNDER" (Arctos yüzen butonu)
+//  Arctos'ta o an açık cari plan cache'ten tespit edilir (activeCari.js).
+//  Float pencere /api/active-cari'yi yoklar; "Gönder" /api/active-cari/send'i çağırır.
+// ═══════════════════════════════════════════════════════════════════════════
+const ACTIVE_CARI_DEFAULT_TPL = 'Sayın {firma}, güncel hesap bakiyeniz {bakiye} TL ({durum}). Bilginize sunarız.';
+
+function fmtAmountTR(n) {
+    const num = Number(n) || 0;
+    return num.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+// Bakiye işaretsiz gösterilir; yön {durum} ile (Borç/Alacak). Boş parantez temizlenir.
+function renderBalanceMessage(tpl, c) {
+    const bak = c.bakiye != null ? fmtAmountTR(Math.abs(c.bakiye)) : '';
+    const durum = c.bakiye == null ? '' : (c.bakiye > 0 ? 'Borç' : c.bakiye < 0 ? 'Alacak' : '');
+    return String(tpl || '')
+        .replace(/\{ad\}/gi, c.name || '')
+        .replace(/\{unvan\}/gi, c.name || '')
+        .replace(/\{firma\}/gi, c.firma || c.name || '')
+        .replace(/\{kod\}/gi, c.kod || '')
+        .replace(/\{bakiye\}/gi, bak)
+        .replace(/\{kalan\}/gi, bak)
+        .replace(/\{durum\}/gi, durum)
+        .replace(/ ?\(\s*\)/g, '')
+        .replace(/[ \t]{2,}/g, ' ')
+        .trim();
+}
+
+// O an açık cari + çözümlenmiş iletişim/bakiye/önizleme metni. Buton bunu yoklar.
+app.get('/api/active-cari', async (req, res) => {
+    const a = activeCari.getActive();
+    if (!a) return res.json({ success: true, active: null });
+    if (!pool || !pool.connected) {
+        return res.json({ success: true, active: { firmaNo: a.firmaNo, donemNo: a.donemNo, ind: a.ind, ageMs: a.ageMs, dbConnected: false } });
+    }
+    try {
+        const map = await resolveCariContacts(a.firmaNo, [a.ind]);
+        const c = map.get(a.ind);
+        if (!c) {
+            return res.json({ success: true, active: { firmaNo: a.firmaNo, donemNo: a.donemNo, ind: a.ind, ageMs: a.ageMs, found: false } });
+        }
+        const durum = c.bakiye == null ? '' : (c.bakiye > 0 ? 'Borç' : c.bakiye < 0 ? 'Alacak' : '');
+        res.json({
+            success: true,
+            active: {
+                firmaNo: a.firmaNo, donemNo: a.donemNo, ind: a.ind, ageMs: a.ageMs, found: true,
+                name: c.name, kod: c.kod, firma: c.firma,
+                phone: c.phone, valid: !!c.valid, pasif: !!c.pasif,
+                bakiye: c.bakiye, durum,
+                message: renderBalanceMessage(ACTIVE_CARI_DEFAULT_TPL, c),
+                wa: waStatus().ready,
+            },
+        });
+    } catch (err) {
+        res.json({ success: false, message: err.message });
+    }
+});
+
+// Açık cariye bakiye mesajını gönder (birincil numara). message verilirse onu,
+// yoksa varsayılan şablonu kullanır. WhatsApp varlık doğrulaması yapılır.
+app.post('/api/active-cari/send', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    const a = activeCari.getActive() || {};
+    const firmaNo = (req.body && req.body.firmaNo) || a.firmaNo;
+    const indVal = (req.body && req.body.ind != null) ? req.body.ind : a.ind;
+    const indNum = parseInt(indVal, 10);
+    if (!firmaNo || !Number.isFinite(indNum)) {
+        return res.status(400).json({ success: false, message: 'Açık cari tespit edilemedi.' });
+    }
+    if (!waStatus().ready) {
+        return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil. Önce QR okutun.' });
+    }
+    try {
+        const map = await resolveCariContacts(firmaNo, [indNum]);
+        const c = map.get(indNum);
+        if (!c) return res.status(404).json({ success: false, message: 'Cari bulunamadı.' });
+        if (c.pasif) return res.status(400).json({ success: false, message: 'Cari pasif (STATUS=2) — gönderilmez.' });
+        if (!c.phone || !c.valid) return res.status(400).json({ success: false, message: 'Carinin geçerli telefonu yok.' });
+
+        const text = (req.body && req.body.message && String(req.body.message).trim())
+            ? String(req.body.message)
+            : renderBalanceMessage(ACTIVE_CARI_DEFAULT_TPL, c);
+
+        const chk = await checkOnWhatsApp(c.phone);
+        if (!chk.exists) {
+            return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
+        }
+        const result = await waSend(c.phone, text, null, { simulateTyping: true, typingMs: 1500 });
+        if (result.success) return res.json({ success: true, message: 'Gönderildi.', phone: c.phone, name: c.name });
+        res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  LİSANS (çevrimiçi lisans altyapısı — scaffold, şu an kısıtlamaz)
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/license', (req, res) => {
@@ -1240,6 +1339,9 @@ reminders.configure({
     waStatus,
     baseDir,
 });
+
+// Arctos'ta o an açık cariyi plan cache'ten tespit eden izleyici (yüzen buton için).
+activeCari.configure({ getPool: () => pool, sql });
 
 app.listen(PORT, async () => {
     const url = `http://localhost:${PORT}`;
