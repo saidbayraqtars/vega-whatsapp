@@ -952,6 +952,23 @@ function renderBalanceMessage(tpl, c) {
         .trim();
 }
 
+// Gerçek güncel bakiye = aktif dönem cari hareketinden SUM(BORC)-SUM(ALACAK)
+// (Arctos'un cari hareket ekranında gösterdiği net ile birebir; belge/hatırlatma
+// mesajlarıyla AYNI kaynak). TBLCARI.BAKIYE BAYAT olabilir — kullanılmaz.
+// net>0 = borç (müşteri borçlu), net<0 = alacak. Dönem yoksa null.
+async function fetchCariNetBalance(firmaNo, donemNo, ind) {
+    if (!pool || !pool.connected || !firmaNo || !donemNo) return null;
+    const indNum = parseInt(ind, 10);
+    if (!Number.isFinite(indNum)) return null;
+    const tbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
+    if (!(await validateTableName(tbl))) return null;
+    const r = await pool.request().query(
+        `SELECT CAST(SUM(BORC) - SUM(ALACAK) AS DECIMAL(18,2)) AS NET FROM [${tbl}] WHERE FIRMANO=${indNum}`
+    );
+    const net = r.recordset[0] && r.recordset[0].NET;
+    return net != null ? Number(net) : null;
+}
+
 // O an açık cari + çözümlenmiş iletişim/bakiye/önizleme metni. Buton bunu yoklar.
 app.get('/api/active-cari', async (req, res) => {
     const a = activeCari.getActive();
@@ -965,6 +982,9 @@ app.get('/api/active-cari', async (req, res) => {
         if (!c) {
             return res.json({ success: true, active: { firmaNo: a.firmaNo, donemNo: a.donemNo, ind: a.ind, ageMs: a.ageMs, found: false } });
         }
+        // Bakiyeyi aktif dönem hareketinden hesapla (TBLCARI.BAKIYE bayat olabilir).
+        const net = await fetchCariNetBalance(a.firmaNo, a.donemNo, a.ind);
+        if (net != null) c.bakiye = net;
         const durum = c.bakiye == null ? '' : (c.bakiye > 0 ? 'Borç' : c.bakiye < 0 ? 'Alacak' : '');
         res.json({
             success: true,
@@ -1002,6 +1022,11 @@ app.post('/api/active-cari/send', async (req, res) => {
         if (!c) return res.status(404).json({ success: false, message: 'Cari bulunamadı.' });
         if (c.pasif) return res.status(400).json({ success: false, message: 'Cari pasif (STATUS=2) — gönderilmez.' });
         if (!c.phone || !c.valid) return res.status(400).json({ success: false, message: 'Carinin geçerli telefonu yok.' });
+
+        // Varsayılan şablon için bakiyeyi aktif dönem hareketinden hesapla.
+        const donemNo = (req.body && req.body.donemNo) || a.donemNo;
+        const net = await fetchCariNetBalance(firmaNo, donemNo, indNum);
+        if (net != null) c.bakiye = net;
 
         const text = (req.body && req.body.message && String(req.body.message).trim())
             ? String(req.body.message)
