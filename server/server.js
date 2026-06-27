@@ -35,6 +35,7 @@ const watcher = require('./watcher');
 const reminders = require('./reminders');
 const activeCari = require('./activeCari');
 const license = require('./license');
+const antiban = require('./antiban');
 
 const QRCode = require('qrcode');
 
@@ -1028,6 +1029,12 @@ app.post('/api/active-cari/send', async (req, res) => {
         const net = await fetchCariNetBalance(firmaNo, donemNo, indNum);
         if (net != null) c.bakiye = net;
 
+        // KESİN KURAL: biz müşteriye borçluysak (net bakiye Alacak yönünde, < 0) gönderme.
+        // Otomatik watcher ile aynı çizgi; manuel "Bakiyeyi Gönder" de alacaklı cariye atmaz.
+        if (c.bakiye != null && c.bakiye < 0) {
+            return res.status(400).json({ success: false, message: 'Cari alacaklı (biz borçluyuz) — mesaj gönderilmez.' });
+        }
+
         const text = (req.body && req.body.message && String(req.body.message).trim())
             ? String(req.body.message)
             : renderBalanceMessage(ACTIVE_CARI_DEFAULT_TPL, c);
@@ -1037,7 +1044,7 @@ app.post('/api/active-cari/send', async (req, res) => {
             return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
         }
         const result = await waSend(c.phone, text, null, { simulateTyping: true, typingMs: 1500 });
-        if (result.success) return res.json({ success: true, message: 'Gönderildi.', phone: c.phone, name: c.name });
+        if (result.success) { antiban.recordSent(waStatus().me); return res.json({ success: true, message: 'Gönderildi.', phone: c.phone, name: c.name }); }
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -1081,7 +1088,9 @@ app.get('/api/wa/status', async (req, res) => {
         const st = waStatus();
         let qrImage = null;
         if (st.qr) qrImage = await QRCode.toDataURL(st.qr, { margin: 2, width: 280 });
-        res.json({ success: true, ready: st.ready, initializing: st.initializing, hasQr: st.hasQr, qrImage, me: st.me, error: st.error });
+        // Anti-ban: warm-up günü + saatlik/günlük tavan ve bugün gönderilen (UI uyarısı için).
+        const ab = st.ready ? antiban.snapshot(st.me, DEFAULT_PACING.dailyCap) : null;
+        res.json({ success: true, ready: st.ready, initializing: st.initializing, hasQr: st.hasQr, qrImage, me: st.me, error: st.error, antiban: ab });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -1116,6 +1125,8 @@ const DEFAULT_PACING = {
 
 const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// Saatlik tavan dolduğunda bir sonraki saat başına kalan süre (anti-ban beklemesi).
+const msUntilNextHour = () => { const n = new Date(); return (3600 - (n.getMinutes() * 60 + n.getSeconds())) * 1000; };
 
 function pushEvent(job, event) {
     job.events.push(event);
@@ -1125,8 +1136,9 @@ function pushEvent(job, event) {
 }
 
 function renderMessage(template, recipient) {
-    // {ad} / {unvan} / {firma} / {kod} değişkenleri
-    return String(template || '')
+    // Önce spintax varyantlarını ({a|b|c}) çöz (anti-ban: birebir aynı metin gitmesin),
+    // sonra {ad} / {unvan} / {firma} / {kod} değişkenleri.
+    return antiban.applySpintax(template)
         .replace(/\{ad\}/gi, recipient.name || recipient.unvan || '')
         .replace(/\{unvan\}/gi, recipient.unvan || recipient.name || '')
         .replace(/\{firma\}/gi, recipient.firma || recipient.unvan || recipient.name || '')
@@ -1156,10 +1168,20 @@ async function runJob(job) {
     let sentInBatch = 0;
     for (let i = 0; i < order.length; i++) {
         if (job.cancelled) { pushEvent(job, { type: 'cancelled', index: i }); break; }
-        // Tavan hesap bazlı: bugün gönderilen TÜM mesajlar sayılır (önceki job'lar
-        // + watcher dahil) — aynı gün ikinci toplu gönderim tavanı sıfırlamasın.
-        if (getDailySent() >= p.dailyCap) {
-            pushEvent(job, { type: 'capReached', cap: p.dailyCap, todaySent: getDailySent() });
+        // Anti-ban kapısı: warm-up rampı + saatlik + günlük tavan (hesap-başı).
+        // Günlük dolduysa job biter; saatlik dolduysa sonraki saat başına kadar
+        // (iptal edilebilir) bekleyip aynı alıcıdan devam eder.
+        const g = antiban.gate(waStatus().me, p.dailyCap);
+        if (!g.ok) {
+            if (g.capType === 'hourly') {
+                const waitMs = msUntilNextHour();
+                pushEvent(job, { type: 'hourlyCap', reason: g.reason, waitMs, hourSent: g.hourSent, hourCap: g.hourCap });
+                const until = Date.now() + waitMs;
+                while (!job.cancelled && Date.now() < until) await sleep(Math.min(5000, until - Date.now()));
+                if (job.cancelled) { pushEvent(job, { type: 'cancelled', index: i }); break; }
+                i--; continue;
+            }
+            pushEvent(job, { type: 'capReached', cap: g.dailyCap, todaySent: g.daySent, reason: g.reason });
             break;
         }
 
@@ -1207,6 +1229,7 @@ async function runJob(job) {
         if (job.cancelled) { pushEvent(job, { type: 'cancelled', index: i }); break; }
 
         if (result.success) {
+            antiban.recordSent(waStatus().me); // anti-ban saat/gün sayacı
             job.sentCount++;
             sentInBatch++;
             pushEvent(job, { ...base, status: 'sent', sentCount: job.sentCount });
@@ -1340,6 +1363,9 @@ app.get('*', (req, res) => {
 
 // Lisans altyapısını başlat (data/license.json + machine-id; scaffold = kısıtlamaz).
 license.configure({ baseDir });
+
+// Anti-ban katmanı: warm-up rampı + saatlik/günlük tavan (hesap-başı sayaç).
+antiban.configure(baseDir);
 
 // Watcher'ı bağımlılıklarıyla yapılandır (config/state data/ altına yazılır).
 watcher.configure({

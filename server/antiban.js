@@ -1,0 +1,144 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  Anti-ban / shadowban önleme katmanı (paylaşılan)
+//  Üç gönderim kaynağı da (toplu job / watcher / reminders) gönderim ÖNCESİ
+//  gate() çağırır, gönderim BAŞARILI olunca recordSent() çağırır. Böylece tek
+//  merkezden:
+//    • WARM-UP RAMP — yeni numara ilk günler düşük tavanla başlar, kademeli
+//      artar (1. gün direkt 200 atıp yanmasın). Numara değişince (yeni QR /
+//      yeni hesap) ramp KENDİLİĞİNDEN sıfırlanır (sayaç hesap kimliğine bağlı).
+//    • SAATLİK TAVAN — günlük tavanı tek saatte boşaltmayı engeller (200'ü ilk
+//      saatte atmak, güne yaymak kadar tehlikeli).
+//    • GÜNLÜK TAVAN — warm-up rampı ile kullanıcı tavanının küçüğü.
+//  Sayaçlar data/antiban.json'da hesap-başı tutulur; gün/saat dönünce sıfırlanır,
+//  yeniden başlatma kaybetmez.
+//
+//  NOT: whatsapp.js'teki bumpDailySent ayrı "toplam bugün gönderilen" sayacıdır
+//  (UI göstergesi). Burası gönderim İZNİNİ veren otoritedir.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const fs = require('fs');
+const path = require('path');
+
+// ─── Ayarlanabilir sınırlar ──────────────────────────────────────────────────
+// warmupRamp[i] = numaranın i. aktif gününde izin verilen GÜNLÜK tavan. Son
+// elemandan sonrası sabit kalır (olgun numara). Muhafazakâr: iş mesajı + Baileys
+// (resmî olmayan) için güvenli kademe. Gerekirse buradan gevşetilir.
+const WARMUP_RAMP = [20, 40, 60, 90, 130, 170, 200];
+// Saatlik tavan: günlük tavanı tek saate sığdırmayı engeller. Olgun numarada
+// 200/gün ≈ 40/saat ⇒ en az ~5 saate yayılır.
+const HOURLY_CAP = 40;
+
+let STATE_PATH = null;
+// accounts[accountId] = { firstActiveDate:'YYYY-MM-DD', day:{date,count}, hour:{key,count} }
+let state = { accounts: {} };
+
+const dayKey = (d = new Date()) => d.toISOString().slice(0, 10);            // YYYY-MM-DD
+const hourKey = (d = new Date()) => d.toISOString().slice(0, 13);           // YYYY-MM-DDTHH
+const daysBetween = (fromKey, toKey) =>
+    Math.max(0, Math.round((Date.parse(`${toKey}T00:00:00Z`) - Date.parse(`${fromKey}T00:00:00Z`)) / 86_400_000));
+
+// Hesap kimliğini telefon numarasına indir: "905xxxxxxxxx:12@s.whatsapp.net" →
+// "905xxxxxxxxx". Cihaz eki (:12) yeniden eşleşmede değişir; numara aynıyken
+// warm-up'ı sıfırlamak istemeyiz, o yüzden numara kısmını anahtar yaparız.
+const normAccount = (id) => String(id || 'unknown').split(':')[0].split('@')[0] || 'unknown';
+
+function configure(baseDir) {
+    const dataDir = path.join(baseDir, 'data');
+    try { if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true }); } catch { /* yok say */ }
+    STATE_PATH = path.join(dataDir, 'antiban.json');
+    load();
+}
+
+function load() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+        if (raw && raw.accounts) state = raw;
+    } catch { /* ilk çalıştırma */ }
+}
+function save() {
+    try { if (STATE_PATH) fs.writeFileSync(STATE_PATH, JSON.stringify(state)); }
+    catch { /* sayaç yazılamazsa gönderim engellenmesin */ }
+}
+
+// Hesap kaydını al/oluştur ve gün/saat dönüşünde sayaçları sıfırla.
+function touch(accountId) {
+    const key = normAccount(accountId);
+    const today = dayKey();
+    const hr = hourKey();
+    let acc = state.accounts[key];
+    if (!acc) {
+        acc = { firstActiveDate: today, day: { date: today, count: 0 }, hour: { key: hr, count: 0 } };
+        state.accounts[key] = acc;
+    }
+    if (!acc.firstActiveDate) acc.firstActiveDate = today;
+    if (!acc.day || acc.day.date !== today) acc.day = { date: today, count: 0 };
+    if (!acc.hour || acc.hour.key !== hr) acc.hour = { key: hr, count: 0 };
+    return acc;
+}
+
+// Warm-up rampına göre bu numaranın bugünkü günlük tavanı.
+function rampDailyCap(acc) {
+    const idx = Math.min(daysBetween(acc.firstActiveDate, dayKey()), WARMUP_RAMP.length - 1);
+    return WARMUP_RAMP[idx];
+}
+
+// Gönderim ÖNCESİ izin sorgusu. userDailyCap verilirse warm-up tavanıyla küçüğü
+// alınır (kullanıcı daha düşük istediyse ona uyulur; daha yükseği warm-up keser).
+// Döner: { ok, reason, dailyCap, daySent, hourCap, hourSent, dayIndex, capType }
+//   capType: 'daily' | 'hourly' (ok=false iken hangi tavanın dolduğu).
+function gate(accountId, userDailyCap) {
+    if (!STATE_PATH) return { ok: true, dailyCap: null, daySent: 0, hourCap: HOURLY_CAP, hourSent: 0, dayIndex: 0 };
+    const acc = touch(accountId);
+    const dayIndex = daysBetween(acc.firstActiveDate, dayKey());
+    const rampCap = rampDailyCap(acc);
+    const dailyCap = (Number(userDailyCap) > 0) ? Math.min(rampCap, Number(userDailyCap)) : rampCap;
+
+    if (acc.day.count >= dailyCap) {
+        return { ok: false, capType: 'daily', reason: `Günlük tavan doldu (${acc.day.count}/${dailyCap}${dayIndex < WARMUP_RAMP.length - 1 ? ', ısınma günü ' + (dayIndex + 1) : ''})`,
+            dailyCap, daySent: acc.day.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
+    }
+    if (acc.hour.count >= HOURLY_CAP) {
+        return { ok: false, capType: 'hourly', reason: `Saatlik tavan doldu (${acc.hour.count}/${HOURLY_CAP}) — sonraki saat sürer`,
+            dailyCap, daySent: acc.day.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
+    }
+    return { ok: true, dailyCap, daySent: acc.day.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
+}
+
+// Gönderim BAŞARILI olunca çağır: saat + gün sayaçlarını artır, diske yaz.
+function recordSent(accountId) {
+    if (!STATE_PATH) return;
+    const acc = touch(accountId);
+    acc.day.count++;
+    acc.hour.count++;
+    save();
+}
+
+// ─── Metin varyasyonu (spintax) ──────────────────────────────────────────────
+// Herkese BİREBİR aynı metin = spam imzası. Kullanıcı şablona "{a|b|c}" yazarak
+// varyant tanımlar; her gönderimde rastgele biri seçilir. Örn:
+//   "{Sayın|Değerli|Merhaba} {firma}, {güncel|şu anki} borç bakiyeniz {bakiye} TL."
+// Yalnız İÇİNDE '|' olan süslü parantezler varyant sayılır; değişken token'ları
+// ({firma}, {bakiye} — pipe yok) dokunulmaz. Pipe yoksa metin aynen döner.
+function applySpintax(text) {
+    let s = String(text || '');
+    // İç içe olabilir; en içteki pipe'lı grubu tekrar tekrar çöz (sonsuz döngü
+    // koruması: en fazla 20 tur).
+    for (let i = 0; i < 20 && /\{[^{}]*\|[^{}]*\}/.test(s); i++) {
+        s = s.replace(/\{([^{}]*\|[^{}]*)\}/g, (_, body) => {
+            const opts = body.split('|');
+            return opts[Math.floor(Math.random() * opts.length)];
+        });
+    }
+    return s;
+}
+
+// UI / teşhis için anlık durum (gönderime etkisi yok).
+function snapshot(accountId, userDailyCap) {
+    const g = gate(accountId, userDailyCap);
+    return {
+        dayIndex: g.dayIndex, warmup: g.dayIndex < WARMUP_RAMP.length - 1,
+        dailyCap: g.dailyCap, daySent: g.daySent, hourCap: g.hourCap, hourSent: g.hourSent,
+    };
+}
+
+module.exports = { configure, gate, recordSent, snapshot, applySpintax, WARMUP_RAMP, HOURLY_CAP };

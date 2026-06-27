@@ -55,11 +55,11 @@
         </nav>
         <span class="pill"><span class="dot" id="dbDot"></span> Veritabanı</span>
         <span class="pill"><span class="dot" id="waDot"></span> <span id="waLabel">WhatsApp</span></span>
-        <span class="pill" id="licPill" title="Lisans durumu"><span class="dot" id="licDot"></span> <span id="licLabel">Lisans</span></span>
+        <span class="pill hidden" id="licPill" title="Lisans durumu"><span class="dot" id="licDot"></span> <span id="licLabel">Lisans</span></span>
         <div class="spacer"></div>
-        <button class="btn ghost sm" id="licBtn">Lisans</button>
-        <button class="btn ghost sm" id="waBtn">WhatsApp Bağlantısı</button>
+        <button class="btn ghost sm" id="waBtn">📱 WhatsApp</button>
         <button class="btn ghost sm" id="settingsBtn" title="Ayarlar">⚙ Ayarlar</button>
+        <button class="btn ghost sm" id="licBtn" title="Lisans">Lisans</button>
     </div>
 
     <div class="wrap" id="viewBulk">
@@ -67,23 +67,29 @@
         <div class="card">
             <h2>📋 Cariler</h2>
             <ol class="steps">
-                <li>Firma seç ve carileri ara</li>
-                <li>Mesaj gidecek kişileri işaretle</li>
-                <li>Sağda mesajı yazıp Gönder'e bas</li>
+                <li>Firmayı seç, kişileri ara</li>
+                <li>Göndereceklerini işaretle</li>
+                <li>Sağda mesajı yaz, Gönder'e bas</li>
             </ol>
             <div class="toolbar">
                 <select id="firmaSel"></select>
-                <input type="text" id="searchInput" placeholder="Ünvan, kod veya telefon ara..." />
+                <input type="text" id="searchInput" placeholder="İsim, kod veya telefon yazıp Ara'ya bas..." />
                 <button class="btn sm" id="searchBtn">Ara</button>
-                <label class="check" title="Vega cari kartında 'SMS Gönder' işaretli (SMSGONDER=1) cariler — telefon TELEFON1/2/3'ten alınır"><input type="checkbox" id="onlySms" checked /> SMS Gönder izni olanlar</label>
-                <select id="cariTypeSel" title="Cari tipi (FIRMATIPI): Alıcı=müşteri, Satıcı=tedarikçi">
-                    <option value="hepsi">Hepsi (alıcı+satıcı)</option>
-                    <option value="alici">Alıcı (müşteri)</option>
-                    <option value="satici">Satıcı (tedarikçi)</option>
-                    <option value="diger">Diğer (personel vb.)</option>
-                </select>
-                <label class="check" title="Yalnızca güncel bakiyesi 0 olmayan cariler"><input type="checkbox" id="onlyBalance" /> Sadece bakiyeli</label>
             </div>
+
+            <details class="adv filters">
+                <summary>Filtreler (isteğe bağlı)</summary>
+                <div class="toolbar" style="margin:12px 0 0">
+                    <label class="check" title="Vega cari kartında 'SMS Gönder' işaretli (SMSGONDER=1) cariler — telefon TELEFON1/2/3'ten alınır"><input type="checkbox" id="onlySms" checked /> Sadece izinli kişiler</label>
+                    <select id="cariTypeSel" title="Cari tipi (FIRMATIPI): Alıcı=müşteri, Satıcı=tedarikçi">
+                        <option value="hepsi">Herkes</option>
+                        <option value="alici">Müşteriler</option>
+                        <option value="satici">Tedarikçiler</option>
+                        <option value="diger">Diğer</option>
+                    </select>
+                    <label class="check" title="Yalnızca güncel bakiyesi 0 olmayan cariler"><input type="checkbox" id="onlyBalance" /> Sadece bakiyesi olanlar</label>
+                </div>
+            </details>
 
             <div class="tablewrap">
                 <table>
@@ -123,7 +129,7 @@
                         <span class="chip" data-var="{unvan}">{unvan}</span>
                         <span class="chip" data-var="{kod}">{kod}</span>
                     </div>
-                    <div class="hint">Değişkenler her cariye göre kişiselleştirilir. <b>{firma}</b> = firma adı (FIRMAADI) → "Sayın {firma} müşterimiz".</div>
+                    <div class="hint">Bu etiketlere tıkla, mesaja eklensin. Her kişiye göre otomatik dolar — örn. <b>{firma}</b> → kişinin firma adı.</div>
                 </div>
 
                 <div class="field">
@@ -133,7 +139,7 @@
                 </div>
 
                 <details class="adv">
-                    <summary>Gönderim ayarları (bot koruması)</summary>
+                    <summary>Gelişmiş gönderim ayarları — normalde dokunmana gerek yok</summary>
                     <div class="grid2">
                         <div><label>Min gecikme (sn)</label><input id="p_min" type="number" value="8" /></div>
                         <div><label>Max gecikme (sn)</label><input id="p_max" type="number" value="22" /></div>
@@ -162,7 +168,12 @@
             <h2>🔔 Belge Tipi Mesajları
                 <span class="pill" style="margin-left:auto"><span class="dot" id="wcDot"></span> <span id="wcState">Pasif</span></span>
             </h2>
-            <p class="sub">Seçilen firma/dönemin cari hareketleri taranır; tanımladığın belge tiplerine (tahsilat, fatura, sipariş…) uyan yeni kayıt bulununca o tipin şablonuyla otomatik WhatsApp gönderilir. <b>Varsayılan: hiçbir tip etkin değil</b> — açtığın tipler gönderilir.</p>
+            <p class="sub">Seçtiğin belge (fatura, tahsilat, sipariş…) Vega'da oluşunca ilgili cariye otomatik WhatsApp gider. <b>Sen açmadıkça hiçbir mesaj gönderilmez.</b></p>
+            <ol class="steps">
+                <li>Firma ve dönemi seç</li>
+                <li>"+ Yeni mesaj türü ekle"ye bas</li>
+                <li>Mesajı yaz, "Etkin"le, Kaydet</li>
+            </ol>
 
             <div class="row">
                 <div class="field"><label>Firma</label><select id="wc_firma"></select></div>
@@ -170,12 +181,12 @@
             </div>
 
             <div class="field" style="margin-top:10px">
-                <label>Hedef cari tipi (alıcı / satıcı ayrımı)</label>
+                <label>Kimlere gönderilsin?</label>
                 <select id="wc_cariType" title="Belge mesajları yalnız seçilen cari tipine gönderilir (FIRMATIPI)">
-                    <option value="hepsi">Hepsi (alıcı + satıcı)</option>
-                    <option value="alici">Sadece Alıcı (müşteri)</option>
-                    <option value="satici">Sadece Satıcı (tedarikçi)</option>
-                    <option value="diger">Sadece Diğer (personel vb.)</option>
+                    <option value="hepsi">Herkes (müşteri + tedarikçi)</option>
+                    <option value="alici">Sadece müşteriler</option>
+                    <option value="satici">Sadece tedarikçiler</option>
+                    <option value="diger">Sadece diğer</option>
                 </select>
             </div>
 
@@ -183,7 +194,7 @@
             <button class="btn ghost sm" id="wc_addRule" style="margin-top:10px">+ Yeni mesaj türü ekle</button>
 
             <details class="adv" style="margin-top:12px">
-                <summary>Genel gönderim ayarları</summary>
+                <summary>Gelişmiş ayarlar — normalde dokunmana gerek yok</summary>
                 <div class="grid2">
                     <div><label>Tarama sıklığı (sn)</label><input id="wc_interval" type="number" value="30" min="10" /></div>
                 </div>
@@ -217,7 +228,12 @@
         <!-- SOL: Kategoriler -->
         <div class="card">
             <h2>📅 Bakiye / Borç Hatırlatma</h2>
-            <p class="sub">Belirlenen <b>gün sıklığı + saat + başlangıç tarihiyle</b> borçlulara otomatik <b>kalan borç</b> hatırlatması gönderilir. Bakiye, belge mesajlarıyla <b>aynı kaynaktan</b> (cari hareket) hesaplanır — bu yüzden <b>dönem seçimi zorunlu</b>. Yalnızca <b>borçlulara</b> (kalan borç > 0) gider; alacaklılara asla. <b>Varsayılan: pasif</b> — açtığını gönderir. <b>Önizle</b> ile göndermeden kime ne gideceğini gör.</p>
+            <p class="sub">Borcu olan carilere, seçtiğin gün aralığı ve saatte otomatik <b>bakiye hatırlatması</b> gider. Sadece borçlulara gönderilir. <b>Önizle</b> ile göndermeden önce kime ne gideceğini görebilirsin.</p>
+            <ol class="steps">
+                <li>Firma ve dönemi seç</li>
+                <li>Mesajı, gün ve saati yaz</li>
+                <li>Önizle → "Etkin"le → Kaydet</li>
+            </ol>
 
             <div class="row">
                 <div class="field"><label>Firma</label><select id="rm_firma"></select></div>

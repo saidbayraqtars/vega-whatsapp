@@ -20,6 +20,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const antiban = require('./antiban');
 
 let deps = null;
 let CONFIG_PATH = null;
@@ -254,7 +255,7 @@ function fmtAmount(n) {
     return num.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 function renderTemplate(tpl, v) {
-    return String(tpl || '')
+    return antiban.applySpintax(tpl)
         .replace(/\{ad\}/gi, v.ad || '')
         .replace(/\{unvan\}/gi, v.ad || '')
         .replace(/\{firma\}/gi, v.firma || v.ad || '')
@@ -393,6 +394,9 @@ async function _runReminder(rem) {
 
     for (const c of cands) {
         if (!deps.waStatus().ready) { interrupted = true; break; }
+        // Anti-ban tavanı (warm-up/saatlik/günlük) doldu → turu kes; lastRunAt
+        // ilerlemez, tavan açılınca (sonraki saat/gün) kalan cariler gönderilir.
+        if (!antiban.gate(deps.waStatus().me, null).ok) { interrupted = true; break; }
         const contact = withManualPhone(firmaNo, c.IND, contacts.get(c.IND) || {});
         const bakiye = c.BAKIYE != null ? Number(c.BAKIYE) : (contact.bakiye != null ? contact.bakiye : null);
         const durum = bakiye == null ? '' : (bakiye > 0 ? 'Borç' : bakiye < 0 ? 'Alacak' : '');
@@ -440,6 +444,7 @@ async function _runReminder(rem) {
         }
         const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
         if (res.success) {
+            antiban.recordSent(deps.waStatus().me);
             sent++; rem.perCariLastSent[c.IND] = nowIso;
             pushLog({ reminder: rem.name, id: rem.id, ind: c.IND, name: contact.name, firma: contact.firma, phone: contact.phone, bakiye: bakStr, bakiyeDurum: durum, gecikmeGun: ag ? ag.gecikmeGun : undefined, status: 'sent', message: text });
         } else {
@@ -571,6 +576,7 @@ async function sendOne(id, ind) {
     const media = loadMediaFromDescriptor(rem.media);
     const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
     if (res.success) {
+        antiban.recordSent(deps.waStatus().me);
         rem.perCariLastSent[indNum] = new Date().toISOString(); saveConfig();
         pushLog({ reminder: rem.name, id: rem.id, ind: indNum, name: contact.name, firma: contact.firma, phone: contact.phone, bakiye: bakStr, bakiyeDurum: durum, status: 'sent', message: text, manual: !!contact.phoneManual });
         return { success: true, message: 'Gönderildi', phone: contact.phone };

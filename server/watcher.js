@@ -24,6 +24,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const antiban = require('./antiban');
 
 let deps = null;
 let CONFIG_PATH = null;
@@ -366,6 +367,8 @@ async function processPending() {
 
     for (const item of [...pending]) {
         if (!deps.waStatus().ready) break;
+        // Anti-ban tavanı doldu → kuyrukta kalsın, sonraki turda (saat/gün dönünce) dene.
+        if (!antiban.gate(deps.waStatus().me, null).ok) break;
         // Pasif/silinmiş cariyi kuyruktan at (doğrulama yapılabildiyse).
         if (contacts && item.cariInd != null) {
             const c = contacts.get(item.cariInd);
@@ -395,6 +398,7 @@ async function processPending() {
         }
         const res = await deps.waSend(item.phone, item.text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
         if (res.success) {
+            antiban.recordSent(deps.waStatus().me);
             pending = pending.filter(p => p !== item); savePending(); sentCount++;
             pushLog({ ...pendingBase(item), status: 'sent', message: item.text });
         } else {
@@ -405,7 +409,7 @@ async function processPending() {
             }
             savePending();
         }
-        await sleep(rand(2500, 6000));
+        await sleep(rand(8000, 20000));
     }
     return sentCount;
 }
@@ -420,7 +424,7 @@ function fmtAmount(n) {
 }
 
 function renderTemplate(tpl, vars) {
-    return String(tpl || '')
+    return antiban.applySpintax(tpl)
         .replace(/\{ad\}/gi, vars.ad || '')
         .replace(/\{unvan\}/gi, vars.ad || '')
         .replace(/\{firma\}/gi, vars.firma || vars.ad || '')
@@ -635,6 +639,12 @@ async function pollOnce() {
             if (c.pasif) {
                 skipped++; pushLog({ ...base, status: 'pasif', error: 'Cari pasif (STATUS=2)' }); continue;
             }
+            // KESİN KURAL: biz müşteriye borçluysak (net bakiye Alacak yönünde, < 0) HİÇ gönderme.
+            // Tahsilat/bakiye mesajı "müşteri bize borçlu" izlenimi verir; alacaklı cariye yanlıştır.
+            // (reminders.js zaten net>0 borçluları hedefler; watcher belge-tipi yolunda bu guard eksikti.)
+            if (kalanBorc != null && kalanBorc < 0) {
+                skipped++; pushLog({ ...base, status: 'alacakli', error: 'Cari alacaklı (biz borçluyuz) — gönderilmez' }); continue;
+            }
             if (!cariTipMatches(config.cariType, c.tip)) {
                 skipped++; pushLog({ ...base, status: 'wrongType', error: `Cari tipi filtre dışı (${c.tip || 'bilinmiyor'})` }); continue;
             }
@@ -658,6 +668,12 @@ async function pollOnce() {
                 if (!deps.waStatus().ready) {
                     enqueue(base, phone, text, 'WhatsApp bağlı değil — kuyruğa alındı, bağlanınca gönderilecek', rule.media); queued++; continue;
                 }
+                // Anti-ban tavanı (warm-up/saatlik/günlük) doldu → kuyruğa al, gönderme.
+                // Sonraki turlarda gate açılınca processPending gönderir.
+                const g = antiban.gate(deps.waStatus().me, null);
+                if (!g.ok) {
+                    enqueue(base, phone, text, `Gönderim tavanı: ${g.reason} — kuyruğa alındı`, rule.media); queued++; continue;
+                }
                 if (config.verifyOnWhatsApp) {
                     const chk = await deps.checkOnWhatsApp(phone);
                     if (!chk.exists) {
@@ -667,9 +683,9 @@ async function pollOnce() {
                     }
                 }
                 const res = await deps.waSend(phone, text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
-                if (res.success) { sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
+                if (res.success) { antiban.recordSent(deps.waStatus().me); sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
                 else { enqueue(base, phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`, rule.media); queued++; }
-                await sleep(rand(2500, 6000));
+                await sleep(rand(8000, 20000));
             }
         }
 

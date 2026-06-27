@@ -340,3 +340,8 @@ textarea { min-height: 130px; resize: vertical; line-height: 1.55; }
 .cariinfo .ci-k { color: var(--muted); }
 .cariinfo .ci-v { font-weight: 600; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .kbd { font-family: ui-monospace, monospace; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; font-size: 12px; }
+
+/* Sade kullanım: isteğe bağlı "Filtreler" kutusu (varsayılan kapalı) */
+.filters { margin-top: 4px; margin-bottom: 14px; }
+.filters .toolbar { flex-wrap: wrap; margin: 12px 0 0; }
+.filters[open] summary { color: var(--text); }
