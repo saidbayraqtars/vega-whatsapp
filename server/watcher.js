@@ -278,7 +278,10 @@ function loadConfig() {
             const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
             config = { ...DEFAULT_CONFIG, ...raw };
             // Göç: eski tek-şablon config → "Cari Giriş (Tahsilat)" kuralı.
-            if (!Array.isArray(config.rules) && (raw.template != null || raw.izahatCodes != null)) {
+            // DİSKTEKİ ham veriye (raw.rules) bak: config.rules zaten DEFAULT_CONFIG'ten
+            // [] gelir, o yüzden config.rules'a bakmak göçü hep atlatırdı (eski kullanıcının
+            // etkin tahsilat şablonu güncellemede sessizce düşerdi → havale bildirimi durur).
+            if (!Array.isArray(raw.rules) && (raw.template != null || raw.izahatCodes != null)) {
                 config.rules = [{
                     id: 'cariGiris', docType: 'cariGiris', name: 'Cari Giriş (Tahsilat)',
                     enabled: !!raw.enabled, template: raw.template || '',
