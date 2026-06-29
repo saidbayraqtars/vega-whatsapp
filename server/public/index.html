@@ -4,7 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Expert Bilişim — WhatsApp Tahsilat</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" />
     <link rel="stylesheet" href="style.css" />
+    <!-- Tema: boyamadan önce uygula (FOUC engelle) -->
+    <script>
+        try { if (localStorage.getItem('vega.theme') === 'dark') document.documentElement.classList.add('dark'); } catch (e) {}
+    </script>
 </head>
 <body>
 
@@ -19,7 +26,7 @@
     </div>
     <div class="card narrow">
         <h1>İlk Kurulum</h1>
-        <p class="sub">VegaDB (SQL Server) bağlantı bilgileri. Parola makineye bağlı olarak şifreli saklanır; sonraki açılışlarda otomatik bağlanılır.</p>
+        <p class="sub">VegaDB (SQL Server) bağlantı bilgileri. Parola makineye bağlı şifreli saklanır; sonraki açılışlarda otomatik bağlanılır.</p>
         <div class="row">
             <div class="field"><label>Sunucu</label><input id="su_server" value="localhost" /></div>
             <div class="field" style="flex:.5"><label>Port</label><input id="su_port" value="1433" /></div>
@@ -40,222 +47,250 @@
 
 <!-- ─── ANA EKRAN ─── -->
 <div id="app" class="hidden">
-    <div class="topbar">
-        <div class="brand">
-            <div class="logo">EB</div>
-            <div>
-                <div class="name">Expert <span>Bilişim</span></div>
-                <div class="team">Yazılım Ekibi</div>
+    <!-- SOL SIDEBAR -->
+    <aside class="sidebar">
+        <div class="sb-head">
+            <div class="brand">
+                <div class="logo">EB</div>
+                <div>
+                    <div class="name">Expert <span>Bilişim</span></div>
+                    <div class="team">WhatsApp Tahsilat</div>
+                </div>
             </div>
         </div>
-        <nav class="tabs">
-            <button class="tab active" id="tabBulk" data-view="viewBulk">Toplu Mesaj</button>
-            <button class="tab" id="tabWatcher" data-view="viewWatcher">Belge Tipi Mesajları</button>
-            <button class="tab" id="tabReminders" data-view="viewReminders">Bakiye Hatırlatma</button>
+
+        <nav class="nav">
+            <div class="nav-group">Gönderim</div>
+            <button class="tab active" id="tabBulk" data-view="viewBulk" data-title="Toplu Mesaj">
+                <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+                <span>Toplu Mesaj</span>
+            </button>
+            <button class="tab" id="tabWatcher" data-view="viewWatcher" data-title="Belge Tipi Mesajları">
+                <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h5"/><path d="M9 13h6M9 17h4"/></svg>
+                <span>Belge Tipi</span>
+            </button>
+            <button class="tab" id="tabReminders" data-view="viewReminders" data-title="Bakiye / Borç Hatırlatma">
+                <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+                <span>Bakiye Hatırlatma</span>
+            </button>
         </nav>
-        <span class="pill"><span class="dot" id="dbDot"></span> Veritabanı</span>
-        <span class="pill"><span class="dot" id="waDot"></span> <span id="waLabel">WhatsApp</span></span>
-        <span class="pill hidden" id="licPill" title="Lisans durumu"><span class="dot" id="licDot"></span> <span id="licLabel">Lisans</span></span>
-        <div class="spacer"></div>
-        <button class="btn ghost sm" id="waBtn">📱 WhatsApp</button>
-        <button class="btn ghost sm" id="settingsBtn" title="Ayarlar">⚙ Ayarlar</button>
-        <button class="btn ghost sm" id="licBtn" title="Lisans">Lisans</button>
-    </div>
 
-    <div class="wrap" id="viewBulk">
-        <!-- SOL: Cari seçimi -->
-        <div class="card">
-            <h2>📋 Cariler</h2>
-            <ol class="steps">
-                <li>Firmayı seç, kişileri ara</li>
-                <li>Göndereceklerini işaretle</li>
-                <li>Sağda mesajı yaz, Gönder'e bas</li>
-            </ol>
-            <div class="toolbar">
-                <select id="firmaSel"></select>
-                <input type="text" id="searchInput" placeholder="İsim, kod veya telefon yazıp Ara'ya bas..." />
-                <button class="btn sm" id="searchBtn">Ara</button>
+        <div class="sb-foot">
+            <div class="sb-status">
+                <span class="pill"><span class="dot" id="dbDot"></span> Veritabanı</span>
+                <span class="pill"><span class="dot" id="waDot"></span> <span id="waLabel">WhatsApp</span></span>
+                <span class="pill hidden" id="licPill" title="Lisans durumu"><span class="dot" id="licDot"></span> <span id="licLabel">Lisans</span></span>
             </div>
-
-            <details class="adv filters">
-                <summary>Filtreler (isteğe bağlı)</summary>
-                <div class="toolbar" style="margin:12px 0 0">
-                    <label class="check" title="Vega cari kartında 'SMS Gönder' işaretli (SMSGONDER=1) cariler — telefon TELEFON1/2/3'ten alınır"><input type="checkbox" id="onlySms" checked /> Sadece izinli kişiler</label>
-                    <select id="cariTypeSel" title="Cari tipi (FIRMATIPI): Alıcı=müşteri, Satıcı=tedarikçi">
-                        <option value="hepsi">Herkes</option>
-                        <option value="alici">Müşteriler</option>
-                        <option value="satici">Tedarikçiler</option>
-                        <option value="diger">Diğer</option>
-                    </select>
-                    <label class="check" title="Yalnızca güncel bakiyesi 0 olmayan cariler"><input type="checkbox" id="onlyBalance" /> Sadece bakiyesi olanlar</label>
-                </div>
-            </details>
-
-            <div class="tablewrap">
-                <table>
-                    <thead>
-                        <tr>
-                            <th class="c"><input type="checkbox" id="selAll" title="Sayfayı seç" /></th>
-                            <th>Ünvan</th>
-                            <th>Kod</th>
-                            <th>Telefon</th>
-                        </tr>
-                    </thead>
-                    <tbody id="cariBody">
-                        <tr><td colspan="4" class="muted" style="padding:18px">Firma seçip arayın.</td></tr>
-                    </tbody>
-                </table>
-            </div>
-
-            <div class="selbar">
-                <span class="count" id="loadInfo"></span>
-                <div class="spacer" style="flex:1"></div>
-                <span class="count">Seçili: <b id="selCount">0</b></span>
-                <button class="btn ghost sm" id="selPage">Sayfayı Seç</button>
-                <button class="btn ghost sm" id="selClear">Temizle</button>
+            <div class="sb-actions">
+                <button class="btn ghost sm" id="waBtn">WhatsApp</button>
+                <button class="btn ghost sm" id="settingsBtn" title="Ayarlar">Ayarlar</button>
+                <button class="btn ghost sm" id="licBtn" title="Lisans">Lisans</button>
+                <button class="btn ghost sm" id="themeBtn" title="Gece / gündüz modu">🌙 Tema</button>
             </div>
         </div>
+    </aside>
 
-        <!-- SAĞ: Mesaj -->
-        <div class="panel">
+    <!-- İÇERİK -->
+    <div class="main">
+        <header class="appbar">
+            <div class="title" id="appbarTitle">Toplu Mesaj</div>
+            <div class="spacer"></div>
+            <div class="ctx" id="appbarCtx"></div>
+        </header>
+
+        <div class="wrap" id="viewBulk">
+            <!-- SOL: Cari seçimi -->
             <div class="card">
-                <h2>✏️ Mesaj Oluştur</h2>
-                <div class="field">
-                    <label>Mesaj metni</label>
-                    <textarea id="msgText" placeholder="Sayın {firma} müşterimiz, ..."></textarea>
-                    <div class="chips">
-                        <span class="chip" data-var="{firma}">{firma}</span>
-                        <span class="chip" data-var="{ad}">{ad}</span>
-                        <span class="chip" data-var="{unvan}">{unvan}</span>
-                        <span class="chip" data-var="{kod}">{kod}</span>
-                    </div>
-                    <div class="hint">Bu etiketlere tıkla, mesaja eklensin. Her kişiye göre otomatik dolar — örn. <b>{firma}</b> → kişinin firma adı.</div>
+                <h2>Cariler</h2>
+                <p class="sub">Firmayı seç, kişileri ara, göndereceklerini işaretle. Mesajı sağda yazıp Gönder'e bas.</p>
+                <div class="toolbar">
+                    <select id="firmaSel"></select>
+                    <input type="text" id="searchInput" placeholder="İsim, kod veya telefon yazıp Ara'ya bas..." />
+                    <button class="btn sm" id="searchBtn">Ara</button>
                 </div>
 
-                <div class="field">
-                    <label>Görsel / Video (opsiyonel)</label>
-                    <input type="file" id="mediaInput" accept="image/*,video/*" />
-                    <div class="media-preview" id="mediaPreview"></div>
-                </div>
-
-                <details class="adv">
-                    <summary>Gelişmiş gönderim ayarları — normalde dokunmana gerek yok</summary>
-                    <div class="grid2">
-                        <div><label>Min gecikme (sn)</label><input id="p_min" type="number" value="8" /></div>
-                        <div><label>Max gecikme (sn)</label><input id="p_max" type="number" value="22" /></div>
-                        <div><label>Parti boyutu</label><input id="p_batch" type="number" value="25" /></div>
-                        <div><label>Günlük tavan</label><input id="p_cap" type="number" value="200" /></div>
-                        <div><label>Parti molası min (sn)</label><input id="p_pmin" type="number" value="60" /></div>
-                        <div><label>Parti molası max (sn)</label><input id="p_pmax" type="number" value="150" /></div>
+                <details class="adv filters">
+                    <summary>Filtreler (isteğe bağlı)</summary>
+                    <div class="toolbar" style="margin:12px 0 0">
+                        <label class="check" title="Vega cari kartında 'SMS Gönder' işaretli (SMSGONDER=1) cariler"><input type="checkbox" id="onlySms" checked /> Sadece izinli kişiler</label>
+                        <select id="cariTypeSel" title="Cari tipi (FIRMATIPI)">
+                            <option value="hepsi">Herkes</option>
+                            <option value="alici">Müşteriler</option>
+                            <option value="satici">Tedarikçiler</option>
+                            <option value="diger">Diğer</option>
+                        </select>
+                        <label class="check" title="Yalnızca güncel bakiyesi 0 olmayan cariler"><input type="checkbox" id="onlyBalance" /> Sadece bakiyesi olanlar</label>
                     </div>
-                    <label class="check" style="margin-top:10px"><input type="checkbox" id="p_typing" checked /> "Yazıyor..." simülasyonu</label>
-                    <label class="check"><input type="checkbox" id="p_verify" checked /> Numara WhatsApp'ta mı kontrol et</label>
-                    <label class="check"><input type="checkbox" id="p_shuffle" /> Sırayı karıştır</label>
-                    <label class="check"><input type="checkbox" id="bulkAllPhones" /> Cari kartındaki <b>tüm telefon numaralarına</b> gönder (Telefon 1/2/3)</label>
                 </details>
 
-                <div class="est" id="estimate"></div>
-                <button class="btn green" id="sendBtn" style="margin-top:14px">Gönder</button>
-                <div class="err" id="sendErr"></div>
-            </div>
-        </div>
-    </div>
-
-    <!-- ─── BELGE TİPİ MESAJLARI ─── -->
-    <div class="wrap" id="viewWatcher" style="display:none">
-        <!-- SOL: Kurallar -->
-        <div class="card">
-            <h2>🔔 Belge Tipi Mesajları
-                <span class="pill" style="margin-left:auto"><span class="dot" id="wcDot"></span> <span id="wcState">Pasif</span></span>
-            </h2>
-            <p class="sub">Seçtiğin belge (fatura, tahsilat, sipariş…) Vega'da oluşunca ilgili cariye otomatik WhatsApp gider. <b>Sen açmadıkça hiçbir mesaj gönderilmez.</b></p>
-            <ol class="steps">
-                <li>Firma ve dönemi seç</li>
-                <li>"+ Yeni mesaj türü ekle"ye bas</li>
-                <li>Mesajı yaz, "Etkin"le, Kaydet</li>
-            </ol>
-
-            <div class="row">
-                <div class="field"><label>Firma</label><select id="wc_firma"></select></div>
-                <div class="field"><label>Dönem</label><select id="wc_donem"></select></div>
-            </div>
-
-            <div class="field" style="margin-top:10px">
-                <label>Kimlere gönderilsin?</label>
-                <select id="wc_cariType" title="Belge mesajları yalnız seçilen cari tipine gönderilir (FIRMATIPI)">
-                    <option value="hepsi">Herkes (müşteri + tedarikçi)</option>
-                    <option value="alici">Sadece müşteriler</option>
-                    <option value="satici">Sadece tedarikçiler</option>
-                    <option value="diger">Sadece diğer</option>
-                </select>
-            </div>
-
-            <div id="wc_rules"></div>
-            <button class="btn ghost sm" id="wc_addRule" style="margin-top:10px">+ Yeni mesaj türü ekle</button>
-
-            <details class="adv" style="margin-top:12px">
-                <summary>Gelişmiş ayarlar — normalde dokunmana gerek yok</summary>
-                <div class="grid2">
-                    <div><label>Tarama sıklığı (sn)</label><input id="wc_interval" type="number" value="30" min="10" /></div>
+                <div class="tablewrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th class="c"><input type="checkbox" id="selAll" title="Sayfayı seç" /></th>
+                                <th>Ünvan</th>
+                                <th>Kod</th>
+                                <th>Telefon</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cariBody">
+                            <tr><td colspan="4" class="muted" style="padding:18px">Firma seçip arayın.</td></tr>
+                        </tbody>
+                    </table>
                 </div>
-                <label class="check" style="margin-top:8px"><input type="checkbox" id="wc_verify" checked /> Numara WhatsApp'ta mı kontrol et</label>
-                <label class="check"><input type="checkbox" id="wc_typing" checked /> "Yazıyor..." simülasyonu</label>
-                <label class="check"><input type="checkbox" id="wc_allPhones" /> Cari kartındaki <b>tüm telefon numaralarına</b> gönder (Telefon 1/2/3)</label>
-                <label class="check"><input type="checkbox" id="wc_onlySms" /> Sadece <b>SMS Gönder izni</b> (SMSGONDER) olan carilere gönder</label>
-            </details>
 
-            <div class="selbar" style="margin-top:14px">
-                <button class="btn green" id="wc_save">Kaydet ve Başlat</button>
-                <button class="btn danger" id="wc_stop" style="display:none">Durdur</button>
-                <div class="spacer" style="flex:1"></div>
-                <span class="count" id="wc_info"></span>
+                <div class="selbar">
+                    <span class="count" id="loadInfo"></span>
+                    <div class="spacer" style="flex:1"></div>
+                    <span class="count">Seçili: <b id="selCount">0</b></span>
+                    <button class="btn ghost sm" id="selPage">Sayfayı Seç</button>
+                    <button class="btn ghost sm" id="selClear">Temizle</button>
+                </div>
             </div>
-            <div class="err" id="wc_err"></div>
+
+            <!-- SAĞ: Mesaj -->
+            <div class="panel">
+                <div class="card">
+                    <h2>Mesaj Oluştur</h2>
+                    <div class="field">
+                        <label>Mesaj metni</label>
+                        <textarea id="msgText" placeholder="Sayın {firma} müşterimiz, ..."></textarea>
+                        <div class="chips">
+                            <span class="chip" data-var="{firma}">{firma}</span>
+                            <span class="chip" data-var="{ad}">{ad}</span>
+                            <span class="chip" data-var="{unvan}">{unvan}</span>
+                            <span class="chip" data-var="{kod}">{kod}</span>
+                        </div>
+                        <div class="hint">Etiketlere tıkla, mesaja eklensin. Her kişiye göre otomatik dolar — örn. <b>{firma}</b> → kişinin firma adı.</div>
+                    </div>
+
+                    <div class="field">
+                        <label>Görsel / Video (opsiyonel)</label>
+                        <input type="file" id="mediaInput" accept="image/*,video/*" />
+                        <div class="media-preview" id="mediaPreview"></div>
+                    </div>
+
+                    <details class="adv">
+                        <summary>Gelişmiş gönderim ayarları</summary>
+                        <div class="grid2">
+                            <div><label>Min gecikme (sn)</label><input id="p_min" type="number" value="8" /></div>
+                            <div><label>Max gecikme (sn)</label><input id="p_max" type="number" value="22" /></div>
+                            <div><label>Parti boyutu</label><input id="p_batch" type="number" value="25" /></div>
+                            <div><label>Günlük tavan</label><input id="p_cap" type="number" value="200" /></div>
+                            <div><label>Parti molası min (sn)</label><input id="p_pmin" type="number" value="60" /></div>
+                            <div><label>Parti molası max (sn)</label><input id="p_pmax" type="number" value="150" /></div>
+                        </div>
+                        <label class="check" style="margin-top:10px"><input type="checkbox" id="p_typing" checked /> "Yazıyor..." simülasyonu</label>
+                        <label class="check"><input type="checkbox" id="p_verify" checked /> Numara WhatsApp'ta mı kontrol et</label>
+                        <label class="check"><input type="checkbox" id="p_shuffle" /> Sırayı karıştır</label>
+                        <label class="check"><input type="checkbox" id="bulkAllPhones" /> Cari kartındaki <b>tüm telefon numaralarına</b> gönder (Telefon 1/2/3)</label>
+                    </details>
+
+                    <div class="est" id="estimate"></div>
+                    <button class="btn green" id="sendBtn" style="margin-top:14px">Gönder</button>
+                    <div class="err" id="sendErr"></div>
+                </div>
+            </div>
         </div>
 
-        <!-- SAĞ: Canlı kayıt -->
-        <div class="panel">
+        <!-- ─── BELGE TİPİ MESAJLARI ─── -->
+        <div class="wrap" id="viewWatcher" style="display:none">
+            <!-- SOL: Kurallar -->
             <div class="card">
-                <h2>📨 Son Otomatik Gönderimler</h2>
-                <div class="muted" id="wc_status" style="font-size:13px; margin-bottom:8px">—</div>
-                <div class="log" id="wc_log" style="max-height:520px"></div>
+                <h2>Belge Tipi Mesajları
+                    <span class="pill" style="margin-left:auto"><span class="dot" id="wcDot"></span> <span id="wcState">Pasif</span></span>
+                </h2>
+                <p class="sub">Seçtiğin belge (fatura, tahsilat, sipariş…) Vega'da oluşunca ilgili cariye otomatik WhatsApp gider. <b>Sen açmadıkça hiçbir mesaj gönderilmez.</b></p>
+
+                <div class="row">
+                    <div class="field"><label>Firma</label><select id="wc_firma"></select></div>
+                    <div class="field"><label>Dönem</label><select id="wc_donem"></select></div>
+                </div>
+
+                <div class="field" style="margin-top:10px">
+                    <label>Kimlere gönderilsin?</label>
+                    <select id="wc_cariType" title="Belge mesajları yalnız seçilen cari tipine gönderilir (FIRMATIPI)">
+                        <option value="hepsi">Herkes (müşteri + tedarikçi)</option>
+                        <option value="alici">Sadece müşteriler</option>
+                        <option value="satici">Sadece tedarikçiler</option>
+                        <option value="diger">Sadece diğer</option>
+                    </select>
+                </div>
+
+                <div id="wc_rules"></div>
+                <button class="btn ghost sm" id="wc_addRule" style="margin-top:10px">+ Yeni mesaj türü ekle</button>
+
+                <details class="adv" style="margin-top:12px">
+                    <summary>Belge düzenleme / silme takibi</summary>
+                    <p class="hint" style="margin:2px 0 10px">Mesaj gönderilmiş bir belge sonradan <b>değişir veya silinirse</b> otomatik tepki ver. Yalnız son <b>7 gün</b> içindeki belgeler izlenir.</p>
+                    <label class="check"><input type="checkbox" id="wc_watchEdits" /> Belge <b>düzenlenince</b> (tutar değişince) "güncellendi" mesajı gönder</label>
+                    <label class="check"><input type="checkbox" id="wc_watchDeletes" /> Belge <b>silinince</b> gönderilen WhatsApp mesajını geri çek <span class="muted">(WhatsApp ~2 gün sınırı)</span></label>
+                    <div class="field" style="margin-top:10px">
+                        <label>Düzenlendi mesajı</label>
+                        <textarea id="wc_editTemplate" style="min-height:90px"></textarea>
+                        <div class="hint">{firma}=firma, {evrak}=belge no, {eskiTutar}/{yeniTutar}=önceki/yeni tutar, {tarih}=belge tarihi, {bakiye}=güncel bakiye, {durum}=Borç/Alacak.</div>
+                    </div>
+                </details>
+
+                <details class="adv" style="margin-top:12px">
+                    <summary>Gelişmiş ayarlar</summary>
+                    <div class="grid2">
+                        <div><label>Tarama sıklığı (sn)</label><input id="wc_interval" type="number" value="30" min="10" /></div>
+                    </div>
+                    <label class="check" style="margin-top:8px"><input type="checkbox" id="wc_verify" checked /> Numara WhatsApp'ta mı kontrol et</label>
+                    <label class="check"><input type="checkbox" id="wc_typing" checked /> "Yazıyor..." simülasyonu</label>
+                    <label class="check"><input type="checkbox" id="wc_allPhones" /> Cari kartındaki <b>tüm telefon numaralarına</b> gönder (Telefon 1/2/3)</label>
+                    <label class="check"><input type="checkbox" id="wc_onlySms" /> Sadece <b>SMS Gönder izni</b> (SMSGONDER) olan carilere gönder</label>
+                </details>
+
+                <div class="selbar" style="margin-top:14px">
+                    <button class="btn green" id="wc_save">Kaydet ve Başlat</button>
+                    <button class="btn danger" id="wc_stop" style="display:none">Durdur</button>
+                    <div class="spacer" style="flex:1"></div>
+                    <span class="count" id="wc_info"></span>
+                </div>
+                <div class="err" id="wc_err"></div>
+            </div>
+
+            <!-- SAĞ: Canlı kayıt -->
+            <div class="panel">
+                <div class="card">
+                    <h2>Son Otomatik Gönderimler</h2>
+                    <div class="muted" id="wc_status" style="font-size:13px; margin-bottom:8px">—</div>
+                    <div class="log" id="wc_log" style="max-height:520px"></div>
+                </div>
             </div>
         </div>
-    </div>
 
-    <!-- ─── BAKİYE / BORÇ HATIRLATMA ─── -->
-    <div class="wrap" id="viewReminders" style="display:none">
-        <!-- SOL: Kategoriler -->
-        <div class="card">
-            <h2>📅 Bakiye / Borç Hatırlatma</h2>
-            <p class="sub">Borcu olan carilere, seçtiğin gün aralığı ve saatte otomatik <b>bakiye hatırlatması</b> gider. Sadece borçlulara gönderilir. <b>Önizle</b> ile göndermeden önce kime ne gideceğini görebilirsin.</p>
-            <ol class="steps">
-                <li>Firma ve dönemi seç</li>
-                <li>Mesajı, gün ve saati yaz</li>
-                <li>Önizle → "Etkin"le → Kaydet</li>
-            </ol>
-
-            <div class="row">
-                <div class="field"><label>Firma</label><select id="rm_firma"></select></div>
-                <div class="field"><label>Dönem <span class="muted">(bakiye için zorunlu)</span></label><select id="rm_donem"></select></div>
-            </div>
-
-            <div id="rm_cards"></div>
-
-            <div class="selbar" style="margin-top:14px">
-                <button class="btn green" id="rm_save">Kaydet</button>
-                <div class="spacer" style="flex:1"></div>
-                <span class="count" id="rm_info"></span>
-            </div>
-            <div class="err" id="rm_err"></div>
-        </div>
-
-        <!-- SAĞ: Canlı kayıt -->
-        <div class="panel">
+        <!-- ─── BAKİYE / BORÇ HATIRLATMA ─── -->
+        <div class="wrap" id="viewReminders" style="display:none">
+            <!-- SOL: Kategoriler -->
             <div class="card">
-                <h2>📨 Son Hatırlatmalar</h2>
-                <div class="muted" id="rm_status" style="font-size:13px; margin-bottom:8px">—</div>
-                <div class="log" id="rm_log" style="max-height:520px"></div>
+                <h2>Bakiye / Borç Hatırlatma</h2>
+                <p class="sub">Borcu olan carilere, seçtiğin gün aralığı ve saatte otomatik <b>bakiye hatırlatması</b> gider. Sadece borçlulara. <b>Önizle</b> ile göndermeden önce kime ne gideceğini gör.</p>
+
+                <div class="row">
+                    <div class="field"><label>Firma</label><select id="rm_firma"></select></div>
+                    <div class="field"><label>Dönem <span class="muted">(bakiye için zorunlu)</span></label><select id="rm_donem"></select></div>
+                </div>
+
+                <div id="rm_cards"></div>
+
+                <div class="selbar" style="margin-top:14px">
+                    <button class="btn green" id="rm_save">Kaydet</button>
+                    <div class="spacer" style="flex:1"></div>
+                    <span class="count" id="rm_info"></span>
+                </div>
+                <div class="err" id="rm_err"></div>
+            </div>
+
+            <!-- SAĞ: Canlı kayıt -->
+            <div class="panel">
+                <div class="card">
+                    <h2>Son Hatırlatmalar</h2>
+                    <div class="muted" id="rm_status" style="font-size:13px; margin-bottom:8px">—</div>
+                    <div class="log" id="rm_log" style="max-height:520px"></div>
+                </div>
             </div>
         </div>
     </div>
@@ -264,7 +299,7 @@
 <!-- ─── AYARLAR MODAL ─── -->
 <div id="settingsModal" class="overlay hidden">
     <div class="modal" style="max-width:540px">
-        <h2>⚙ Ayarlar</h2>
+        <h2>Ayarlar</h2>
 
         <div class="row">
             <div class="field"><label>Varsayılan Firma</label><select id="set_firma"></select></div>
@@ -339,14 +374,14 @@
     </div>
 </div>
 
-<!-- ─── GÖNDERİLEN MESAJ MODAL (otomatik tahsilat log'undan) ─── -->
+<!-- ─── GÖNDERİLEN MESAJ MODAL ─── -->
 <div id="msgModal" class="overlay hidden">
     <div class="modal" style="max-width:440px">
         <h2>Gönderilen Mesaj</h2>
         <div class="muted" id="msgModalMeta" style="font-size:13px; margin-bottom:10px"></div>
         <div id="msgModalCari" class="cariinfo" style="display:none"></div>
         <div class="muted" style="font-size:12px; margin:4px 0 6px">Mesaj taslağı</div>
-        <div id="msgModalText" style="white-space:pre-wrap; font-size:14px; line-height:1.6; padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--bg3); overflow:auto"></div>
+        <div id="msgModalText" style="white-space:pre-wrap; font-size:14px; line-height:1.6; padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--surface-2); overflow:auto"></div>
         <div class="actions">
             <button class="btn" id="msgModalClose">Kapat</button>
         </div>

@@ -16,7 +16,7 @@
   .card {
     height: 100vh; display: flex; flex-direction: column;
     background: #16222e;
-    border: 1px solid #2bd29c66; border-radius: 14px;
+    border: 1px solid #22c55e55; border-radius: 14px;
     box-shadow: 0 10px 30px rgba(0,0,0,.6); overflow: hidden;
   }
   /* Üst şerit = sürükleme tutamağı */
@@ -40,21 +40,21 @@
         display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   .bal { font-size: 14px; color: #9fb3c2; }
   .bal b { font-size: 22px; font-weight: 800; display: block; margin-top: 2px; }
-  .bal b.borc { color: #ff9270; }
-  .bal b.alacak { color: #2bd29c; }
+  .bal b.borc { color: #f87171; }
+  .bal b.alacak { color: #22c55e; }
 
   button.go {
     -webkit-app-region: no-drag; border: none; border-radius: 12px; cursor: pointer;
-    padding: 16px; font-size: 16px; font-weight: 800; letter-spacing: .3px; color: #062018;
-    background: linear-gradient(120deg, #32edb1, #1fbf8d);
-    box-shadow: 0 4px 14px #1fbf8d44; transition: filter .15s, opacity .15s;
+    padding: 16px; font-size: 16px; font-weight: 800; letter-spacing: .3px; color: #fff;
+    background: linear-gradient(120deg, #22c55e, #16a34a);
+    box-shadow: 0 4px 14px #16a34a55; transition: filter .15s, opacity .15s;
   }
   button.go:hover { filter: brightness(1.08); }
   button.go:disabled { background: #283a47; color: #6b7c8a; box-shadow: none; cursor: default; }
 
   .note { font-size: 12px; min-height: 16px; color: #8aa0b0; }
-  .note.err { color: #ff9270; }
-  .note.warn { color: #f3c969; }
+  .note.err { color: #f87171; }
+  .note.warn { color: #fbbf24; }
 
   /* ── Önizleme ── */
   #viewPreview { gap: 10px; }
@@ -65,13 +65,13 @@
     background: #0d1922; color: #eaf2f8; border: 1px solid #ffffff1f; border-radius: 11px;
     padding: 10px; font-size: 13px; font-family: inherit; line-height: 1.45; user-select: text;
   }
-  textarea:focus { outline: none; border-color: #2bd29c99; }
+  textarea:focus { outline: none; border-color: #22c55e99; }
   .pvstatus { font-size: 12px; min-height: 15px; }
-  .pvstatus.ok { color: #2bd29c; } .pvstatus.err { color: #ff9270; } .pvstatus.warn { color: #f3c969; }
+  .pvstatus.ok { color: #22c55e; } .pvstatus.err { color: #f87171; } .pvstatus.warn { color: #fbbf24; }
   .row { display: flex; gap: 8px; }
   button.send { flex: 1; -webkit-app-region: no-drag; border: none; border-radius: 11px; cursor: pointer;
-    padding: 14px; font-size: 15px; font-weight: 800; color: #062018;
-    background: linear-gradient(120deg, #32edb1, #1fbf8d); }
+    padding: 14px; font-size: 15px; font-weight: 800; color: #fff;
+    background: linear-gradient(120deg, #22c55e, #16a34a); }
   button.send:hover { filter: brightness(1.08); }
   button.send:disabled { opacity: .5; cursor: default; }
   button.back { -webkit-app-region: no-drag; border: 1px solid #ffffff26; border-radius: 11px; cursor: pointer;

@@ -128,7 +128,10 @@ function createWindow() {
         autoHideMenuBar: true,
         webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true },
     });
-    mainWindow.loadURL(URL);
+    // Önceki sürümden cache'lenmiş eski arayüz (index/app/style) kalmasın → temizle, sonra yükle.
+    mainWindow.webContents.session.clearCache()
+        .catch(() => { /* yok say */ })
+        .finally(() => mainWindow.loadURL(URL));
 
     // X → kapatma değil, tray'e gizle (izleme sürsün).
     mainWindow.on('close', (e) => {

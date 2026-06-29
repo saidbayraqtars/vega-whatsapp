@@ -446,12 +446,32 @@ const sendMessage = async (phone, text, media = null, opts = {}) => {
     }
 };
 
+// Gönderilmiş bir mesajı herkesten geri çek (delete-for-everyone). id = sendMessage'ın
+// döndürdüğü key.id. WhatsApp ~2 gün sınırı koyar; daha eski mesajda sunucu hata döner.
+// Birebir (DM) sohbet olduğu için key.participant gerekmez.
+const deleteMessage = async (phone, id) => {
+    if (!isReady || !sock) return { success: false, error: 'WhatsApp bağlı değil.' };
+    if (!id) return { success: false, error: 'Mesaj kimliği yok.' };
+    const clean = normalizePhone(phone);
+    if (!clean) return { success: false, error: 'Geçersiz numara.' };
+    const jid = `${clean}@s.whatsapp.net`;
+    try {
+        await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: true, id } });
+        waEvent(`recall-ok to=${clean} id=${id}`);
+        return { success: true };
+    } catch (err) {
+        waEvent(`recall-fail to=${clean} id=${id} err=${err.message}`);
+        return { success: false, error: err.message };
+    }
+};
+
 module.exports = {
     initializeWhatsApp,
     refreshWhatsApp,
     logoutWhatsApp,
     getStatus,
     sendMessage,
+    deleteMessage,
     checkOnWhatsApp,
     getDailySent,
     waitForReady,

@@ -27,7 +27,7 @@ const multer = require('multer');
 
 const {
     initializeWhatsApp, refreshWhatsApp, logoutWhatsApp,
-    getStatus: waStatus, sendMessage: waSend, checkOnWhatsApp, getDailySent,
+    getStatus: waStatus, sendMessage: waSend, deleteMessage: waDelete, checkOnWhatsApp, getDailySent,
     waitForReady: waWaitForReady,
 } = require('./whatsapp');
 const { normalizePhone, isLikelyValid } = require('./phone');
@@ -1356,8 +1356,15 @@ app.post('/api/send-cancel/:jobId', (req, res) => {
 });
 
 // ─── Statik frontend ─────────────────────────────────────────────────────────
-app.use(express.static(PUBLIC_DIR));
+// Masaüstü app: CDN yok, cache faydası yok. Electron renderer eski index/app/style'ı
+// cache'leyip eski arayüzü göstermesin diye no-store (güncelleme anında yansır).
+app.use(express.static(PUBLIC_DIR, {
+    etag: false,
+    lastModified: false,
+    setHeaders: (res) => res.setHeader('Cache-Control', 'no-store'),
+}));
 app.get('*', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
@@ -1373,6 +1380,7 @@ watcher.configure({
     sql,
     resolveCariContacts,
     waSend,
+    waDelete,
     checkOnWhatsApp,
     waStatus,
     baseDir,

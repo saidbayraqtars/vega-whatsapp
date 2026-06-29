@@ -31,6 +31,7 @@ let CONFIG_PATH = null;
 let STATE_PATH = null;
 let PENDING_PATH = null;
 let LOG_PATH = null;
+let DOCS_PATH = null;
 let MEDIA_DIR = null;
 
 let timer = null;
@@ -113,6 +114,14 @@ const DEFAULT_CONFIG = {
     onlySmsGonder: false,
     // Cari tipi hedefleme (FIRMATIPI): hepsi | alici | satici | diger.
     cariType: 'hepsi',
+    // ── Belge düzenleme / silme izleme (mesaj atılmış belgeler için) ──
+    // watchEdits: belgenin tutarı sonradan değişince "düzenlendi" mesajı gönder.
+    // watchDeletes: belge DB'den silinince gönderilen WhatsApp mesajını geri çek.
+    // editScanSec: izlenen belgeleri yeniden sorgulama sıklığı (DB yükünü sınırlar).
+    watchEdits: false,
+    watchDeletes: false,
+    editScanSec: 60,
+    editTemplate: 'Sayın {firma}, {tarih} tarihli {evrak} no.lu belgeniz güncellendi. Yeni tutar: {yeniTutar} TL (önceki {eskiTutar} TL). Güncel bakiyeniz: {bakiye} TL ({durum}).',
     // Belge tipi kuralları. loadConfig ilk açılışta PRESET_RULES ile doldurur.
     //   { id, docType, name, enabled, izahatCodes:[], direction:'alacak'|'borc'|'any',
     //     minAmount, excludeFatura, template, media:{path,mime,kind,name}|null }
@@ -123,9 +132,17 @@ let config = { ...DEFAULT_CONFIG };
 let state = { lastSeenInd: {} };
 let log = [];
 let pending = [];
+// Gönderilen belge defteri: { [tbl]: { [docType::EVRAKNO]: entry } }. Düzenleme/silme
+// algısı için; yalnız watchEdits||watchDeletes açıkken doldurulur. 7 günle sınırlı.
+let docs = {};
+let lastEditScanAt = 0;
 
 const MAX_VERIFY_ATTEMPTS = 3;
 const MAX_SEND_ATTEMPTS = 8;
+// İzleme penceresi: 7 günden eski belge "düzenlenemez/silinmez" sayılır, defterden düşer.
+const DOC_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+// WhatsApp geri çekme (delete-for-everyone) sınırı ~2 gün; küçük güvenlik payı bırak.
+const RECALL_LIMIT_MS = 2 * 24 * 60 * 60 * 1000 - 10 * 60 * 1000;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
@@ -224,11 +241,13 @@ function configure(d) {
     STATE_PATH = path.join(dataDir, 'watcher-state.json');
     PENDING_PATH = path.join(dataDir, 'watcher-pending.json');
     LOG_PATH = path.join(dataDir, 'watcher-log.json');
+    DOCS_PATH = path.join(dataDir, 'watcher-docs.json');
     MEDIA_DIR = dataDir;
     loadConfig();
     loadState();
     loadPending();
     loadLog();
+    loadDocs();
 }
 
 // ─── Görsel/video (kural başına) ───────────────────────────────────────────────
@@ -332,6 +351,59 @@ function pushLog(entry) {
     try { fs.writeFileSync(LOG_PATH, JSON.stringify(log), 'utf8'); } catch { /* bellekte devam */ }
 }
 
+// ─── Gönderilen belge defteri (düzenleme/silme izleme) ──────────────────────────
+const watchActive = () => config.watchEdits === true || config.watchDeletes === true;
+const docKeyOf = (docType, evrak) => `${docType}::${evrak}`;
+
+function loadDocs() {
+    try { if (fs.existsSync(DOCS_PATH)) { const d = JSON.parse(fs.readFileSync(DOCS_PATH, 'utf8')); if (d && typeof d === 'object') docs = d; } }
+    catch (e) { console.error('[Watcher] belge defteri okunamadı:', e.message); }
+}
+function saveDocs() {
+    try { fs.writeFileSync(DOCS_PATH, JSON.stringify(docs), 'utf8'); }
+    catch (e) { console.error('[Watcher] belge defteri yazılamadı:', e.message); }
+}
+// 7 günden eski kayıtları düşür (defter bounded kalsın).
+function pruneDocs() {
+    const cut = Date.now() - DOC_WINDOW_MS;
+    let changed = false;
+    for (const t of Object.keys(docs)) {
+        const bucket = docs[t];
+        for (const k of Object.keys(bucket)) {
+            if (new Date(bucket[k].sentAt).getTime() < cut) { delete bucket[k]; changed = true; }
+        }
+        if (!Object.keys(bucket).length) delete docs[t];
+    }
+    if (changed) saveDocs();
+}
+
+// Bir belge mesajı başarıyla gidince deftere işle (yeni belge VEYA kuyruktan gönderim).
+// base: pollOnce/enqueue base'i (docType, ruleId, amountNum, direction, evrak, cariInd,
+// name/firma/kod, tarihISO içerir). id: WhatsApp mesaj kimliği (geri çekme için).
+function recordSentDoc(tbl, base, phone, id) {
+    if (!watchActive() || !tbl || !base || !base.evrak || !base.docType) return;
+    docs[tbl] = docs[tbl] || {};
+    const key = docKeyOf(base.docType, base.evrak);
+    const e = docs[tbl][key] || {
+        evrak: base.evrak, cariInd: base.cariInd, docType: base.docType,
+        ruleId: base.ruleId, ruleName: base.ruleName,
+        name: base.name, firma: base.firma, kod: base.kod,
+        amount: Number(base.amountNum) || 0, direction: base.direction || 'any',
+        tarih: base.tarihISO || null, waMsgs: [], sentAt: new Date().toISOString(),
+    };
+    if (id) e.waMsgs.push({ phone, id });
+    docs[tbl][key] = e;
+    saveDocs();
+}
+
+// Defter kaydından log/güvenlik için base üret.
+const ledgerBase = (e) => ({
+    ind: null, cariInd: e.cariInd, name: e.name || String(e.cariInd),
+    firma: e.firma || e.name || String(e.cariInd), kod: e.kod || '',
+    phone: (e.waMsgs[0] && e.waMsgs[0].phone) || null,
+    tutar: fmtAmount(e.amount), evrak: e.evrak, ruleName: e.ruleName,
+});
+
 // Kuyruğa ekle (ind+phone tekilliği). mediaDesc kuralın görselidir (kalıcı yeniden okuma için).
 function enqueue(base, phone, text, reason, mediaDesc) {
     if (pending.some(p => p.ind === base.ind && p.phone === phone)) return;
@@ -339,6 +411,9 @@ function enqueue(base, phone, text, reason, mediaDesc) {
         ind: base.ind, cariInd: base.cariInd, name: base.name, firma: base.firma, kod: base.kod,
         tutar: base.tutar, evrak: base.evrak, bakiye: base.bakiye, bakiyeDurum: base.bakiyeDurum,
         ruleName: base.ruleName, phone, text, media: mediaDesc || null,
+        // Defter alanları: kuyruktan gönderilince recordSentDoc bunlarla işler.
+        docType: base.docType, ruleId: base.ruleId, amountNum: base.amountNum,
+        direction: base.direction, tarihISO: base.tarihISO,
         attempts: 0, noWaCount: 0, queuedAt: new Date().toISOString(), lastError: reason,
     });
     savePending();
@@ -402,6 +477,7 @@ async function processPending() {
         const res = await deps.waSend(item.phone, item.text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
         if (res.success) {
             antiban.recordSent(deps.waStatus().me);
+            recordSentDoc(tableName(), item, item.phone, res.id);
             pending = pending.filter(p => p !== item); savePending(); sentCount++;
             pushLog({ ...pendingBase(item), status: 'sent', message: item.text });
         } else {
@@ -432,6 +508,8 @@ function renderTemplate(tpl, vars) {
         .replace(/\{unvan\}/gi, vars.ad || '')
         .replace(/\{firma\}/gi, vars.firma || vars.ad || '')
         .replace(/\{tutar\}/gi, vars.tutar || '')
+        .replace(/\{eskiTutar\}/gi, vars.eskiTutar || '')
+        .replace(/\{yeniTutar\}/gi, vars.yeniTutar || '')
         .replace(/\{kod\}/gi, vars.kod || '')
         .replace(/\{evrak\}/gi, vars.evrak || '')
         .replace(/\{belge\}/gi, vars.belge || '')
@@ -539,6 +617,134 @@ function matchRule(row, rules) {
     return null;
 }
 
+// ─── Düzenleme / silme taraması (mesaj atılmış belgeler) ────────────────────────
+// Defterdeki belgeleri DB'de yeniden sorgular: tutar değişmiş → "düzenlendi" mesajı;
+// satır yok → silinmiş → WhatsApp mesajını geri çek. editScanSec ile throttle'lı.
+async function scanEditsDeletes(pool, tbl) {
+    const now = Date.now();
+    if (now - lastEditScanAt < Math.max(15, config.editScanSec || 60) * 1000) return;
+    lastEditScanAt = now;
+    pruneDocs();
+    const bucket = docs[tbl];
+    if (!bucket) return;
+    const entries = Object.entries(bucket);
+    if (!entries.length) return;
+
+    // İzlenen EVRAKNO'ların güncel durumunu tek sorguda al.
+    const evraks = [...new Set(entries.map(([, e]) => e.evrak).filter(v => v != null && v !== ''))];
+    const inds = [...new Set(entries.map(([, e]) => parseInt(e.cariInd, 10)).filter(Number.isFinite))];
+    if (!evraks.length || !inds.length) return;
+
+    const req = pool.request();
+    const params = evraks.map((ev, i) => { req.input(`e${i}`, deps.sql.NVarChar, String(ev)); return `@e${i}`; });
+    const cur = new Map();
+    try {
+        const rows = (await req.query(`
+            SELECT EVRAKNO, FIRMANO,
+                   CAST(SUM(BORC) AS DECIMAL(18,2)) AS B,
+                   CAST(SUM(ALACAK) AS DECIMAL(18,2)) AS A,
+                   COUNT(*) AS N
+            FROM [${tbl}]
+            WHERE FIRMANO IN (${inds.join(',')}) AND EVRAKNO IN (${params.join(',')})
+            GROUP BY EVRAKNO, FIRMANO
+        `)).recordset;
+        rows.forEach(r => cur.set(`${r.FIRMANO}::${r.EVRAKNO}`, { B: Number(r.B) || 0, A: Number(r.A) || 0, N: Number(r.N) || 0 }));
+    } catch (e) { console.error('[Watcher] düzenleme/silme sorgusu:', e.message); return; }
+
+    for (const [key, e] of entries) {
+        const c = cur.get(`${e.cariInd}::${e.evrak}`);
+        if (!c || c.N === 0) {
+            if (config.watchDeletes) await handleDeleted(tbl, key, e);
+            else { delete bucket[key]; saveDocs(); }    // izlenmiyorsa defteri temizle
+            continue;
+        }
+        const curAmount = e.direction === 'alacak' ? c.A : e.direction === 'borc' ? c.B : (c.B > 0 ? c.B : c.A);
+        if (Math.abs(curAmount - (Number(e.amount) || 0)) >= 0.01) {
+            if (config.watchEdits) await handleEdited(pool, tbl, key, e, curAmount);
+            else { e.amount = curAmount; saveDocs(); } // izlenmiyorsa sessizce güncelle
+        }
+    }
+}
+
+// Silinen belge: gönderilen WhatsApp mesaj(lar)ını geri çek (2 gün sınırı). WA bağlı
+// değilse needsRecall ile beklet, sonraki turda dene. Tamamlanınca defterden düş.
+async function handleDeleted(tbl, key, e) {
+    const bucket = docs[tbl]; if (!bucket) return;
+    const ageMs = Date.now() - new Date(e.sentAt).getTime();
+    if (ageMs > RECALL_LIMIT_MS) {
+        pushLog({ ...ledgerBase(e), status: 'recallExpired', error: 'Belge silindi ama mesaj 2 günden eski — geri çekilemez' });
+        delete bucket[key]; saveDocs(); return;
+    }
+    if (!deps.waStatus().ready) { e.needsRecall = true; saveDocs(); return; }
+    let allOk = true;
+    for (const m of (e.waMsgs || [])) {
+        const r = await deps.waDelete(m.phone, m.id);
+        if (!r.success) allOk = false;
+        await sleep(rand(800, 1800));
+    }
+    pushLog({ ...ledgerBase(e), status: 'recalled', error: allOk ? 'Belge silindi — WhatsApp mesajı geri çekildi' : 'Belge silindi — bazı mesajlar geri çekilemedi' });
+    delete bucket[key]; saveDocs();
+}
+
+// Tutarı değişen belge: "düzenlendi" mesajı gönder (mevcut guard'lar + anti-ban + kuyruk).
+async function handleEdited(pool, tbl, key, e, curAmount) {
+    const bucket = docs[tbl]; if (!bucket) return;
+    const oldAmount = Number(e.amount) || 0;
+    e.amount = curAmount;       // tekrar tetiklenmesin diye hemen güncelle (mesaj gitmese de)
+    saveDocs();
+
+    const contacts = await deps.resolveCariContacts(config.firmaNo, [e.cariInd]);
+    const c = contacts.get(e.cariInd) || {};
+    const borcMap = await fetchKalanBorc(pool, tbl, [e.cariInd]);
+    const kalanBorc = borcMap.has(e.cariInd) ? borcMap.get(e.cariInd) : (c.bakiye != null ? c.bakiye : null);
+    const bakiyeStr = kalanBorc != null ? fmtAmount(Math.abs(kalanBorc)) : '';
+    const durum = kalanBorc == null ? '' : (kalanBorc > 0 ? 'Borç' : kalanBorc < 0 ? 'Alacak' : '');
+    const base = {
+        ind: null, cariInd: e.cariInd, name: c.name || e.name || String(e.cariInd),
+        firma: c.firma || c.name || e.firma || String(e.cariInd), kod: c.kod || e.kod || '',
+        phone: c.phone || null, tutar: fmtAmount(curAmount), evrak: e.evrak,
+        bakiye: bakiyeStr, bakiyeDurum: durum, ruleName: e.ruleName,
+        docType: e.docType, ruleId: e.ruleId, amountNum: curAmount, direction: e.direction, tarihISO: e.tarih,
+    };
+
+    // Guard'lar (insert yoluyla birebir aynı): pasif / alacaklı / tip / sms / telefon.
+    if (c.pasif) { pushLog({ ...base, status: 'pasif', error: 'Cari pasif — düzenleme mesajı atlandı' }); return; }
+    if (kalanBorc != null && kalanBorc < 0) { pushLog({ ...base, status: 'alacakli', error: 'Cari alacaklı (biz borçluyuz) — düzenleme mesajı atlandı' }); return; }
+    if (!cariTipMatches(config.cariType, c.tip)) { pushLog({ ...base, status: 'wrongType', error: `Cari tipi filtre dışı (${c.tip || 'bilinmiyor'})` }); return; }
+    if (config.onlySmsGonder && !c.smsGonder) { pushLog({ ...base, status: 'noSmsConsent', error: 'SMS Gönder izni yok' }); return; }
+    if (!c.phone || !c.valid) { pushLog({ ...base, status: 'noPhone', error: 'Geçerli telefon yok' }); return; }
+
+    const text = renderTemplate(config.editTemplate || DEFAULT_CONFIG.editTemplate, {
+        ad: c.name, firma: c.firma, kod: c.kod, evrak: e.evrak, belge: e.ruleName,
+        tarih: e.tarih ? new Date(e.tarih).toLocaleDateString('tr-TR') : '',
+        eskiTutar: fmtAmount(oldAmount), yeniTutar: fmtAmount(curAmount),
+        bakiye: bakiyeStr, durum,
+    });
+
+    if (!deps.waStatus().ready) {
+        enqueue(base, c.phone, text, 'WhatsApp bağlı değil — düzenleme mesajı kuyruğa alındı', null);
+        return;
+    }
+    const g = antiban.gate(deps.waStatus().me, null);
+    if (!g.ok) { enqueue(base, c.phone, text, `Gönderim tavanı: ${g.reason} — kuyruğa alındı`, null); return; }
+    if (config.verifyOnWhatsApp) {
+        const chk = await deps.checkOnWhatsApp(c.phone);
+        if (!chk.exists) {
+            if (chk.transient) enqueue(base, c.phone, text, `Doğrulanamadı (${chk.error || 'geçici hata'}) — kuyruğa alındı`, null);
+            else pushLog({ ...base, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' });
+            return;
+        }
+    }
+    const res = await deps.waSend(c.phone, text, null, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
+    if (res.success) {
+        antiban.recordSent(deps.waStatus().me);
+        if (res.id) { e.waMsgs.push({ phone: c.phone, id: res.id }); saveDocs(); }  // sonraki silmede bu da geri çekilir
+        pushLog({ ...base, status: 'edited', message: text, error: `Tutar ${fmtAmount(oldAmount)} → ${fmtAmount(curAmount)} TL` });
+    } else {
+        enqueue(base, c.phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`, null);
+    }
+}
+
 // ─── Çekirdek: tek tarama ──────────────────────────────────────────────────────
 async function pollOnce() {
     if (polling) return;
@@ -556,6 +762,12 @@ async function pollOnce() {
         const tbl = tableName();
         if (!tbl) throw new Error('Firma/dönem seçilmemiş.');
         if (!(await tableExists(pool, tbl))) throw new Error(`Tablo bulunamadı: ${tbl}`);
+
+        // Mesaj atılmış belgelerin düzenleme/silme taraması (throttle'lı; insert'ten bağımsız).
+        if (watchActive()) {
+            try { await scanEditsDeletes(pool, tbl); }
+            catch (e) { console.error('[Watcher] düzenleme/silme tarama hatası:', e.message); }
+        }
 
         const rules = (config.rules || []).filter(r => r.enabled);
 
@@ -628,6 +840,13 @@ async function pollOnce() {
         const borcMap = await fetchKalanBorc(pool, tbl, inds);
 
         for (const { row, rule, amount } of matched) {
+            // INSERT-guard: bu belge zaten bildirilmişse (sil+ekle ile gelen düzenleme)
+            // yeni mesaj ATMA — düzenleme/silme taraması tutar farkını/kaybı yakalar.
+            if (watchActive() && docs[tbl] && docs[tbl][docKeyOf(rule.docType, row.EVRAKNO || '')]) {
+                skipped++;
+                pushLog({ ind: row.IND, cariInd: row.FIRMANO, name: String(row.FIRMANO), evrak: row.EVRAKNO || '', ruleName: rule.name, status: 'info', error: 'Belge zaten bildirildi — düzenleme olarak izleniyor' });
+                continue;
+            }
             const c = contacts.get(row.FIRMANO) || {};
             const kalanBorc = borcMap.has(row.FIRMANO) ? borcMap.get(row.FIRMANO) : (c.bakiye != null ? c.bakiye : null);
             const bakiyeStr = kalanBorc != null ? fmtAmount(Math.abs(kalanBorc)) : '';
@@ -637,6 +856,8 @@ async function pollOnce() {
                 firma: c.firma || c.name || String(row.FIRMANO), kod: c.kod || '', phone: c.phone || null,
                 tutar: fmtAmount(amount), evrak: row.EVRAKNO || '', bakiye: bakiyeStr, bakiyeDurum: durum,
                 ruleName: rule.name,
+                // Defter alanları (düzenleme/silme izleme için).
+                docType: rule.docType, ruleId: rule.id, amountNum: amount, direction: rule.direction, tarihISO: row.TARIH,
             };
 
             if (c.pasif) {
@@ -686,7 +907,7 @@ async function pollOnce() {
                     }
                 }
                 const res = await deps.waSend(phone, text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
-                if (res.success) { antiban.recordSent(deps.waStatus().me); sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
+                if (res.success) { antiban.recordSent(deps.waStatus().me); recordSentDoc(tbl, base, phone, res.id); sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
                 else { enqueue(base, phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`, rule.media); queued++; }
                 await sleep(rand(8000, 20000));
             }
@@ -753,6 +974,9 @@ function getStatus() {
         verifyOnWhatsApp: config.verifyOnWhatsApp, simulateTyping: config.simulateTyping,
         sendAllPhones: config.sendAllPhones === true, onlySmsGonder: config.onlySmsGonder === true,
         cariType: config.cariType || 'hepsi',
+        watchEdits: config.watchEdits === true, watchDeletes: config.watchDeletes === true,
+        editScanSec: config.editScanSec || 60, editTemplate: config.editTemplate || DEFAULT_CONFIG.editTemplate,
+        docsCount: Object.values(docs).reduce((n, b) => n + Object.keys(b).length, 0),
         rules: (config.rules || []).map(r => ({
             id: r.id, docType: r.docType, name: r.name, enabled: r.enabled, izahatCodes: r.izahatCodes,
             direction: r.direction, minAmount: r.minAmount, excludeFatura: r.excludeFatura,

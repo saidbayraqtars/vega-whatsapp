@@ -644,6 +644,9 @@ async function loadWatcherConfig() {
     $('wc_allPhones').checked = s.sendAllPhones === true;
     $('wc_onlySms').checked = s.onlySmsGonder === true;
     $('wc_cariType').value = s.cariType || 'hepsi';
+    $('wc_watchEdits').checked = s.watchEdits === true;
+    $('wc_watchDeletes').checked = s.watchDeletes === true;
+    $('wc_editTemplate').value = s.editTemplate || '';
     renderWatcherRules(s.rules || []);
     renderWatcherState(s);
 }
@@ -821,6 +824,9 @@ function collectWatcherConfig() {
         sendAllPhones: $('wc_allPhones').checked,
         onlySmsGonder: $('wc_onlySms').checked,
         cariType: $('wc_cariType').value || 'hepsi',
+        watchEdits: $('wc_watchEdits').checked,
+        watchDeletes: $('wc_watchDeletes').checked,
+        editTemplate: $('wc_editTemplate').value,
         rules: collectRules(),
     };
 }
@@ -869,7 +875,7 @@ async function refreshWatcherLog() {
         const box = $('wc_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz otomatik gönderim yok.</div>'; return; }
         wcLogEntries = r.log;
-        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', noSmsConsent: 'SMS izni yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta', pasif: 'Cari pasif', wrongType: 'Tip dışı' };
+        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', noSmsConsent: 'SMS izni yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta', pasif: 'Cari pasif', wrongType: 'Tip dışı', alacakli: 'Alacaklı (atlandı)', dropped: 'Düşürüldü', edited: 'Güncellendi', recalled: 'Geri çekildi', recallExpired: 'Geri çekilemedi (2 gün)', info: 'Bilgi' };
         box.innerHTML = r.log.map((e, i) => `
             <div class="logline">
                 <span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
@@ -880,7 +886,7 @@ async function refreshWatcherLog() {
                     <span class="muted" style="font-size:11px">${e.at ? new Date(e.at).toLocaleTimeString('tr-TR') : ''}</span>
                     ${e.message ? `<a href="#" class="wc_msg" data-i="${i}">mesajı gör</a>` : ''}
                 </span>
-                <span class="st ${e.status === 'sent' ? 'sent' : (e.status === 'failed' ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>
+                <span class="st ${['sent', 'edited', 'recalled'].includes(e.status) ? 'sent' : (['failed', 'recallExpired'].includes(e.status) ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>
             </div>`).join('');
         box.querySelectorAll('.wc_msg').forEach(a => a.onclick = (ev) => {
             ev.preventDefault();
@@ -1373,6 +1379,33 @@ $('lic_recheck').onclick = async () => {
     try { const r = await api('/license/recheck', { method: 'POST' }); renderLicense(r.license); }
     catch (e) { $('lic_err').textContent = 'Hata: ' + e.message; }
 };
+
+// ─── Gece / gündüz modu ───
+function applyTheme(t) {
+    const dark = t === 'dark';
+    document.documentElement.classList.toggle('dark', dark);
+    const b = $('themeBtn');
+    if (b) b.textContent = dark ? '☀️ Tema' : '🌙 Tema';
+}
+(function initTheme() {
+    let t = 'light';
+    try { t = localStorage.getItem('vega.theme') || 'light'; } catch { /* yok say */ }
+    applyTheme(t);
+    const b = $('themeBtn');
+    if (b) b.onclick = () => {
+        const next = document.documentElement.classList.contains('dark') ? 'light' : 'dark';
+        try { localStorage.setItem('vega.theme', next); } catch { /* yok say */ }
+        applyTheme(next);
+    };
+})();
+
+// ─── Üst başlık: aktif sekme adını yansıt (mevcut .tab onclick'i EZME — ek dinleyici) ───
+document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => {
+        const el = $('appbarTitle');
+        if (el) el.textContent = t.dataset.title || t.textContent.trim();
+    });
+});
 
 // ─── yardımcı ───
 function esc(s) {
