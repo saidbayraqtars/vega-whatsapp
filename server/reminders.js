@@ -95,17 +95,32 @@ function configure(d) {
 // için güncelleme/yeniden başlatma anında ne tekrar gönderim ne de gönderilemeyenlere
 // yeniden deneme olur; hatırlatma bir SONRAKİ periyotta normal saatinde devam eder.
 const BASELINE_MARKER = '.rm-baseline-v1';
+const LASTRUN_RESET_MARKER = '.rm-lastrun-reset-v2';
 function applyOneTimeBaseline() {
     if (!DATA_DIR) return;
-    const marker = path.join(DATA_DIR, BASELINE_MARKER);
-    if (fs.existsSync(marker)) return; // zaten uygulandı
-    const now = new Date().toISOString();
-    log = [];
-    try { writeJsonAtomic(LOG_PATH, JSON.stringify(log)); } catch { /* yok say */ }
-    for (const rem of config.reminders || []) rem.lastRunAt = now;
-    saveConfig();
-    try { fs.writeFileSync(marker, now, 'utf8'); } catch { /* yok say */ }
-    console.log('[Reminders] tek seferlik baz çizgisi: geçmiş log temizlendi, mevcut döngü kapatıldı (tekrar gönderim yok).');
+    // v1 (tek seferlik): geçmiş gönderim log'unu temizle. ARTIK lastRunAt'a DOKUNMAZ
+    // — eskiden now basıyordu, bu da ilk planlı gönderimi intervalDays boyunca
+    // bloke ediyordu (saatinde kursan bile göndermiyordu). Bkz. v2 düzeltmesi.
+    const m1 = path.join(DATA_DIR, BASELINE_MARKER);
+    if (!fs.existsSync(m1)) {
+        log = [];
+        try { writeJsonAtomic(LOG_PATH, JSON.stringify(log)); } catch { /* yok say */ }
+        try { fs.writeFileSync(m1, new Date().toISOString(), 'utf8'); } catch { /* yok say */ }
+        console.log('[Reminders] v1 baz çizgisi: geçmiş log temizlendi.');
+    }
+    // v2 (tek seferlik onarım): önceki sürümde baz çizgisi lastRunAt=now basmış olan
+    // kurulumlarda planlı gönderim intervalDays boyunca atlanıyordu. lastRunAt'ı bir
+    // kez temizle (null) → hatırlatma bir SONRAKİ saatinde normal çalışsın. Mükerrer
+    // gönderim perCariLastSent ile müşteri-başına engelli; catch-up engeli geçmiş
+    // pencereyi yine atlar → toplu spam OLMAZ.
+    const m2 = path.join(DATA_DIR, LASTRUN_RESET_MARKER);
+    if (!fs.existsSync(m2)) {
+        let changed = false;
+        for (const rem of config.reminders || []) { if (rem.lastRunAt != null) { rem.lastRunAt = null; changed = true; } }
+        if (changed) saveConfig();
+        try { fs.writeFileSync(m2, new Date().toISOString(), 'utf8'); } catch { /* yok say */ }
+        console.log('[Reminders] v2 onarım: lastRunAt temizlendi (planlı gönderim bir sonraki saatinde çalışır).');
+    }
 }
 
 // ─── Elle eklenen telefonlar (UYGULAMA İÇİ — DB'ye YAZILMAZ) ──────────────────
@@ -389,14 +404,15 @@ async function _runReminder(rem) {
         agingMap = await fetchAging(pool, firmaNo, config.donemNo, cands.map(c => ({ ind: c.IND, vadeGun: c.OPSIYON })), rem.vadeGunDefault || 90);
     }
     const media = loadMediaFromDescriptor(rem.media);
-    let sent = 0, skipped = 0, interrupted = false;
+    let sent = 0, skipped = 0, interrupted = false, stopReason = null;
     const nowIso = new Date().toISOString();
 
     for (const c of cands) {
-        if (!deps.waStatus().ready) { interrupted = true; break; }
+        if (!deps.waStatus().ready) { interrupted = true; stopReason = 'WhatsApp bağlı değil'; break; }
         // Anti-ban tavanı (warm-up/saatlik/günlük) doldu → turu kes; lastRunAt
         // ilerlemez, tavan açılınca (sonraki saat/gün) kalan cariler gönderilir.
-        if (!antiban.gate(deps.waStatus().me, null).ok) { interrupted = true; break; }
+        const gate = antiban.gate(deps.waStatus().me, null);
+        if (!gate.ok) { interrupted = true; stopReason = gate.reason; break; }
         const contact = withManualPhone(firmaNo, c.IND, contacts.get(c.IND) || {});
         const bakiye = c.BAKIYE != null ? Number(c.BAKIYE) : (contact.bakiye != null ? contact.bakiye : null);
         const durum = bakiye == null ? '' : (bakiye > 0 ? 'Borç' : bakiye < 0 ? 'Alacak' : '');
@@ -436,7 +452,7 @@ async function _runReminder(rem) {
                     // boş yanıt vb.) TÜM turu KESME: kesersek lastRunAt ilerlemez, scheduler
                     // 60sn'de baştan tarar = sonsuz döngü + numarasız carileri tekrar tekrar loglar.
                     // O cariyi bu turda atla, çalıştırma normal bitsin, lastRunAt ilerlesin.
-                    if (!deps.waStatus().ready) { interrupted = true; break; }
+                    if (!deps.waStatus().ready) { interrupted = true; stopReason = 'WhatsApp bağlantısı koptu'; break; }
                     skipped++; continue;
                 }
                 skipped++; pushLog({ reminder: rem.name, name: contact.name, phone: contact.phone, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' }); continue;
@@ -456,8 +472,8 @@ async function _runReminder(rem) {
         if (res.success && sent % 20 === 0) await sleep(rand(60000, 150000));
         else await sleep(rand(12000, 30000));
     }
-    const note = `${sent} gönderildi${skipped ? `, ${skipped} atlandı` : ''}${interrupted ? ' (yarıda kesildi, sürecek)' : ''}`;
-    lastResult = { id: rem.id, sent, skipped, total: cands.length, interrupted, note, at: new Date().toISOString() };
+    const note = `${sent} gönderildi${skipped ? `, ${skipped} atlandı` : ''}${interrupted ? ` (durdu${stopReason ? ': ' + stopReason : ''}, sürecek)` : ''}`;
+    lastResult = { id: rem.id, sent, skipped, total: cands.length, interrupted, stopReason, note, at: new Date().toISOString() };
     return { sent, skipped, total: cands.length, interrupted };
 }
 
@@ -586,26 +602,33 @@ async function sendOne(id, ind) {
 }
 
 // ─── Zamanlayıcı ────────────────────────────────────────────────────────────────
-function isDue(rem, now = new Date()) {
-    if (!rem.enabled) return false;
-    if (rem.startDate) { const sd = new Date(rem.startDate); if (!isNaN(sd) && now < sd) return false; }
+// isDue false ise SEBEBİ döner (UI'da "neden göndermedi" görünsün); due ise null.
+function dueReason(rem, now = new Date()) {
+    if (!rem.enabled) return 'kapalı';
+    if (rem.startDate) { const sd = new Date(rem.startDate); if (!isNaN(sd) && now < sd) return `başlangıç ${sd.toLocaleDateString('tr-TR')} sonrası`; }
     let target = null;
     if (rem.sendTime) {
         const [h, m] = String(rem.sendTime).split(':').map(Number);
         target = new Date(now); target.setHours(h || 0, m || 0, 0, 0);
-        if (now < target) return false; // bugünün saati henüz gelmedi
+        if (now < target) return `saati gelmedi (${rem.sendTime})`; // bugünün saati henüz gelmedi
     }
     // Catch-up engeli: planlanan saat zamanlayıcı başlamadan ÖNCE geçtiyse (uygulama
     // o saatten SONRA açıldı/güncellendi) bu döngüyü ATLA. 7/24 tray uygulaması saatinde
     // zaten çalışır → normal gönderir; sadece "kaçırılmış geçmiş pencere" atlanır, böylece
     // güncelleme/yeniden başlatma anında geçmiş tarihli toplu tekrar gönderim olmaz.
-    if (target && schedulerStartedAt && schedulerStartedAt > target.getTime()) return false;
+    if (target && schedulerStartedAt && schedulerStartedAt > target.getTime()) {
+        return 'kaçırılan pencere atlandı (uygulama saatten sonra açıldı; bir sonraki gün gönderir)';
+    }
     if (rem.lastRunAt) {
         const diff = now.getTime() - new Date(rem.lastRunAt).getTime();
-        if (diff < (rem.intervalDays || 7) * DAY_MS) return false;
+        if (diff < (rem.intervalDays || 7) * DAY_MS) {
+            const next = new Date(new Date(rem.lastRunAt).getTime() + (rem.intervalDays || 7) * DAY_MS);
+            return `bu periyotta çalıştı (sonraki ~${next.toLocaleDateString('tr-TR')})`;
+        }
     }
-    return true;
+    return null;
 }
+function isDue(rem, now = new Date()) { return dueReason(rem, now) === null; }
 
 async function tick() {
     if (ticking) return;
@@ -613,13 +636,19 @@ async function tick() {
     lastTickAt = new Date().toISOString();
     lastError = null;
     try {
+        let ranAny = false;
+        const skips = [];
         for (const rem of config.reminders || []) {
-            if (!isDue(rem)) continue;
+            const reason = dueReason(rem);
+            if (reason !== null) { if (rem.enabled) skips.push(`${rem.name}: ${reason}`); continue; }
             const res = await runReminder(rem);
+            ranAny = true;
             // WA/DB yok (aborted) ya da yarıda kesildi (interrupted) → lastRunAt ilerletme, sonraki tick'te tekrar.
             // Atlanan cari olması (skipped>0) çalıştırmayı geçersiz kılmaz; lastRunAt ilerler.
             if (res && !res.aborted && !res.interrupted) { rem.lastRunAt = new Date().toISOString(); saveConfig(); }
         }
+        // Hiçbiri çalışmadıysa NEDEN'i UI'da göster ("Son: ..." satırı) — kör kalmasın.
+        if (!ranAny && skips.length) lastResult = { note: skips.join('  •  '), at: new Date().toISOString() };
     } catch (e) { lastError = e.message; console.error('[Reminders] tick hata:', e.message); }
     finally { ticking = false; }
 }
