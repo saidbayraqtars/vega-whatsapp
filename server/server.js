@@ -925,6 +925,14 @@ app.post('/api/reminders/:id/media/clear', (req, res) => {
     res.json({ success: true, status: reminders.clearReminderMedia(req.params.id) });
 });
 
+// ─── Gönderim saati penceresi (gece gönderme koruması — paylaşılan) ───────────
+app.get('/api/send-window', (req, res) => {
+    res.json({ success: true, window: antiban.getSendWindow() });
+});
+app.post('/api/send-window', (req, res) => {
+    res.json({ success: true, window: antiban.setSendWindow(req.body || {}) });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  AKTİF CARİ → "BAKİYEYİ GÖNDER" (Arctos yüzen butonu)
 //  Arctos'ta o an açık cari plan cache'ten tespit edilir (activeCari.js).

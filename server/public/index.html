@@ -308,6 +308,17 @@
         <div class="hint">Firma/dönem burada değişir; uygulama en başa dönmez, seçim hatırlanır.</div>
 
         <div style="border-top:1px solid var(--border); margin:16px 0 12px"></div>
+        <div class="muted" style="font-weight:600; margin-bottom:8px">Gönderim Saatleri (gece gönderme)</div>
+        <label class="check"><input type="checkbox" id="sw_enabled" checked /> Otomatik gönderimi yalnız belirli saatler arasında yap</label>
+        <div class="row" style="margin-top:8px">
+            <div class="field"><label>Başlangıç</label><input id="sw_start" type="time" value="10:00" /></div>
+            <div class="field"><label>Bitiş</label><input id="sw_end" type="time" value="20:00" /></div>
+            <div class="field" style="display:flex; align-items:flex-end"><button class="btn green" id="sw_save" style="width:100%">Saatleri Kaydet</button></div>
+        </div>
+        <div class="hint">Bu saatler dışında (varsayılan akşam 20:00 → sabah 10:00) hatırlatma/belge mesajı gönderilmez; sırada bekler, saat gelince devam eder. Toplu ve "Şimdi gönder" bu kuraldan etkilenmez.</div>
+        <div class="hint" id="sw_result" style="display:none"></div>
+
+        <div style="border-top:1px solid var(--border); margin:16px 0 12px"></div>
         <div class="muted" style="font-weight:600; margin-bottom:8px">SQL Bağlantısı</div>
         <div class="row">
             <div class="field"><label>Sunucu</label><input id="set_server" /></div>

@@ -445,6 +445,8 @@ async function processPending() {
 
     for (const item of [...pending]) {
         if (!deps.waStatus().ready) break;
+        // Gece penceresi: gönderim saati dışında kuyrukta beklesin (gece mesaj atma).
+        if (antiban.inQuietHours()) break;
         // Anti-ban tavanı doldu → kuyrukta kalsın, sonraki turda (saat/gün dönünce) dene.
         if (!antiban.gate(deps.waStatus().me, null).ok) break;
         // Pasif/silinmiş cariyi kuyruktan at (doğrulama yapılabildiyse).
@@ -721,6 +723,7 @@ async function handleEdited(pool, tbl, key, e, curAmount) {
         bakiye: bakiyeStr, durum,
     });
 
+    if (antiban.inQuietHours()) { enqueue(base, c.phone, text, antiban.quietReason(), null); return; }
     if (!deps.waStatus().ready) {
         enqueue(base, c.phone, text, 'WhatsApp bağlı değil — düzenleme mesajı kuyruğa alındı', null);
         return;
@@ -889,6 +892,8 @@ async function pollOnce() {
 
             const targets = (config.sendAllPhones && Array.isArray(c.phones) && c.phones.length) ? c.phones : [c.phone];
             for (const phone of targets) {
+                // Gece penceresi: saat dışındaysa kuyruğa al, pencere açılınca gönderilir.
+                if (antiban.inQuietHours()) { enqueue(base, phone, text, antiban.quietReason(), rule.media); queued++; continue; }
                 if (!deps.waStatus().ready) {
                     enqueue(base, phone, text, 'WhatsApp bağlı değil — kuyruğa alındı, bağlanınca gönderilecek', rule.media); queued++; continue;
                 }

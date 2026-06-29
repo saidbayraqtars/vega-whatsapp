@@ -56,7 +56,7 @@ function writeJsonAtomic(file, data) {
 }
 
 function defaultReminders() {
-    const common = { intervalDays: 7, sendTime: '10:00', startDate: null, minAmount: 0, onlySmsGonder: false, verifyOnWhatsApp: true, vadeGunDefault: 90, media: null, lastRunAt: null, perCariLastSent: {} };
+    const common = { intervalDays: 7, sendTime: '10:00', startDate: null, minAmount: 0, onlySmsGonder: false, verifyOnWhatsApp: true, vadeGunDefault: 90, media: null, lastRunAt: null, perCariLastSent: {}, perCariTried: {} };
     return [
         { id: 'anyBalance', type: 'anyBalance', name: 'Bakiye hatırlatma (kalan borç)', enabled: false,
             template: 'Sayın {firma}, güncel borç bakiyeniz {bakiye} TL. Ödemenizi rica ederiz.', ...common },
@@ -174,6 +174,9 @@ function normalizeReminder(r, prev) {
         // çalışma durumu korunur (UI göndermezse eski değer)
         lastRunAt: (r.lastRunAt !== undefined) ? r.lastRunAt : (prev ? prev.lastRunAt : null),
         perCariLastSent: (r.perCariLastSent !== undefined) ? r.perCariLastSent : (prev ? prev.perCariLastSent : {}) || {},
+        // Başarısız/atlanan cariler (telefon yok / WA yok / hata) — OTOMATİK tekrar
+        // denenmez; yalnız elle "Yeniden dene" (sendOne) ile temizlenir/gönderilir.
+        perCariTried: (r.perCariTried !== undefined) ? r.perCariTried : (prev ? prev.perCariTried : {}) || {},
     };
 }
 
@@ -371,18 +374,21 @@ async function debtorCandidates(pool, firmaNo, donem, minAmount) {
 }
 
 // ─── Tek hatırlatma çalıştır ───────────────────────────────────────────────────
-async function runReminder(rem) {
+async function runReminder(rem, opts = {}) {
     // Eşzamanlı çalışma kilidi: aynı hatırlatma zaten çalışıyorsa (scheduler vs elle) atla.
     if (runningReminderIds.has(rem.id)) return { aborted: true, reason: 'Bu hatırlatma zaten çalışıyor' };
     runningReminderIds.add(rem.id);
     try {
-        return await _runReminder(rem);
+        return await _runReminder(rem, opts);
     } finally {
         runningReminderIds.delete(rem.id);
     }
 }
 
-async function _runReminder(rem) {
+// opts.manual = kullanıcı tetikledi (Şimdi gönder) → gece penceresi VE perCariTried
+// (otomatik-deneme engeli) baypas edilir.
+async function _runReminder(rem, opts = {}) {
+    const manual = opts.manual === true;
     const pool = deps.getPool();
     // aborted = çalıştırma hiç yapılamadı (DB/WA/firma yok) → lastRunAt İLERLEMEZ, sonraki tick'te tekrar.
     // skipped (aşağıda) = çalıştı ama N cari atlandı (telefonsuz/pasif/dedup) → lastRunAt İLERLER.
@@ -406,35 +412,51 @@ async function _runReminder(rem) {
     const media = loadMediaFromDescriptor(rem.media);
     let sent = 0, skipped = 0, interrupted = false, stopReason = null;
     const nowIso = new Date().toISOString();
+    rem.perCariLastSent = rem.perCariLastSent || {};
+    rem.perCariTried = rem.perCariTried || {};
 
     for (const c of cands) {
         if (!deps.waStatus().ready) { interrupted = true; stopReason = 'WhatsApp bağlı değil'; break; }
-        // Anti-ban tavanı (warm-up/saatlik/günlük) doldu → turu kes; lastRunAt
-        // ilerlemez, tavan açılınca (sonraki saat/gün) kalan cariler gönderilir.
+        // Gece penceresi (otomatik): gönderim saati dışındaysa dur — sırada beklesin.
+        // Manuel "Şimdi gönder" baypas eder. lastRunAt ilerlemez → pencere açılınca sürer.
+        if (!manual && antiban.inQuietHours()) { interrupted = true; stopReason = antiban.quietReason(); break; }
+        // Anti-ban tavanı (warm-up/saatlik/günlük) doldu → turu kes; lastRunAt ilerlemez.
         const gate = antiban.gate(deps.waStatus().me, null);
         if (!gate.ok) { interrupted = true; stopReason = gate.reason; break; }
+
         const contact = withManualPhone(firmaNo, c.IND, contacts.get(c.IND) || {});
         const bakiye = c.BAKIYE != null ? Number(c.BAKIYE) : (contact.bakiye != null ? contact.bakiye : null);
         const durum = bakiye == null ? '' : (bakiye > 0 ? 'Borç' : bakiye < 0 ? 'Alacak' : '');
+        const bakStr = bakiye != null ? fmtAmount(Math.abs(bakiye)) : '';
         const ag = agingMap.get(c.IND);
+        // Bakiye HER log kaydında görünsün (borçlu olduğu, ne kadar olduğu bilinsin).
+        const logBase = { reminder: rem.name, id: rem.id, ind: c.IND, name: contact.name, firma: contact.firma, phone: contact.phone || '', bakiye: bakStr, bakiyeDurum: durum };
 
         // Gecikme kategorisinde (overdueBuyer, askıda) vadesi geçmemişleri atla.
         if (rem.type === 'overdueBuyer' && (!ag || ag.gecikmeGun <= 0)) continue;
 
-        // Pasif cari (TBLCARI.STATUS=2) → hiç gönderme. Log'a yazılır ki "atlandı" görünür
-        // olsun (görünmüyorsa o carinin STATUS'u 2 değildir → gerçek pasiflik kaynağı farklı).
-        if (contact.pasif) { skipped++; pushLog({ reminder: rem.name, id: rem.id, ind: c.IND, name: contact.name, firma: contact.firma, status: 'pasif', error: 'Cari pasif (STATUS=2) — gönderilmez' }); continue; }
-
-        // intervalDays içinde aynı cariye tekrar gönderme (dedup).
+        // intervalDays içinde başarıyla gönderilmişe tekrar gönderme (dedup) — log yok.
         const last = rem.perCariLastSent[c.IND];
         if (last && (Date.now() - new Date(last).getTime()) < (rem.intervalDays || 7) * DAY_MS) { skipped++; continue; }
 
-        if (rem.onlySmsGonder && !contact.smsGonder) { skipped++; continue; }
-        if (!contact.phone || !contact.valid) { skipped++; pushLog({ reminder: rem.name, id: rem.id, ind: c.IND, name: contact.name, firma: contact.firma, status: 'noPhone', error: 'Geçerli telefon yok' }); continue; }
+        // Daha önce denenip başarısız/atlanmış (telefon yok / WA yok / hata) → OTOMATİK
+        // tekrar DENEME, tekrar LOGLAMA (flood'u da keser). Yalnız elle "Yeniden dene"
+        // (sendOne) temizler. Manuel "Şimdi gönder" baypas eder (hepsini yeniden dener).
+        if (!manual && rem.perCariTried[c.IND]) { skipped++; continue; }
 
-        const bakStr = bakiye != null ? fmtAmount(Math.abs(bakiye)) : '';
+        // Pasif cari (STATUS=2) → gönderme; bir kez logla, tekrar deneme.
+        if (contact.pasif) { skipped++; rem.perCariTried[c.IND] = { status: 'pasif', at: nowIso }; saveConfig(); pushLog({ ...logBase, status: 'pasif', error: 'Cari pasif (STATUS=2) — gönderilmez' }); continue; }
+
+        // onlySms FİLTRE'dir (yapılandırma değişebilir) → "tried" işaretleme, sessizce atla.
+        if (rem.onlySmsGonder && !contact.smsGonder) { skipped++; continue; }
+
+        if (!contact.phone || !contact.valid) {
+            skipped++; rem.perCariTried[c.IND] = { status: 'noPhone', at: nowIso }; saveConfig();
+            pushLog({ ...logBase, status: 'noPhone', error: 'Geçerli telefon yok' });
+            continue;
+        }
+
         const vadeStr = ag && ag.enEskiVade ? new Date(ag.enEskiVade).toLocaleDateString('tr-TR') : '';
-        // {vadeNot}: vade biliniyorsa hazır cümle, yoksa boş (mesajdan tamamen düşer).
         const vadeNot = vadeStr ? `Son ödeme tarihi ${vadeStr}. ` : '';
         const text = renderTemplate(rem.template, {
             ad: contact.name, firma: contact.firma || contact.name, kod: contact.kod,
@@ -447,28 +469,29 @@ async function _runReminder(rem) {
             const chk = await deps.checkOnWhatsApp(contact.phone);
             if (!chk.exists) {
                 if (chk.transient) {
-                    // WA GERÇEKTEN koptuysa turu kes (lastRunAt ilerlemez → sonra baştan dener).
-                    // Ama WA bağlıyken tek numaranın doğrulaması geçici hata verdiyse (onWhatsApp
-                    // boş yanıt vb.) TÜM turu KESME: kesersek lastRunAt ilerlemez, scheduler
-                    // 60sn'de baştan tarar = sonsuz döngü + numarasız carileri tekrar tekrar loglar.
-                    // O cariyi bu turda atla, çalıştırma normal bitsin, lastRunAt ilerlesin.
+                    // WA GERÇEKTEN koptuysa turu kes; tek numara geçici hatası ise o cariyi
+                    // atla (tried İŞARETLEME → bağlantı düzelince yine denenir).
                     if (!deps.waStatus().ready) { interrupted = true; stopReason = 'WhatsApp bağlantısı koptu'; break; }
                     skipped++; continue;
                 }
-                skipped++; pushLog({ reminder: rem.name, name: contact.name, phone: contact.phone, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' }); continue;
+                skipped++; rem.perCariTried[c.IND] = { status: 'notOnWhatsApp', at: nowIso }; saveConfig();
+                pushLog({ ...logBase, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' });
+                continue;
             }
         }
         const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
         if (res.success) {
             antiban.recordSent(deps.waStatus().me);
-            sent++; rem.perCariLastSent[c.IND] = nowIso;
-            pushLog({ reminder: rem.name, id: rem.id, ind: c.IND, name: contact.name, firma: contact.firma, phone: contact.phone, bakiye: bakStr, bakiyeDurum: durum, gecikmeGun: ag ? ag.gecikmeGun : undefined, status: 'sent', message: text });
+            sent++; rem.perCariLastSent[c.IND] = nowIso; delete rem.perCariTried[c.IND];
+            pushLog({ ...logBase, gecikmeGun: ag ? ag.gecikmeGun : undefined, status: 'sent', message: text });
         } else {
-            pushLog({ reminder: rem.name, name: contact.name, phone: contact.phone, status: 'failed', error: res.error });
+            // Gönderim hatası → OTOMATİK tekrar DENEME; elle "Yeniden dene" gerekir.
+            rem.perCariTried[c.IND] = { status: 'failed', at: nowIso, error: res.error };
+            pushLog({ ...logBase, status: 'failed', error: res.error });
         }
-        saveConfig(); // perCariLastSent kalıcı
-        // Anti-ban: tahsilat mesajı yüksek riskli → insansı, yavaş tempo (toplu gönderimden
-        // daha temkinli). Her mesaj arası 12-30 sn; her 20 başarılı gönderimde 1-2.5 dk mola.
+        saveConfig(); // perCariLastSent / perCariTried kalıcı
+        // Anti-ban: tahsilat mesajı yüksek riskli → insansı, yavaş tempo. Her mesaj arası
+        // 12-30 sn; her 20 başarılı gönderimde 1-2.5 dk mola.
         if (res.success && sent % 20 === 0) await sleep(rand(60000, 150000));
         else await sleep(rand(12000, 30000));
     }
@@ -513,6 +536,7 @@ async function previewReminder(rem) {
         else {
             const last = rem.perCariLastSent[c.IND];
             if (last && (Date.now() - new Date(last).getTime()) < (rem.intervalDays || 7) * DAY_MS) skip = 'Sıklık içinde zaten gönderildi';
+            else if (rem.perCariTried && rem.perCariTried[c.IND]) skip = 'Daha önce denendi — elle "Yeniden dene"';
             else if (rem.onlySmsGonder && !contact.smsGonder) skip = 'Sadece SMS izinli seçili — izin yok';
             else if (!contact.phone || !contact.valid) skip = 'Geçerli telefon yok';
         }
@@ -593,11 +617,14 @@ async function sendOne(id, ind) {
     const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
     if (res.success) {
         antiban.recordSent(deps.waStatus().me);
-        rem.perCariLastSent[indNum] = new Date().toISOString(); saveConfig();
+        rem.perCariLastSent = rem.perCariLastSent || {}; rem.perCariTried = rem.perCariTried || {};
+        rem.perCariLastSent[indNum] = new Date().toISOString();
+        delete rem.perCariTried[indNum];   // elle gönderildi → "denendi" engeli kalksın
+        saveConfig();
         pushLog({ reminder: rem.name, id: rem.id, ind: indNum, name: contact.name, firma: contact.firma, phone: contact.phone, bakiye: bakStr, bakiyeDurum: durum, status: 'sent', message: text, manual: !!contact.phoneManual });
         return { success: true, message: 'Gönderildi', phone: contact.phone };
     }
-    pushLog({ reminder: rem.name, name: contact.name, phone: contact.phone, status: 'failed', error: res.error });
+    pushLog({ reminder: rem.name, id: rem.id, ind: indNum, name: contact.name, firma: contact.firma, phone: contact.phone, bakiye: bakStr, bakiyeDurum: durum, status: 'failed', error: res.error });
     return { success: false, message: res.error || 'Gönderilemedi' };
 }
 
@@ -670,7 +697,7 @@ function autoStart() { start(); } // zamanlayıcı hep çalışır; her hatırla
 async function runNow(id) {
     const rem = (config.reminders || []).find(r => r.id === id);
     if (!rem) return { success: false, message: 'Hatırlatma bulunamadı.' };
-    const res = await runReminder(rem);
+    const res = await runReminder(rem, { manual: true });
     if (res && !res.aborted && !res.interrupted) { rem.lastRunAt = new Date().toISOString(); saveConfig(); }
     return { success: !res.aborted, message: res.aborted ? res.reason : (res.note || `${res.sent} gönderildi`), result: res };
 }

@@ -345,9 +345,30 @@ async function openSettings() {
             $('set_user').value = r.db.username || '';
         }
     } catch { /* yok say */ }
+    try {
+        const sw = await api('/send-window');
+        if (sw.success && sw.window) {
+            $('sw_enabled').checked = sw.window.enabled !== false;
+            $('sw_start').value = sw.window.start || '10:00';
+            $('sw_end').value = sw.window.end || '20:00';
+        }
+    } catch { /* yok say */ }
     await loadSettingsFirmalar();
     $('settingsModal').classList.remove('hidden');
 }
+
+$('sw_save').onclick = async () => {
+    const box = $('sw_result');
+    box.style.display = ''; box.className = 'hint'; box.textContent = 'Kaydediliyor...';
+    try {
+        const r = await api('/send-window', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: $('sw_enabled').checked, start: $('sw_start').value, end: $('sw_end').value }),
+        });
+        if (r.success) { box.className = 'hint ok'; box.textContent = `✓ Kaydedildi (${r.window.start}–${r.window.end}${r.window.enabled ? '' : ', kapalı'})`; }
+        else { box.className = 'err'; box.textContent = 'Kaydedilemedi.'; }
+    } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
+};
 
 async function loadSettingsFirmalar() {
     const fr = await api('/firmalar');
@@ -1272,14 +1293,18 @@ async function refreshRemindersLog() {
                     <span class="muted" style="font-size:11px">${e.at ? new Date(e.at).toLocaleTimeString('tr-TR') : ''}</span>
                 </span>`;
             const badge = `<span class="st ${e.status === 'sent' ? 'sent' : (e.status === 'failed' ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>`;
-            // Telefonu olmayan kayıt → elle numara ekle + yeniden dene (Önizle ile aynı akış).
-            if (e.status === 'noPhone' && e.ind != null) {
+            // Gönderilemeyen/atlanan kayıt → OTOMATİK denenmez; elle "Yeniden dene".
+            // noPhone ayrıca "No. ekle" (manuel numara) sunar.
+            const retryable = ['noPhone', 'failed', 'notOnWhatsApp', 'pasif'];
+            if (retryable.includes(e.status) && e.ind != null) {
                 const ind = esc(String(e.ind));
                 const rid = e.id != null ? esc(String(e.id)) : '';
                 const done = rmResentKeys.has(rid + ':' + ind);
+                const noPhoneBtn = e.status === 'noPhone' ? `<button class="btn ghost xs" data-act="edit" data-ind="${ind}" title="Elle telefon ekle">✎ No. ekle</button>` : '';
+                const retryBtn = rid ? `<button class="btn ghost xs" data-act="send" data-id="${rid}" data-ind="${ind}" title="Şimdi yeniden gönder">Yeniden dene</button>` : '';
                 const actions = done
                     ? `<span class="st sent">✓ yeniden gönderildi</span>`
-                    : `<button class="btn ghost xs" data-act="edit" data-ind="${ind}" title="Elle telefon ekle">✎ No. ekle</button>${rid ? ` <button class="btn ghost xs" data-act="send" data-id="${rid}" data-ind="${ind}" title="Numara ekledikten sonra yeniden gönder">Yeniden dene</button>` : ''}`;
+                    : `${noPhoneBtn}${retryBtn}`;
                 return `
             <div class="logline" data-ind="${ind}" style="display:block">
                 <div style="display:flex; justify-content:space-between; gap:10px; align-items:baseline; flex-wrap:wrap">${meta}${badge}</div>

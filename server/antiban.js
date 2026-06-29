@@ -113,6 +113,44 @@ function recordSent(accountId) {
     save();
 }
 
+// ─── Gönderim saati penceresi (gece gönderme koruması) ───────────────────────
+// Otomatik gönderimler (hatırlatma + belge watcher) yalnız [start,end] arasında
+// yapılır; dışında sırada bekler. Manuel gönderim (toplu/Şimdi gönder/float) bu
+// pencereye TABİ DEĞİL — kullanıcı bizzat tetikler. Varsayılan 10:00–20:00
+// (akşam 20:00 → sabah 10:00 arası gönderilmez). data/antiban.json'da tutulur.
+const DEFAULT_SEND_WINDOW = { enabled: true, start: '10:00', end: '20:00' };
+const validTime = (t) => (/^\d{1,2}:\d{2}$/.test(String(t || '')) ? t : null);
+const toMin = (t) => { const [h, m] = String(t).split(':').map(Number); return (h || 0) * 60 + (m || 0); };
+
+function getSendWindow() {
+    const w = state.sendWindow || {};
+    return { enabled: w.enabled !== false, start: validTime(w.start) || DEFAULT_SEND_WINDOW.start, end: validTime(w.end) || DEFAULT_SEND_WINDOW.end };
+}
+function setSendWindow(patch = {}) {
+    const cur = getSendWindow();
+    state.sendWindow = {
+        enabled: patch.enabled !== undefined ? patch.enabled !== false : cur.enabled,
+        start: validTime(patch.start) || cur.start,
+        end: validTime(patch.end) || cur.end,
+    };
+    save();
+    return getSendWindow();
+}
+// Şu an gönderim YASAK pencerede mi? (gece). Pencere gece yarısını aşabilir (örn 22:00–06:00).
+function inQuietHours(now = new Date()) {
+    const w = getSendWindow();
+    if (!w.enabled) return false;
+    const t = now.getHours() * 60 + now.getMinutes();
+    const s = toMin(w.start), e = toMin(w.end);
+    if (s === e) return false; // 24 saat açık
+    const allowed = s < e ? (t >= s && t < e) : (t >= s || t < e);
+    return !allowed;
+}
+function quietReason() {
+    const w = getSendWindow();
+    return `Gönderim saati dışı (${w.start}–${w.end} arası gönderilir) — sırada bekliyor`;
+}
+
 // ─── Metin varyasyonu (spintax) ──────────────────────────────────────────────
 // Herkese BİREBİR aynı metin = spam imzası. Kullanıcı şablona "{a|b|c}" yazarak
 // varyant tanımlar; her gönderimde rastgele biri seçilir. Örn:
@@ -141,4 +179,4 @@ function snapshot(accountId, userDailyCap) {
     };
 }
 
-module.exports = { configure, gate, recordSent, snapshot, applySpintax, WARMUP_RAMP, HOURLY_CAP };
+module.exports = { configure, gate, recordSent, snapshot, applySpintax, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };
