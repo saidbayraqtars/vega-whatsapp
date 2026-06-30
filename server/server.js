@@ -1295,6 +1295,31 @@ app.post('/api/extre/send', async (req, res) => {
     }
 });
 
+// ── GEÇİCİ TEŞHİS: cari hareket IZAHAT kod dağılımı + son satırlar. "Havale girişi
+// mesaj gitmiyor" arızası için: havale satırının işlem kodunu tespit etmek. Tarayıcıda:
+//   http://localhost:3100/api/extre/_izahat?firmaNo=0101&donemNo=0014
+app.get('/api/extre/_izahat', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    const { firmaNo, donemNo } = req.query;
+    if (!/^\d+$/.test(String(firmaNo)) || !/^\d+$/.test(String(donemNo)))
+        return res.status(400).json({ success: false, message: 'firmaNo/donemNo gerekli (rakam).' });
+    const tbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
+    if (!(await validateTableName(tbl))) return res.status(404).json({ success: false, message: 'Cari hareket tablosu yok.' });
+    try {
+        const dist = (await pool.request().query(`
+            SELECT IZAHAT, COUNT(*) AS c,
+                   SUM(CASE WHEN ISNULL(BORC,0)>0 THEN 1 ELSE 0 END) AS borc,
+                   SUM(CASE WHEN ISNULL(ALACAK,0)>0 THEN 1 ELSE 0 END) AS alacak
+            FROM [${tbl}] GROUP BY IZAHAT ORDER BY IZAHAT`)).recordset;
+        const recent = (await pool.request().query(`
+            SELECT TOP 30 IND, TARIH, IZAHAT, EVRAKNO,
+                   CAST(ISNULL(BORC,0) AS DECIMAL(18,2)) AS BORC,
+                   CAST(ISNULL(ALACAK,0) AS DECIMAL(18,2)) AS ALACAK
+            FROM [${tbl}] ORDER BY IND DESC`)).recordset;
+        res.json({ success: true, table: tbl, dist, recent });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  LİSANS (çevrimiçi lisans altyapısı — scaffold, şu an kısıtlamaz)
 // ═══════════════════════════════════════════════════════════════════════════

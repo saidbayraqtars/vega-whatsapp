@@ -590,15 +590,32 @@ async function sha256hex(s) {
     const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
     return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
-async function ensureExtreUnlocked() {
-    if (extreUnlocked()) return true;
-    const pw = prompt('Hesap Extresi (beta) erişim şifresi:');
-    if (pw == null) return false; // iptal
-    try {
-        if ((await sha256hex(pw)) === EXTRE_PW_HASH) { try { localStorage.setItem('vega.extreUnlock', '1'); } catch { /* yok say */ } return true; }
-    } catch { /* crypto.subtle yoksa */ }
-    alert('Şifre hatalı.');
-    return false;
+// NOT: Electron window.prompt() DESTEKLEMEZ (null döner) → özel modal kullanılır.
+function ensureExtreUnlocked() {
+    if (extreUnlocked()) return Promise.resolve(true);
+    return new Promise((resolve) => {
+        const modal = $('extreLockModal'), inp = $('exLockPw'), err = $('exLockErr');
+        const okB = $('exLockOk'), cancelB = $('exLockCancel');
+        err.textContent = ''; inp.value = '';
+        modal.classList.remove('hidden');
+        setTimeout(() => inp.focus(), 50);
+        const cleanup = () => {
+            okB.removeEventListener('click', onOk);
+            cancelB.removeEventListener('click', onCancel);
+            inp.removeEventListener('keydown', onKey);
+        };
+        const finish = (v) => { modal.classList.add('hidden'); cleanup(); resolve(v); };
+        const onOk = async () => {
+            try { if ((await sha256hex(inp.value)) === EXTRE_PW_HASH) { try { localStorage.setItem('vega.extreUnlock', '1'); } catch { /* yok say */ } return finish(true); } }
+            catch { /* crypto.subtle yoksa */ }
+            err.textContent = 'Şifre hatalı.'; inp.select();
+        };
+        const onCancel = () => finish(false);
+        const onKey = (e) => { if (e.key === 'Enter') onOk(); else if (e.key === 'Escape') onCancel(); };
+        okB.addEventListener('click', onOk);
+        cancelB.addEventListener('click', onCancel);
+        inp.addEventListener('keydown', onKey);
+    });
 }
 
 document.querySelectorAll('.tab').forEach(t => {
