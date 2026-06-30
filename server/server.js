@@ -1205,48 +1205,45 @@ app.get('/api/extre/_diag', async (req, res) => {
         return res.status(400).json({ success: false, message: 'firmaNo/donemNo gerekli (sadece rakam).' });
     try {
         const prefix = `F${firmaNo}D${donemNo}TBL`;
-        const tables = (await pool.request().input('p', sql.NVarChar, prefix + '%')
-            .query(`SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME LIKE @p ORDER BY TABLE_NAME`))
-            .recordset.map(r => r.TABLE_NAME);
+        // Belge KALEM (satır) tabloları: kolonlarında BELGENO + (STOKKODU|MALINCINSI|MIKTAR)
+        // olan tablolar. KASA/BANK/CAR ödeme hareketleri (stoksuz) dışlanır.
+        const allCols = (await pool.request().input('p', sql.NVarChar, prefix + '%').query(`
+            SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME LIKE @p ORDER BY TABLE_NAME, ORDINAL_POSITION
+        `)).recordset;
         const colsByTbl = {};
-        for (const t of tables) {
-            colsByTbl[t] = (await pool.request().input('t', sql.NVarChar, t)
-                .query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME=@t ORDER BY ORDINAL_POSITION`))
-                .recordset.map(c => c.COLUMN_NAME);
-        }
-        // BELGENO kolonu olan tablolar = belge detay/satır adayları.
-        const belgeTables = tables.filter(t => (colsByTbl[t] || []).some(c => c.toUpperCase() === 'BELGENO'));
-        const belgeTableCols = {};
-        for (const t of belgeTables) belgeTableCols[t] = colsByTbl[t];
+        for (const r of allCols) (colsByTbl[r.TABLE_NAME] = colsByTbl[r.TABLE_NAME] || []).push(r.COLUMN_NAME);
+        const lineTables = Object.keys(colsByTbl).filter(t => {
+            const up = colsByTbl[t].map(c => c.toUpperCase());
+            return up.includes('BELGENO') && (up.includes('STOKKODU') || up.includes('MALINCINSI') || up.includes('MIKTAR'));
+        });
+        const lineTableCols = {};
+        for (const t of lineTables) lineTableCols[t] = colsByTbl[t];
 
-        // Örnek evrak yoksa: cari hareketten ilk dolu EVRAKNO'ları dene.
+        // Örnek evrak yoksa: cari hareketten son dolu EVRAKNO'ları dene.
         const harTbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
         let evrakCandidates = [];
         if (!evrak && (await validateTableName(harTbl))) {
             evrakCandidates = (await pool.request().query(
-                `SELECT TOP 10 EVRAKNO FROM [${harTbl}] WHERE EVRAKNO IS NOT NULL AND LTRIM(RTRIM(EVRAKNO))<>'' ORDER BY IND DESC`
+                `SELECT TOP 25 EVRAKNO FROM [${harTbl}] WHERE EVRAKNO IS NOT NULL AND LTRIM(RTRIM(EVRAKNO))<>'' ORDER BY IND DESC`
             )).recordset.map(r => r.EVRAKNO);
         }
         const tryEvraks = evrak ? [evrak] : evrakCandidates;
 
-        // Hangi detay tablosu bu EVRAKNO'yu içeriyor + örnek satırlar (TOP 3).
-        const matches = {};
-        let usedEvrak = null;
+        // Hangi kalem tablosu bu EVRAKNO'yu içeriyor + örnek satırlar (TOP 3).
+        const sampleMatches = [];
         for (const ev of tryEvraks) {
-            for (const t of belgeTables) {
+            for (const t of lineTables) {
                 try {
                     const r = pool.request(); r.input('e', sql.NVarChar, String(ev));
                     const rows = (await r.query(`SELECT TOP 3 * FROM [${t}] WHERE BELGENO=@e`)).recordset;
-                    if (rows.length) { matches[t] = rows; usedEvrak = ev; }
-                } catch { /* kolon tipi uyuşmazlığı vb. yok say */ }
+                    if (rows.length) sampleMatches.push({ evrak: ev, table: t, rows });
+                } catch { /* tip uyuşmazlığı yok say */ }
             }
-            if (Object.keys(matches).length) break;
+            if (sampleMatches.length >= 3) break; // birkaç örnek yeter
         }
 
-        res.json({
-            success: true, prefix, tableCount: tables.length, tables,
-            belgeTableCols, usedEvrak, evrakCandidates, matches,
-        });
+        res.json({ success: true, prefix, lineTables, lineTableCols, triedEvraks: tryEvraks.slice(0, 25), sampleMatches });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
