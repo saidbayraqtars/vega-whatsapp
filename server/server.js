@@ -1053,7 +1053,7 @@ app.post('/api/active-cari/send', async (req, res) => {
             return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
         }
         const result = await waSend(c.phone, text, null, { simulateTyping: true, typingMs: 1500 });
-        if (result.success) { antiban.recordSent(waStatus().me); return res.json({ success: true, message: 'Gönderildi.', phone: c.phone, name: c.name }); }
+        if (result.success) { antiban.recordSent(waStatus().me, 'manual'); return res.json({ success: true, message: 'Gönderildi.', phone: c.phone, name: c.name }); }
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -1265,7 +1265,7 @@ app.post('/api/extre/send', async (req, res) => {
         return res.status(400).json({ success: false, message: 'firma/dönem/cari gerekli.' });
     if (!waStatus().ready) return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil. Önce QR okutun.' });
     const me = waStatus().me;
-    const g = antiban.gate(me, DEFAULT_PACING.dailyCap);
+    const g = antiban.gate(me, DEFAULT_PACING.dailyCap, 'manual');
     if (!g.ok) return res.status(429).json({ success: false, message: g.reason || 'Anti-ban: gönderim sınırına ulaşıldı.' });
     try {
         const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum);
@@ -1288,7 +1288,7 @@ app.post('/api/extre/send', async (req, res) => {
             : `Sayın ${c.firma || c.name}, hesap ekstreniz ektedir.`;
         const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
         const result = await waSend(c.phone, caption, { kind: 'document', buffer: pdf, mimetype: 'application/pdf', fileName }, { simulateTyping: true, typingMs: 1200 });
-        if (result.success) { antiban.recordSent(me); return res.json({ success: true, message: 'Ekstre gönderildi.', phone: c.phone, name: c.name }); }
+        if (result.success) { antiban.recordSent(me, 'manual'); return res.json({ success: true, message: 'Ekstre gönderildi.', phone: c.phone, name: c.name }); }
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -1415,7 +1415,7 @@ async function runJob(job) {
         // Anti-ban kapısı: warm-up rampı + saatlik + günlük tavan (hesap-başı).
         // Günlük dolduysa job biter; saatlik dolduysa sonraki saat başına kadar
         // (iptal edilebilir) bekleyip aynı alıcıdan devam eder.
-        const g = antiban.gate(waStatus().me, p.dailyCap);
+        const g = antiban.gate(waStatus().me, p.dailyCap, 'bulk');
         if (!g.ok) {
             if (g.capType === 'hourly') {
                 const waitMs = msUntilNextHour();
@@ -1473,7 +1473,7 @@ async function runJob(job) {
         if (job.cancelled) { pushEvent(job, { type: 'cancelled', index: i }); break; }
 
         if (result.success) {
-            antiban.recordSent(waStatus().me); // anti-ban saat/gün sayacı
+            antiban.recordSent(waStatus().me, 'bulk'); // anti-ban saat/gün sayacı
             job.sentCount++;
             sentInBatch++;
             pushEvent(job, { ...base, status: 'sent', sentCount: job.sentCount });

@@ -421,7 +421,7 @@ async function _runReminder(rem, opts = {}) {
         // Manuel "Şimdi gönder" baypas eder. lastRunAt ilerlemez → pencere açılınca sürer.
         if (!manual && antiban.inQuietHours()) { interrupted = true; stopReason = antiban.quietReason(); break; }
         // Anti-ban tavanı (warm-up/saatlik/günlük) doldu → turu kes; lastRunAt ilerlemez.
-        const gate = antiban.gate(deps.waStatus().me, null);
+        const gate = antiban.gate(deps.waStatus().me, null, 'reminder');
         if (!gate.ok) { interrupted = true; stopReason = gate.reason; break; }
 
         const contact = withManualPhone(firmaNo, c.IND, contacts.get(c.IND) || {});
@@ -481,7 +481,7 @@ async function _runReminder(rem, opts = {}) {
         }
         const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
         if (res.success) {
-            antiban.recordSent(deps.waStatus().me);
+            antiban.recordSent(deps.waStatus().me, 'reminder');
             sent++; rem.perCariLastSent[c.IND] = nowIso; delete rem.perCariTried[c.IND];
             pushLog({ ...logBase, gecikmeGun: ag ? ag.gecikmeGun : undefined, status: 'sent', message: text });
         } else {
@@ -616,7 +616,7 @@ async function sendOne(id, ind) {
     const media = loadMediaFromDescriptor(rem.media);
     const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
     if (res.success) {
-        antiban.recordSent(deps.waStatus().me);
+        antiban.recordSent(deps.waStatus().me, 'reminder');
         rem.perCariLastSent = rem.perCariLastSent || {}; rem.perCariTried = rem.perCariTried || {};
         rem.perCariLastSent[indNum] = new Date().toISOString();
         delete rem.perCariTried[indNum];   // elle gönderildi → "denendi" engeli kalksın

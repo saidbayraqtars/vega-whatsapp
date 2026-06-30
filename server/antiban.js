@@ -29,7 +29,13 @@ const WARMUP_RAMP = [20, 40, 60, 90, 130, 170, 200];
 const HOURLY_CAP = 40;
 
 let STATE_PATH = null;
-// accounts[accountId] = { firstActiveDate:'YYYY-MM-DD', day:{date,count}, hour:{key,count} }
+// accounts[accountId] = {
+//   firstActiveDate:'YYYY-MM-DD',
+//   hour:{key,count},                         // SAATLİK tavan: hesap-geneli (ban koruması)
+//   channels:{ [kanal]:{date,count} }          // GÜNLÜK tavan: KANAL-BAŞI ayrı sayaç
+// }
+// Kanallar (belge / reminder / bulk / manual) birbirinin günlük tavanını YEMEZ —
+// biri dolunca diğeri durmaz. Saatlik tavan ortak kalır (toplam patlama koruması).
 let state = { accounts: {} };
 
 const dayKey = (d = new Date()) => d.toISOString().slice(0, 10);            // YYYY-MM-DD
@@ -60,20 +66,28 @@ function save() {
     catch { /* sayaç yazılamazsa gönderim engellenmesin */ }
 }
 
-// Hesap kaydını al/oluştur ve gün/saat dönüşünde sayaçları sıfırla.
-function touch(accountId) {
+// Hesap + kanal kaydını al/oluştur ve gün/saat dönüşünde sayaçları sıfırla.
+// Döner: { acc, ch } — ch = bu kanalın bugünkü günlük sayacı.
+function touch(accountId, channel = 'default') {
     const key = normAccount(accountId);
     const today = dayKey();
     const hr = hourKey();
     let acc = state.accounts[key];
     if (!acc) {
-        acc = { firstActiveDate: today, day: { date: today, count: 0 }, hour: { key: hr, count: 0 } };
+        acc = { firstActiveDate: today, hour: { key: hr, count: 0 }, channels: {} };
         state.accounts[key] = acc;
     }
     if (!acc.firstActiveDate) acc.firstActiveDate = today;
-    if (!acc.day || acc.day.date !== today) acc.day = { date: today, count: 0 };
+    if (!acc.channels) acc.channels = {};                 // eski şemadan göç (acc.day yok say)
     if (!acc.hour || acc.hour.key !== hr) acc.hour = { key: hr, count: 0 };
-    return acc;
+    let ch = acc.channels[channel];
+    if (!ch || ch.date !== today) { ch = { date: today, count: 0 }; acc.channels[channel] = ch; }
+    return { acc, ch };
+}
+// Hesabın bugün TÜM kanallardaki toplam gönderimi (UI göstergesi için).
+function totalDaySent(acc) {
+    const today = dayKey();
+    return Object.values(acc.channels || {}).filter(c => c.date === today).reduce((s, c) => s + c.count, 0);
 }
 
 // Warm-up rampına göre bu numaranın bugünkü günlük tavanı.
@@ -82,33 +96,33 @@ function rampDailyCap(acc) {
     return WARMUP_RAMP[idx];
 }
 
-// Gönderim ÖNCESİ izin sorgusu. userDailyCap verilirse warm-up tavanıyla küçüğü
-// alınır (kullanıcı daha düşük istediyse ona uyulur; daha yükseği warm-up keser).
-// Döner: { ok, reason, dailyCap, daySent, hourCap, hourSent, dayIndex, capType }
-//   capType: 'daily' | 'hourly' (ok=false iken hangi tavanın dolduğu).
-function gate(accountId, userDailyCap) {
-    if (!STATE_PATH) return { ok: true, dailyCap: null, daySent: 0, hourCap: HOURLY_CAP, hourSent: 0, dayIndex: 0 };
-    const acc = touch(accountId);
+// Gönderim ÖNCESİ izin sorgusu. channel = bağımsız günlük sayaç ('belge'|'reminder'|
+// 'bulk'|'manual'…). userDailyCap verilirse warm-up tavanıyla küçüğü alınır.
+// GÜNLÜK tavan KANAL-BAŞI; SAATLİK tavan hesap-geneli (ortak).
+// Döner: { ok, reason, dailyCap, daySent, hourCap, hourSent, dayIndex, capType, channel }
+function gate(accountId, userDailyCap, channel = 'default') {
+    if (!STATE_PATH) return { ok: true, dailyCap: null, daySent: 0, hourCap: HOURLY_CAP, hourSent: 0, dayIndex: 0, channel };
+    const { acc, ch } = touch(accountId, channel);
     const dayIndex = daysBetween(acc.firstActiveDate, dayKey());
     const rampCap = rampDailyCap(acc);
     const dailyCap = (Number(userDailyCap) > 0) ? Math.min(rampCap, Number(userDailyCap)) : rampCap;
 
-    if (acc.day.count >= dailyCap) {
-        return { ok: false, capType: 'daily', reason: `Günlük tavan doldu (${acc.day.count}/${dailyCap}${dayIndex < WARMUP_RAMP.length - 1 ? ', ısınma günü ' + (dayIndex + 1) : ''})`,
-            dailyCap, daySent: acc.day.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
+    if (ch.count >= dailyCap) {
+        return { ok: false, capType: 'daily', channel, reason: `Günlük tavan doldu (${ch.count}/${dailyCap}${dayIndex < WARMUP_RAMP.length - 1 ? ', ısınma günü ' + (dayIndex + 1) : ''})`,
+            dailyCap, daySent: ch.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
     }
     if (acc.hour.count >= HOURLY_CAP) {
-        return { ok: false, capType: 'hourly', reason: `Saatlik tavan doldu (${acc.hour.count}/${HOURLY_CAP}) — sonraki saat sürer`,
-            dailyCap, daySent: acc.day.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
+        return { ok: false, capType: 'hourly', channel, reason: `Saatlik tavan doldu (${acc.hour.count}/${HOURLY_CAP}) — sonraki saat sürer`,
+            dailyCap, daySent: ch.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
     }
-    return { ok: true, dailyCap, daySent: acc.day.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
+    return { ok: true, channel, dailyCap, daySent: ch.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
 }
 
-// Gönderim BAŞARILI olunca çağır: saat + gün sayaçlarını artır, diske yaz.
-function recordSent(accountId) {
+// Gönderim BAŞARILI olunca çağır: kanal-günlük + ortak-saatlik sayacı artır, diske yaz.
+function recordSent(accountId, channel = 'default') {
     if (!STATE_PATH) return;
-    const acc = touch(accountId);
-    acc.day.count++;
+    const { acc, ch } = touch(accountId, channel);
+    ch.count++;
     acc.hour.count++;
     save();
 }
@@ -170,12 +184,16 @@ function applySpintax(text) {
     return s;
 }
 
-// UI / teşhis için anlık durum (gönderime etkisi yok).
+// UI / teşhis için anlık durum (gönderime etkisi yok). daySent = TÜM kanal toplamı.
 function snapshot(accountId, userDailyCap) {
-    const g = gate(accountId, userDailyCap);
+    if (!STATE_PATH) return { dayIndex: 0, warmup: false, dailyCap: null, daySent: 0, hourCap: HOURLY_CAP, hourSent: 0 };
+    const { acc } = touch(accountId, 'default');
+    const dayIndex = daysBetween(acc.firstActiveDate, dayKey());
+    const rampCap = rampDailyCap(acc);
+    const dailyCap = (Number(userDailyCap) > 0) ? Math.min(rampCap, Number(userDailyCap)) : rampCap;
     return {
-        dayIndex: g.dayIndex, warmup: g.dayIndex < WARMUP_RAMP.length - 1,
-        dailyCap: g.dailyCap, daySent: g.daySent, hourCap: g.hourCap, hourSent: g.hourSent,
+        dayIndex, warmup: dayIndex < WARMUP_RAMP.length - 1,
+        dailyCap, daySent: totalDaySent(acc), hourCap: HOURLY_CAP, hourSent: acc.hour.count,
     };
 }
 

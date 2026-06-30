@@ -448,7 +448,7 @@ async function processPending() {
         // Gece penceresi: gönderim saati dışında kuyrukta beklesin (gece mesaj atma).
         if (antiban.inQuietHours()) break;
         // Anti-ban tavanı doldu → kuyrukta kalsın, sonraki turda (saat/gün dönünce) dene.
-        if (!antiban.gate(deps.waStatus().me, null).ok) break;
+        if (!antiban.gate(deps.waStatus().me, null, 'belge').ok) break;
         // Pasif/silinmiş cariyi kuyruktan at (doğrulama yapılabildiyse).
         if (contacts && item.cariInd != null) {
             const c = contacts.get(item.cariInd);
@@ -478,7 +478,7 @@ async function processPending() {
         }
         const res = await deps.waSend(item.phone, item.text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
         if (res.success) {
-            antiban.recordSent(deps.waStatus().me);
+            antiban.recordSent(deps.waStatus().me, 'belge');
             recordSentDoc(tableName(), item, item.phone, res.id);
             pending = pending.filter(p => p !== item); savePending(); sentCount++;
             pushLog({ ...pendingBase(item), status: 'sent', message: item.text });
@@ -728,7 +728,7 @@ async function handleEdited(pool, tbl, key, e, curAmount) {
         enqueue(base, c.phone, text, 'WhatsApp bağlı değil — düzenleme mesajı kuyruğa alındı', null);
         return;
     }
-    const g = antiban.gate(deps.waStatus().me, null);
+    const g = antiban.gate(deps.waStatus().me, null, 'belge');
     if (!g.ok) { enqueue(base, c.phone, text, `Gönderim tavanı: ${g.reason} — kuyruğa alındı`, null); return; }
     if (config.verifyOnWhatsApp) {
         const chk = await deps.checkOnWhatsApp(c.phone);
@@ -740,7 +740,7 @@ async function handleEdited(pool, tbl, key, e, curAmount) {
     }
     const res = await deps.waSend(c.phone, text, null, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
     if (res.success) {
-        antiban.recordSent(deps.waStatus().me);
+        antiban.recordSent(deps.waStatus().me, 'belge');
         if (res.id) { e.waMsgs.push({ phone: c.phone, id: res.id }); saveDocs(); }  // sonraki silmede bu da geri çekilir
         pushLog({ ...base, status: 'edited', message: text, error: `Tutar ${fmtAmount(oldAmount)} → ${fmtAmount(curAmount)} TL` });
     } else {
@@ -899,7 +899,7 @@ async function pollOnce() {
                 }
                 // Anti-ban tavanı (warm-up/saatlik/günlük) doldu → kuyruğa al, gönderme.
                 // Sonraki turlarda gate açılınca processPending gönderir.
-                const g = antiban.gate(deps.waStatus().me, null);
+                const g = antiban.gate(deps.waStatus().me, null, 'belge');
                 if (!g.ok) {
                     enqueue(base, phone, text, `Gönderim tavanı: ${g.reason} — kuyruğa alındı`, rule.media); queued++; continue;
                 }
@@ -912,7 +912,7 @@ async function pollOnce() {
                     }
                 }
                 const res = await deps.waSend(phone, text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
-                if (res.success) { antiban.recordSent(deps.waStatus().me); recordSentDoc(tbl, base, phone, res.id); sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
+                if (res.success) { antiban.recordSent(deps.waStatus().me, 'belge'); recordSentDoc(tbl, base, phone, res.id); sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
                 else { enqueue(base, phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`, rule.media); queued++; }
                 await sleep(rand(8000, 20000));
             }
