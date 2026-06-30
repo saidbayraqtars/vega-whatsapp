@@ -17,6 +17,8 @@ const FONT_BOLD = path.join(FONT_DIR, 'arialbd.ttf');
 const HAS_FONTS = fs.existsSync(FONT_REG) && fs.existsSync(FONT_BOLD);
 
 const fmtTR = (n) => (Number(n) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// Miktar: tam sayıysa ondalıksız, değilse 3 haneye kadar.
+const fmtNum = (n) => { const x = Number(n) || 0; return Number.isInteger(x) ? String(x) : x.toLocaleString('tr-TR', { maximumFractionDigits: 3 }); };
 function fmtDate(d) {
     if (!d) return '';
     const x = new Date(d);
@@ -27,7 +29,7 @@ function fmtDate(d) {
 const COLS = [
     { key: 'tarih',  title: 'Tarih',    x: 40,  w: 58,  align: 'left'  },
     { key: 'evrak',  title: 'Evrak No', x: 98,  w: 82,  align: 'left'  },
-    { key: 'izahat', title: 'Açıklama', x: 180, w: 175, align: 'left'  },
+    { key: 'izahat', title: 'Belge / Açıklama', x: 180, w: 175, align: 'left'  },
     { key: 'borc',   title: 'Borç',     x: 355, w: 66,  align: 'right' },
     { key: 'alacak', title: 'Alacak',   x: 421, w: 66,  align: 'right' },
     { key: 'bakiye', title: 'Bakiye',   x: 487, w: 68,  align: 'right' },
@@ -81,15 +83,17 @@ function buildExtrePdf(data = {}) {
             };
             y = drawHeader(y);
 
-            // ─── Satırlar ───
-            doc.font(REG).fontSize(8.5).fillColor('#111');
-            const ROW_H = 16;
+            // ─── Satırlar (+ belge içeriği = kalemler) ───
+            const ROW_H = 16, KALEM_H = 11;
+            const adX = COLS[2].x + 8;          // kalem girintisi (Açıklama sütunu altı)
+            const sumX = COLS[3].x;             // kalem "miktar×fiyat=tutar" sağ blok başlangıcı
             for (const r of rows) {
-                if (y + ROW_H > PAGE_BOTTOM) { doc.addPage(); y = 40; y = drawHeader(y); doc.font(REG).fontSize(8.5).fillColor('#111'); }
+                if (y + ROW_H > PAGE_BOTTOM) { doc.addPage(); y = 40; y = drawHeader(y); }
+                doc.font(REG).fontSize(8.5);
                 const cells = {
                     tarih: fmtDate(r.tarih),
                     evrak: r.evrak != null ? String(r.evrak) : '',
-                    izahat: r.izahat != null ? String(r.izahat) : '',
+                    izahat: r.belgeTip || (r.izahat != null ? String(r.izahat) : ''),
                     borc: Number(r.borc) ? fmtTR(r.borc) : '',
                     alacak: Number(r.alacak) ? fmtTR(r.alacak) : '',
                     bakiye: fmtTR(r.bakiye),
@@ -98,8 +102,21 @@ function buildExtrePdf(data = {}) {
                     doc.fillColor(c.key === 'bakiye' ? (Number(r.bakiye) < 0 ? '#b45309' : '#111') : '#111')
                         .text(cells[c.key], c.x + 3, y + 4, { width: c.w - 6, align: c.align, lineBreak: false, ellipsis: true });
                 }
-                doc.moveTo(X0, y + ROW_H).lineTo(X1, y + ROW_H).strokeColor('#eee').lineWidth(0.5).stroke();
                 y += ROW_H;
+
+                // Belge içeriği: faturanın/fişin kalemleri (ürün, miktar × fiyat = tutar).
+                if (Array.isArray(r.kalemler) && r.kalemler.length) {
+                    for (const k of r.kalemler) {
+                        if (y + KALEM_H > PAGE_BOTTOM) { doc.addPage(); y = 40; y = drawHeader(y); }
+                        doc.font(REG).fontSize(7);
+                        const sumStr = `${fmtNum(k.miktar)} ${k.birim} × ${fmtTR(k.fiyat)} = ${fmtTR(k.tutar)}`;
+                        doc.fillColor('#555').text(`• ${k.ad}`, adX, y + 1.5, { width: sumX - adX - 4, align: 'left', lineBreak: false, ellipsis: true });
+                        doc.fillColor('#777').text(sumStr, sumX, y + 1.5, { width: X1 - sumX - 2, align: 'right', lineBreak: false, ellipsis: true });
+                        y += KALEM_H;
+                    }
+                }
+                doc.moveTo(X0, y).lineTo(X1, y).strokeColor('#eee').lineWidth(0.5).stroke();
+                y += 2;
             }
             if (!rows.length) {
                 doc.fillColor('#999').font(REG).fontSize(10).text('Bu dönemde hareket bulunmuyor.', X0, y + 8, { width: X1 - X0, align: 'center' });

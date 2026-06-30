@@ -1077,9 +1077,58 @@ async function fetchFirmaName(firmaNo) {
     } catch { return null; }
 }
 
-// Carinin dönem hareket satırları + yürüyen bakiye. IZAHAT/EVRAKNO sürüme göre
-// değişebilir → INFORMATION_SCHEMA ile mevcut kolonlar tespit edilir.
-async function fetchHareketRows(firmaNo, donemNo, ind) {
+// CARIHAREKETLERI.IZAHAT = Vega işlem kodu (canlı doğrulandı F0101). Belge tipi
+// etiketi + "belge içeriği" (kalem) için kaynak belge tablosu eşlemesi.
+const IZAHAT_LABEL = {
+    21: 'Satış Faturası', 20: 'Alış Faturası', 33: 'Stok Çıkış', 32: 'Stok Giriş',
+    13: 'Tahsilat', 11: 'Tediye', 22: 'Satış İrsaliyesi', 23: 'Alış İrsaliyesi',
+    103: 'Devir', 104: 'Devir',
+};
+// IZAHAT kodu → kaynak belge tablo öneki(leri). Kalemler: BASLIK.BELGENO = cari
+// hareket EVRAKNO → BASLIK.IND → HAREKET.EVRAKNO (= başlık IND). Canlı doğrulandı.
+const DOC_LINE_MAP = {
+    21: ['SATFAT', 'SATVADFAT', 'PSATFAT'],
+    20: ['ALFAT', 'ALVADFAT'],
+    22: ['SATIRS'], 23: ['ALIRS'],
+    33: ['STKCIK'], 32: ['STKGIR'],
+};
+// Tablo varlık cache (dönem tabloları kararlı; tekrar INFORMATION_SCHEMA sorgusu yapma).
+const _tblExistsCache = new Map();
+async function tableExistsCached(name) {
+    if (_tblExistsCache.has(name)) return _tblExistsCache.get(name);
+    const ok = await validateTableName(name);
+    _tblExistsCache.set(name, ok);
+    return ok;
+}
+
+// Bir belgenin KALEMLERİ (belge içeriği): ürün/miktar/birim/fiyat/tutar. Yoksa null.
+async function fetchBelgeKalemleri(firmaNo, donemNo, izahat, evrakno) {
+    const suffixes = DOC_LINE_MAP[Number(izahat)];
+    const ev = evrakno == null ? '' : String(evrakno).trim();
+    if (!suffixes || !ev) return null;
+    for (const sfx of suffixes) {
+        const bTbl = `F${firmaNo}D${donemNo}TBL${sfx}BASLIK`;
+        const hTbl = `F${firmaNo}D${donemNo}TBL${sfx}HAREKET`;
+        if (!(await tableExistsCached(bTbl)) || !(await tableExistsCached(hTbl))) continue;
+        const rb = pool.request(); rb.input('e', sql.NVarChar, ev);
+        const b = (await rb.query(`SELECT TOP 1 IND FROM [${bTbl}] WHERE BELGENO=@e ORDER BY IND DESC`)).recordset[0];
+        if (!b) continue;
+        const lines = (await pool.request().query(`
+            SELECT MALINCINSI, STOKKODU, MIKTAR, BIRIM, FIYATI, GERCEKTOPLAM, KDV
+            FROM [${hTbl}] WHERE EVRAKNO=${Number(b.IND)} ORDER BY SATIRNO
+        `)).recordset;
+        if (lines.length) return lines.map(l => ({
+            ad: (l.MALINCINSI != null && String(l.MALINCINSI).trim()) || (l.STOKKODU != null && String(l.STOKKODU).trim()) || '',
+            miktar: Number(l.MIKTAR) || 0, birim: (l.BIRIM == null ? '' : String(l.BIRIM)).trim(),
+            fiyat: Number(l.FIYATI) || 0, tutar: Number(l.GERCEKTOPLAM) || 0, kdv: Number(l.KDV) || 0,
+        }));
+    }
+    return null;
+}
+
+// Carinin dönem hareket satırları + yürüyen bakiye. opts.withKalemler → fatura/stok
+// belgelerinin içeriğini (kalemleri) her satıra ekler.
+async function fetchHareketRows(firmaNo, donemNo, ind, opts = {}) {
     const indNum = parseInt(ind, 10);
     if (!pool || !pool.connected || !/^\d+$/.test(String(firmaNo)) || !/^\d+$/.test(String(donemNo)) || !Number.isFinite(indNum)) return { rows: [], net: 0 };
     const tbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
@@ -1089,11 +1138,11 @@ async function fetchHareketRows(firmaNo, donemNo, ind) {
     const have = new Set(colRs.map(c => c.COLUMN_NAME.toUpperCase()));
     const tarihCol = have.has('TARIH') ? 'TARIH' : null;
     const evrakCol = have.has('EVRAKNO') ? 'EVRAKNO' : null;
-    const izahatCol = have.has('IZAHAT') ? 'IZAHAT' : (have.has('ACIKLAMA') ? 'ACIKLAMA' : null);
+    const izahatCol = have.has('IZAHAT') ? 'IZAHAT' : null; // sayısal işlem kodu
     const sel = [
         tarihCol ? `${tarihCol} AS TARIH` : `CAST(NULL AS DATETIME) AS TARIH`,
         evrakCol ? `${evrakCol} AS EVRAKNO` : `CAST('' AS NVARCHAR(1)) AS EVRAKNO`,
-        izahatCol ? `${izahatCol} AS IZAHAT` : `CAST('' AS NVARCHAR(1)) AS IZAHAT`,
+        izahatCol ? `${izahatCol} AS IZAHAT` : `CAST(NULL AS INT) AS IZAHAT`,
         `CAST(ISNULL(BORC,0) AS DECIMAL(18,2)) AS BORC`,
         `CAST(ISNULL(ALACAK,0) AS DECIMAL(18,2)) AS ALACAK`,
     ].join(', ');
@@ -1102,7 +1151,20 @@ async function fetchHareketRows(firmaNo, donemNo, ind) {
     let run = 0; const rows = [];
     for (const r of recs) {
         run += Number(r.BORC) - Number(r.ALACAK);
-        rows.push({ tarih: r.TARIH, evrak: r.EVRAKNO, izahat: r.IZAHAT, borc: Number(r.BORC), alacak: Number(r.ALACAK), bakiye: run });
+        const izahat = r.IZAHAT != null ? Number(r.IZAHAT) : null;
+        rows.push({
+            tarih: r.TARIH, evrak: r.EVRAKNO, izahat,
+            belgeTip: (izahat != null && IZAHAT_LABEL[izahat]) || '',
+            borc: Number(r.BORC), alacak: Number(r.ALACAK), bakiye: run, kalemler: null,
+        });
+    }
+    if (opts.withKalemler) {
+        for (const row of rows) {
+            if (DOC_LINE_MAP[row.izahat] && row.evrak) {
+                try { row.kalemler = await fetchBelgeKalemleri(firmaNo, donemNo, row.izahat, row.evrak); }
+                catch { row.kalemler = null; }
+            }
+        }
     }
     return { rows, net: run };
 }
@@ -1179,7 +1241,7 @@ app.get('/api/extre/pdf', async (req, res) => {
     try {
         const indNum = parseInt(ind, 10);
         const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum) || {};
-        const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum);
+        const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum, { withKalemler: true });
         const firmaName = await fetchFirmaName(firmaNo);
         const pdf = await buildExtrePdf({
             firmaName: firmaName || '', cariName: c.name || String(indNum), cariKod: c.kod || '',
@@ -1188,61 +1250,6 @@ app.get('/api/extre/pdf', async (req, res) => {
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `inline; filename="ekstre-${indNum}.pdf"`);
         res.send(pdf);
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
-
-// ── GEÇİCİ TEŞHİS: belge kalemleri (belge içeriği) için Vega detay tablo şemasını
-// keşfeder. "belge içeriği" özelliği yazıldıktan sonra KALDIRILACAK. Tarayıcıda aç:
-//   http://localhost:3100/api/extre/_diag?firmaNo=0101&donemNo=0005
-// İstersen örnek belge ver: &evrak=<bir fatura evrak no>  (yoksa otomatik seçilir).
-app.get('/api/extre/_diag', async (req, res) => {
-    if (!requireDb(req, res)) return;
-    const { firmaNo, donemNo } = req.query;
-    let evrak = req.query.evrak;
-    if (!/^\d+$/.test(String(firmaNo)) || !/^\d+$/.test(String(donemNo)))
-        return res.status(400).json({ success: false, message: 'firmaNo/donemNo gerekli (sadece rakam).' });
-    try {
-        const prefix = `F${firmaNo}D${donemNo}TBL`;
-        const colsOf = async (tbl) => (await pool.request().input('t', sql.NVarChar, tbl)
-            .query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME=@t ORDER BY ORDINAL_POSITION`))
-            .recordset.map(c => c.COLUMN_NAME);
-        const exists = async (tbl) => (await pool.request().input('t', sql.NVarChar, tbl)
-            .query(`SELECT COUNT(*) c FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME=@t`)).recordset[0].c > 0;
-
-        // 1) Cari hareket: kolonlar + örnek satırlar (EVRAKNO/IZAHAT/BELGE* bağ kolonlarını gör).
-        const harTbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
-        const cariHareket = { table: harTbl, columns: [], sample: [] };
-        if (await exists(harTbl)) {
-            cariHareket.columns = await colsOf(harTbl);
-            cariHareket.sample = (await pool.request().query(
-                `SELECT TOP 6 * FROM [${harTbl}] WHERE EVRAKNO IS NOT NULL AND LTRIM(RTRIM(EVRAKNO))<>'' ORDER BY IND DESC`
-            )).recordset;
-        }
-
-        // 2) Belge başlık + kalem tabloları: kolonlar (+ HAREKET için örnek satır).
-        const SUFFIXES = [
-            'SATFATBASLIK', 'SATFATHAREKET', 'SATVADFATBASLIK', 'SATVADFATHAREKET',
-            'PSATFATBASLIK', 'PSATFATHAREKET', 'SATIRSBASLIK', 'SATIRSHAREKET',
-            'STKCIKBASLIK', 'STKCIKHAREKET', 'ALFATBASLIK', 'ALFATHAREKET',
-        ];
-        const docTables = {};
-        for (const sfx of SUFFIXES) {
-            const tbl = prefix + sfx;
-            if (!(await exists(tbl))) continue;
-            const entry = { table: tbl, columns: await colsOf(tbl) };
-            // HAREKET (kalem) tabloları için örnek 2 satır — başlığa bağ kolonunu + stok kolonlarını görmek için.
-            if (sfx.endsWith('HAREKET')) {
-                try { entry.sample = (await pool.request().query(`SELECT TOP 2 * FROM [${tbl}] ORDER BY IND DESC`)).recordset; } catch { /* yok say */ }
-            } else {
-                // BASLIK: tek örnek satır (IND/BELGENO/FIRMANO bağ değerlerini görmek için).
-                try { entry.sampleBaslik = (await pool.request().query(`SELECT TOP 1 * FROM [${tbl}] ORDER BY IND DESC`)).recordset; } catch { /* yok say */ }
-            }
-            docTables[sfx] = entry;
-        }
-
-        res.json({ success: true, prefix, cariHareket, docTables });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -1266,7 +1273,7 @@ app.post('/api/extre/send', async (req, res) => {
         if (c.pasif) return res.status(400).json({ success: false, message: 'Cari pasif (STATUS=2) — gönderilmez.' });
         if (!c.phone || !c.valid) return res.status(400).json({ success: false, message: 'Carinin geçerli telefonu yok.' });
 
-        const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum);
+        const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum, { withKalemler: true });
         const firmaName = await fetchFirmaName(firmaNo);
         const pdf = await buildExtrePdf({
             firmaName: firmaName || '', cariName: c.name, cariKod: c.kod,
