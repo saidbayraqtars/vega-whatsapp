@@ -53,11 +53,20 @@ const DEVIR_CODES = [103, 104];
 //   Standart kodlar (F0101 EXPERT BİLİŞİM ile doğrulandı):
 //     13=Cari Giriş/Tahsilat  11=Cari Çıkış/Tediye  21=Satış Faturası
 //     20=Alış Faturası  33=Stok Çıkış Fişi  32=Stok Giriş Fişi
+//     83=Banka Giriş/HAVALE (tahsilat)  84=Banka Çıkış (tediye)
+// HAVALE NOTU (2026-06-30, F0101 D0001 ile birebir doğrulandı): banka havalesi cari
+// defterine IZAHAT=83 ALACAK olarak yazılır (BANKGIRHAREKET 420 satır = CARIHAREKET
+// IZAHAT=83 420 satır, toplam 3.255.263,74 birebir). 83 cariGiris ile aynı "ödeme
+// alındı" sınıfına girer; 84 banka tediyesi → cariCikis. (Eskiden sadece 13 vardı →
+// havale bildirimi gitmiyordu; "bir özellikten sonra gitti" arızasının kökü buydu.)
 // dir: ödeme tipleri yalnız doğru işaretli satırda sınıflanır (peşin stok çıkışı
 // gibi paylaşılan EVRAKNO'lu BORC satırı tahsilat sayılmasın).
 const DOC_PRIORITY = [
-    { docType: 'cariGiris',      suffixes: ['TBLCARGIRBASLIK'], codes: [13], dir: 'alacak' },
-    { docType: 'cariCikis',      suffixes: ['TBLCARCIKBASLIK'], codes: [11], dir: 'borc' },
+    // Banka havalesi (83/84) başlık authority ile eşleşmez (BANKGIRBASLIK'ta FIRMANO
+    // yok + BELGENO ayrı seri) → SADECE IZAHAT kodu yedeğiyle sınıflanır. cari giriş/
+    // çıkış bordrosu (13/11) ise CARGIR/CARCIKBASLIK authority + kodla.
+    { docType: 'cariGiris',      suffixes: ['TBLCARGIRBASLIK'], codes: [13, 83], dir: 'alacak' },
+    { docType: 'cariCikis',      suffixes: ['TBLCARCIKBASLIK'], codes: [11, 84], dir: 'borc' },
     { docType: 'satisFaturasi',  suffixes: ['TBLSATFATBASLIK', 'TBLSATVADFATBASLIK', 'TBLPSATFATBASLIK'], codes: [21] },
     { docType: 'alisFaturasi',   suffixes: ['TBLALFATBASLIK', 'TBLALVADFATBASLIK'], codes: [20] },
     { docType: 'satisIrsaliyesi', suffixes: ['TBLSATIRSBASLIK'], codes: [] },
@@ -66,7 +75,7 @@ const DOC_PRIORITY = [
     { docType: 'stokGiris',      suffixes: ['TBLSTKGIRBASLIK'], codes: [32] },
 ];
 // Tek kod → docType (eski kod-bazlı kuralları docType'a göç için).
-const CODE_TO_DOCTYPE = { 13: 'cariGiris', 11: 'cariCikis', 21: 'satisFaturasi', 20: 'alisFaturasi', 33: 'stokCikis', 32: 'stokGiris' };
+const CODE_TO_DOCTYPE = { 13: 'cariGiris', 83: 'cariGiris', 11: 'cariCikis', 84: 'cariCikis', 21: 'satisFaturasi', 20: 'alisFaturasi', 33: 'stokCikis', 32: 'stokGiris' };
 
 // ─── Hazır belge-tipi şablonları (kullanıcı bunlar üzerinden düzenler) ──────────
 // Tümü default PASİF. docType belirli olunca yön/kod/fatura-dışlama OTOMATİK
@@ -88,13 +97,13 @@ const PRESET_RULES = [
         template: 'Sayın {firma}, {tarih} tarihli {tutar} TL tutarındaki mal/ürün çıkışınız (sevkiyat) gerçekleştirilmiştir. Bilginize sunarız.',
     },
     {
-        id: 'cariGiris', docType: 'cariGiris', name: 'Cari Giriş (Tahsilat)',
-        direction: 'alacak', izahatCodes: [13], excludeFatura: true, enabled: false,
+        id: 'cariGiris', docType: 'cariGiris', name: 'Cari Giriş / Havale (Tahsilat)',
+        direction: 'alacak', izahatCodes: [13, 83], excludeFatura: true, enabled: false,
         template: 'Sayın {firma}, {tarih} tarihinde hesabınıza {tutar} TL tutarında ödemeniz alınmıştır. Güncel bakiyeniz: {bakiye} TL ({durum}). Teşekkür ederiz.',
     },
     {
-        id: 'cariCikis', docType: 'cariCikis', name: 'Cari Çıkış (Tediye)',
-        direction: 'borc', izahatCodes: [11], excludeFatura: false, enabled: false,
+        id: 'cariCikis', docType: 'cariCikis', name: 'Cari Çıkış / Banka Tediye',
+        direction: 'borc', izahatCodes: [11, 84], excludeFatura: false, enabled: false,
         template: 'Sayın {firma}, {tarih} tarihinde tarafınıza {tutar} TL tutarında ödeme gerçekleştirilmiştir. Güncel bakiyeniz: {bakiye} TL ({durum}). Bilginize sunarız.',
     },
 ];
@@ -180,8 +189,8 @@ function inferDocType(r) {
         if (set.size === 1 && codes.every(c => CODE_TO_DOCTYPE[c])) return [...set][0];
     }
     const name = (r.name || '').toLocaleLowerCase('tr-TR');
-    if (/tahsilat|ödeme alın|odeme alin|cari giriş|cari giris/.test(name)) return 'cariGiris';
-    if (/tediye|cari çıkış|cari cikis/.test(name)) return 'cariCikis';
+    if (/tahsilat|ödeme alın|odeme alin|cari giriş|cari giris|havale|banka giriş|banka giris/.test(name)) return 'cariGiris';
+    if (/tediye|cari çıkış|cari cikis|banka çıkış|banka cikis/.test(name)) return 'cariCikis';
     if (/satış fat|satis fat/.test(name)) return 'satisFaturasi';
     if (/alış fat|alis fat/.test(name)) return 'alisFaturasi';
     if (/satış irs|satis irs/.test(name)) return 'satisIrsaliyesi';

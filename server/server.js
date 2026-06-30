@@ -1082,6 +1082,7 @@ async function fetchFirmaName(firmaNo) {
 const IZAHAT_LABEL = {
     21: 'Satış Faturası', 20: 'Alış Faturası', 33: 'Stok Çıkış', 32: 'Stok Giriş',
     13: 'Tahsilat', 11: 'Tediye', 22: 'Satış İrsaliyesi', 23: 'Alış İrsaliyesi',
+    83: 'Havale (Banka Tahsilat)', 84: 'Banka Tediye',
     103: 'Devir', 104: 'Devir',
 };
 // IZAHAT kodu → kaynak belge tablo öneki(leri). Kalemler: BASLIK.BELGENO = cari
