@@ -1322,7 +1322,15 @@ app.get('/api/extre/_izahat', async (req, res) => {
                 if (!(await validateTableName(t))) continue;
                 try { const n = (await pool.request().input('e', sql.NVarChar, ev).query(`SELECT COUNT(*) AS c FROM [${t}] WHERE BELGENO=@e`)).recordset[0].c; if (n > 0) inSource[s] = n; } catch { /* yok say */ }
             }
-            return res.json({ success: true, table: tbl, evrak: ev, rows, inSource });
+            // Banka/cari tahsilat HAREKET tabloları: gerçek satırlar (FIRMANO=cari bağı, TUTAR, IZAHAT).
+            const HAR = ['BANKGIRHAREKET', 'BANKTAHSILHAREKET', 'BANKHARHAREKET', 'EFTHAREKET', 'CARGIRHAREKET'];
+            const hareketRows = {};
+            for (const h of HAR) {
+                const t = `F${firmaNo}D${donemNo}TBL${h}`;
+                if (!(await validateTableName(t))) continue;
+                try { const rs = (await pool.request().input('e', sql.NVarChar, ev).query(`SELECT TOP 5 * FROM [${t}] WHERE BELGENO=@e`)).recordset; if (rs.length) hareketRows[h] = rs; } catch { /* yok say */ }
+            }
+            return res.json({ success: true, table: tbl, evrak: ev, rows, inSource, hareketRows });
         }
         const dist = (await pool.request().query(`
             SELECT IZAHAT, COUNT(*) AS c,
