@@ -1193,6 +1193,65 @@ app.get('/api/extre/pdf', async (req, res) => {
     }
 });
 
+// ── GEÇİCİ TEŞHİS: belge kalemleri (belge içeriği) için Vega detay tablo şemasını
+// keşfeder. "belge içeriği" özelliği yazıldıktan sonra KALDIRILACAK. Tarayıcıda aç:
+//   http://localhost:3100/api/extre/_diag?firmaNo=0101&donemNo=0005
+// İstersen örnek belge ver: &evrak=<bir fatura evrak no>  (yoksa otomatik seçilir).
+app.get('/api/extre/_diag', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    const { firmaNo, donemNo } = req.query;
+    let evrak = req.query.evrak;
+    if (!/^\d+$/.test(String(firmaNo)) || !/^\d+$/.test(String(donemNo)))
+        return res.status(400).json({ success: false, message: 'firmaNo/donemNo gerekli (sadece rakam).' });
+    try {
+        const prefix = `F${firmaNo}D${donemNo}TBL`;
+        const tables = (await pool.request().input('p', sql.NVarChar, prefix + '%')
+            .query(`SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME LIKE @p ORDER BY TABLE_NAME`))
+            .recordset.map(r => r.TABLE_NAME);
+        const colsByTbl = {};
+        for (const t of tables) {
+            colsByTbl[t] = (await pool.request().input('t', sql.NVarChar, t)
+                .query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME=@t ORDER BY ORDINAL_POSITION`))
+                .recordset.map(c => c.COLUMN_NAME);
+        }
+        // BELGENO kolonu olan tablolar = belge detay/satır adayları.
+        const belgeTables = tables.filter(t => (colsByTbl[t] || []).some(c => c.toUpperCase() === 'BELGENO'));
+        const belgeTableCols = {};
+        for (const t of belgeTables) belgeTableCols[t] = colsByTbl[t];
+
+        // Örnek evrak yoksa: cari hareketten ilk dolu EVRAKNO'ları dene.
+        const harTbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
+        let evrakCandidates = [];
+        if (!evrak && (await validateTableName(harTbl))) {
+            evrakCandidates = (await pool.request().query(
+                `SELECT TOP 10 EVRAKNO FROM [${harTbl}] WHERE EVRAKNO IS NOT NULL AND LTRIM(RTRIM(EVRAKNO))<>'' ORDER BY IND DESC`
+            )).recordset.map(r => r.EVRAKNO);
+        }
+        const tryEvraks = evrak ? [evrak] : evrakCandidates;
+
+        // Hangi detay tablosu bu EVRAKNO'yu içeriyor + örnek satırlar (TOP 3).
+        const matches = {};
+        let usedEvrak = null;
+        for (const ev of tryEvraks) {
+            for (const t of belgeTables) {
+                try {
+                    const r = pool.request(); r.input('e', sql.NVarChar, String(ev));
+                    const rows = (await r.query(`SELECT TOP 3 * FROM [${t}] WHERE BELGENO=@e`)).recordset;
+                    if (rows.length) { matches[t] = rows; usedEvrak = ev; }
+                } catch { /* kolon tipi uyuşmazlığı vb. yok say */ }
+            }
+            if (Object.keys(matches).length) break;
+        }
+
+        res.json({
+            success: true, prefix, tableCount: tables.length, tables,
+            belgeTableCols, usedEvrak, evrakCandidates, matches,
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 // Tek cariye PDF ekstre gönder (manuel). Anti-ban kapısı + WA doğrulama uygulanır.
 app.post('/api/extre/send', async (req, res) => {
     if (!requireDb(req, res)) return;
