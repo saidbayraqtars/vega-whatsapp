@@ -1306,6 +1306,24 @@ app.get('/api/extre/_izahat', async (req, res) => {
     const tbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
     if (!(await validateTableName(tbl))) return res.status(404).json({ success: false, message: 'Cari hareket tablosu yok.' });
     try {
+        // &evrak=<no> → o evrakın TAM işlem kodu + hangi kaynak başlık tablosunda (havale tespiti).
+        if (req.query.evrak) {
+            const ev = String(req.query.evrak);
+            const r = pool.request(); r.input('e', sql.NVarChar, ev);
+            const rows = (await r.query(`
+                SELECT IND, TARIH, IZAHAT, EVRAKNO, FIRMANO,
+                       CAST(ISNULL(BORC,0) AS DECIMAL(18,2)) AS BORC,
+                       CAST(ISNULL(ALACAK,0) AS DECIMAL(18,2)) AS ALACAK
+                FROM [${tbl}] WHERE EVRAKNO=@e ORDER BY IND DESC`)).recordset;
+            const SRC = ['CARGIRBASLIK', 'CARCIKBASLIK', 'BANKTAHSILBASLIK', 'BANKGIRBASLIK', 'BANKHARBASLIK', 'BANKODEMEBASLIK', 'BANKGELIRBASLIK', 'EFTBASLIK', 'TAHSILBASLIK', 'SATFATBASLIK', 'ALFATBASLIK', 'STKCIKBASLIK'];
+            const inSource = {};
+            for (const s of SRC) {
+                const t = `F${firmaNo}D${donemNo}TBL${s}`;
+                if (!(await validateTableName(t))) continue;
+                try { const n = (await pool.request().input('e', sql.NVarChar, ev).query(`SELECT COUNT(*) AS c FROM [${t}] WHERE BELGENO=@e`)).recordset[0].c; if (n > 0) inSource[s] = n; } catch { /* yok say */ }
+            }
+            return res.json({ success: true, table: tbl, evrak: ev, rows, inSource });
+        }
         const dist = (await pool.request().query(`
             SELECT IZAHAT, COUNT(*) AS c,
                    SUM(CASE WHEN ISNULL(BORC,0)>0 THEN 1 ELSE 0 END) AS borc,
