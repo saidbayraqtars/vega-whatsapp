@@ -1205,45 +1205,44 @@ app.get('/api/extre/_diag', async (req, res) => {
         return res.status(400).json({ success: false, message: 'firmaNo/donemNo gerekli (sadece rakam).' });
     try {
         const prefix = `F${firmaNo}D${donemNo}TBL`;
-        // Belge KALEM (satır) tabloları: kolonlarında BELGENO + (STOKKODU|MALINCINSI|MIKTAR)
-        // olan tablolar. KASA/BANK/CAR ödeme hareketleri (stoksuz) dışlanır.
-        const allCols = (await pool.request().input('p', sql.NVarChar, prefix + '%').query(`
-            SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_NAME LIKE @p ORDER BY TABLE_NAME, ORDINAL_POSITION
-        `)).recordset;
-        const colsByTbl = {};
-        for (const r of allCols) (colsByTbl[r.TABLE_NAME] = colsByTbl[r.TABLE_NAME] || []).push(r.COLUMN_NAME);
-        const lineTables = Object.keys(colsByTbl).filter(t => {
-            const up = colsByTbl[t].map(c => c.toUpperCase());
-            return up.includes('BELGENO') && (up.includes('STOKKODU') || up.includes('MALINCINSI') || up.includes('MIKTAR'));
-        });
-        const lineTableCols = {};
-        for (const t of lineTables) lineTableCols[t] = colsByTbl[t];
+        const colsOf = async (tbl) => (await pool.request().input('t', sql.NVarChar, tbl)
+            .query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME=@t ORDER BY ORDINAL_POSITION`))
+            .recordset.map(c => c.COLUMN_NAME);
+        const exists = async (tbl) => (await pool.request().input('t', sql.NVarChar, tbl)
+            .query(`SELECT COUNT(*) c FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME=@t`)).recordset[0].c > 0;
 
-        // Örnek evrak yoksa: cari hareketten son dolu EVRAKNO'ları dene.
+        // 1) Cari hareket: kolonlar + örnek satırlar (EVRAKNO/IZAHAT/BELGE* bağ kolonlarını gör).
         const harTbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
-        let evrakCandidates = [];
-        if (!evrak && (await validateTableName(harTbl))) {
-            evrakCandidates = (await pool.request().query(
-                `SELECT TOP 25 EVRAKNO FROM [${harTbl}] WHERE EVRAKNO IS NOT NULL AND LTRIM(RTRIM(EVRAKNO))<>'' ORDER BY IND DESC`
-            )).recordset.map(r => r.EVRAKNO);
+        const cariHareket = { table: harTbl, columns: [], sample: [] };
+        if (await exists(harTbl)) {
+            cariHareket.columns = await colsOf(harTbl);
+            cariHareket.sample = (await pool.request().query(
+                `SELECT TOP 6 * FROM [${harTbl}] WHERE EVRAKNO IS NOT NULL AND LTRIM(RTRIM(EVRAKNO))<>'' ORDER BY IND DESC`
+            )).recordset;
         }
-        const tryEvraks = evrak ? [evrak] : evrakCandidates;
 
-        // Hangi kalem tablosu bu EVRAKNO'yu içeriyor + örnek satırlar (TOP 3).
-        const sampleMatches = [];
-        for (const ev of tryEvraks) {
-            for (const t of lineTables) {
-                try {
-                    const r = pool.request(); r.input('e', sql.NVarChar, String(ev));
-                    const rows = (await r.query(`SELECT TOP 3 * FROM [${t}] WHERE BELGENO=@e`)).recordset;
-                    if (rows.length) sampleMatches.push({ evrak: ev, table: t, rows });
-                } catch { /* tip uyuşmazlığı yok say */ }
+        // 2) Belge başlık + kalem tabloları: kolonlar (+ HAREKET için örnek satır).
+        const SUFFIXES = [
+            'SATFATBASLIK', 'SATFATHAREKET', 'SATVADFATBASLIK', 'SATVADFATHAREKET',
+            'PSATFATBASLIK', 'PSATFATHAREKET', 'SATIRSBASLIK', 'SATIRSHAREKET',
+            'STKCIKBASLIK', 'STKCIKHAREKET', 'ALFATBASLIK', 'ALFATHAREKET',
+        ];
+        const docTables = {};
+        for (const sfx of SUFFIXES) {
+            const tbl = prefix + sfx;
+            if (!(await exists(tbl))) continue;
+            const entry = { table: tbl, columns: await colsOf(tbl) };
+            // HAREKET (kalem) tabloları için örnek 2 satır — başlığa bağ kolonunu + stok kolonlarını görmek için.
+            if (sfx.endsWith('HAREKET')) {
+                try { entry.sample = (await pool.request().query(`SELECT TOP 2 * FROM [${tbl}] ORDER BY IND DESC`)).recordset; } catch { /* yok say */ }
+            } else {
+                // BASLIK: tek örnek satır (IND/BELGENO/FIRMANO bağ değerlerini görmek için).
+                try { entry.sampleBaslik = (await pool.request().query(`SELECT TOP 1 * FROM [${tbl}] ORDER BY IND DESC`)).recordset; } catch { /* yok say */ }
             }
-            if (sampleMatches.length >= 3) break; // birkaç örnek yeter
+            docTables[sfx] = entry;
         }
 
-        res.json({ success: true, prefix, lineTables, lineTableCols, triedEvraks: tryEvraks.slice(0, 25), sampleMatches });
+        res.json({ success: true, prefix, cariHareket, docTables });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
