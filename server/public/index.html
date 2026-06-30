@@ -73,6 +73,10 @@
                 <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
                 <span>Bakiye Hatırlatma</span>
             </button>
+            <button class="tab" id="tabExtre" data-view="viewExtre" data-title="Hesap Extresi">
+                <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h8M8 9h2"/></svg>
+                <span>Hesap Extresi</span>
+            </button>
         </nav>
 
         <div class="sb-foot">
@@ -293,6 +297,55 @@
                 </div>
             </div>
         </div>
+
+        <!-- ─── HESAP EXTRESİ ─── -->
+        <div class="wrap" id="viewExtre" style="display:none">
+            <!-- SOL: Bakiyeli cari listesi -->
+            <div class="card">
+                <h2>Hesap Extresi Gönder</h2>
+                <p class="sub">Firma/dönem seç, <b>Bakiyesi olanları listele</b>'ye bas. Her satırda <b>Extre Gönder</b> ile o cariye PDF hesap ekstresini tek tek gönder. Borçlu da alacaklı da listelenir.</p>
+
+                <div class="toolbar">
+                    <select id="ex_firma"></select>
+                    <select id="ex_donem"></select>
+                </div>
+                <div class="toolbar" style="margin-top:8px">
+                    <input type="text" id="ex_search" placeholder="Ünvan, kod veya telefon ile süz..." />
+                    <button class="btn sm" id="ex_load">Bakiyesi olanları listele</button>
+                </div>
+
+                <div class="tablewrap" style="margin-top:12px">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Ünvan</th>
+                                <th>Kod</th>
+                                <th>Telefon</th>
+                                <th class="c">Bakiye</th>
+                                <th class="c">İşlem</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ex_body">
+                            <tr><td colspan="5" class="muted" style="padding:18px">Firma/dönem seçip listeleyin.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="selbar">
+                    <span class="count" id="ex_info"></span>
+                </div>
+                <div class="err" id="ex_err"></div>
+            </div>
+
+            <!-- SAĞ: Canlı kayıt -->
+            <div class="panel">
+                <div class="card">
+                    <h2>Son Gönderilen Ekstreler</h2>
+                    <div class="muted" id="ex_status" style="font-size:13px; margin-bottom:8px">—</div>
+                    <div class="log" id="ex_log" style="max-height:520px"></div>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -409,6 +462,20 @@
             <button class="btn" id="rmpvClose">Kapat</button>
             <button class="btn primary" id="rmpvConfirm">Onayla ve gönder</button>
         </div>
+    </div>
+</div>
+
+<!-- ─── HESAP EXTRESİ ÖNİZLEME MODAL ─── -->
+<div id="exPreviewModal" class="overlay hidden">
+    <div class="modal" style="max-width:820px">
+        <h2>Ekstre Önizleme</h2>
+        <div class="muted" id="exPvMeta" style="font-size:13px; margin-bottom:8px"></div>
+        <div id="exPvBody" style="max-height:60vh; overflow:auto"></div>
+        <div class="actions">
+            <button class="btn" id="exPvClose">Kapat</button>
+            <button class="btn green" id="exPvSend">Extreyi Gönder</button>
+        </div>
+        <div class="err" id="exPvErr"></div>
     </div>
 </div>
 

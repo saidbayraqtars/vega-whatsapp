@@ -585,9 +585,10 @@ document.querySelectorAll('.tab').forEach(t => {
         document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
         t.classList.add('active');
         const v = t.dataset.view;
-        ['viewBulk', 'viewWatcher', 'viewReminders'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
+        ['viewBulk', 'viewWatcher', 'viewReminders', 'viewExtre'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
         if (v === 'viewWatcher') initWatcherView();
         if (v === 'viewReminders' && typeof initRemindersView === 'function') initRemindersView();
+        if (v === 'viewExtre' && typeof initExtreView === 'function') initExtreView();
     };
 });
 
@@ -1431,6 +1432,162 @@ document.querySelectorAll('.tab').forEach(t => {
         if (el) el.textContent = t.dataset.title || t.textContent.trim();
     });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Hesap Extresi (manuel, tek tek PDF gönderim)
+// ═══════════════════════════════════════════════════════════════════════════
+let exLoaded = false;
+let exRows = [];
+let exPv = null; // önizlemedeki cari (satır objesi)
+
+const exFmt = (n) => (Number(n) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const exDate = (d) => { if (!d) return ''; const x = new Date(d); return isNaN(x.getTime()) ? String(d) : x.toLocaleDateString('tr-TR'); };
+
+async function initExtreView() {
+    if (!exLoaded) {
+        const fr = await api('/firmalar');
+        const sel = $('ex_firma');
+        sel.innerHTML = '';
+        if (fr.success) fr.data.forEach(f => {
+            const o = document.createElement('option');
+            o.value = f.FIRMANO; o.textContent = `${f.FIRMANO} — ${f.FIRMAADI}`;
+            sel.appendChild(o);
+        });
+        sel.onchange = () => loadExtreDonemler();
+        $('ex_load').onclick = loadExtreList;
+        $('ex_search').onkeydown = (e) => { if (e.key === 'Enter') loadExtreList(); };
+        $('exPvClose').onclick = () => $('exPreviewModal').classList.add('hidden');
+        $('exPvSend').onclick = sendExtreFromPreview;
+        exLoaded = true;
+    }
+    const ctx = localContext();
+    if (state.firmaNo) $('ex_firma').value = state.firmaNo;
+    else if (ctx.firmaNo) $('ex_firma').value = ctx.firmaNo;
+    await loadExtreDonemler(state.donemNo || ctx.donemNo);
+    exStatus();
+}
+
+async function loadExtreDonemler(selectDonem) {
+    const firmaNo = $('ex_firma').value;
+    const sel = $('ex_donem');
+    sel.innerHTML = '<option>...</option>';
+    const r = await api(`/donemler?firmaNo=${firmaNo}`);
+    sel.innerHTML = '';
+    if (r.success && r.data.length) {
+        r.data.forEach(d => {
+            const o = document.createElement('option');
+            o.value = d.donemNo;
+            o.textContent = d.donem ? `${d.donemNo} — ${d.donem}` : d.donemNo;
+            sel.appendChild(o);
+        });
+        sel.value = selectDonem || r.data[r.data.length - 1].donemNo;
+    } else {
+        sel.innerHTML = '<option value="">dönem yok</option>';
+    }
+}
+
+function exStatus(msg) {
+    const el = $('ex_status'); if (!el) return;
+    el.textContent = msg || (state.waReady ? 'Hazır.' : 'WhatsApp bağlı değil — gönderim için QR okutun.');
+}
+
+async function loadExtreList() {
+    const firmaNo = $('ex_firma').value, donemNo = $('ex_donem').value;
+    $('ex_err').textContent = '';
+    if (!firmaNo || !donemNo) { $('ex_err').textContent = 'Firma ve dönem seçin.'; return; }
+    const body = $('ex_body');
+    body.innerHTML = `<tr><td colspan="5" class="muted" style="padding:18px">Yükleniyor...</td></tr>`;
+    const search = $('ex_search').value.trim();
+    const r = await api(`/extre/list?firmaNo=${firmaNo}&donemNo=${donemNo}${search ? `&search=${encodeURIComponent(search)}` : ''}`);
+    if (!r.success) { body.innerHTML = ''; $('ex_err').textContent = r.message || 'Listelenemedi.'; return; }
+    exRows = r.data || [];
+    renderExtreList();
+}
+
+function renderExtreList() {
+    const body = $('ex_body');
+    if (!exRows.length) { body.innerHTML = `<tr><td colspan="5" class="muted" style="padding:18px">Bakiyesi olan cari bulunamadı.</td></tr>`; $('ex_info').textContent = ''; return; }
+    body.innerHTML = '';
+    for (const row of exRows) {
+        const tr = document.createElement('tr');
+        const bal = `<span class="bakiye ${row.bakiye > 0 ? 'borc' : (row.bakiye < 0 ? 'alacak' : '')}">${exFmt(row.bakiye)} ₺</span>`;
+        tr.innerHTML = `
+            <td>${esc(row.name)}${row.smsGonder ? ' <span class="smsbadge">SMS</span>' : ''}</td>
+            <td class="muted">${esc(row.kod)}</td>
+            <td>${row.phone ? `${esc(row.phone)}${row.valid ? '' : ' <span class="nophone">?</span>'}` : '<span class="nophone">telefon yok</span>'}</td>
+            <td class="c">${bal}</td>
+            <td class="c"></td>
+        `;
+        const cell = tr.lastElementChild;
+        const btn = document.createElement('button');
+        btn.className = 'btn green xs';
+        btn.textContent = 'Extre Gönder';
+        btn.disabled = !row.phone || !row.valid;
+        btn.title = btn.disabled ? 'Geçerli telefon yok' : 'Önizle ve gönder';
+        btn.onclick = () => openExtrePreview(row);
+        cell.appendChild(btn);
+        body.appendChild(tr);
+    }
+    $('ex_info').textContent = `${exRows.length} cari listelendi`;
+}
+
+async function openExtrePreview(row) {
+    exPv = row;
+    const firmaNo = $('ex_firma').value, donemNo = $('ex_donem').value;
+    $('exPvErr').textContent = '';
+    $('exPvMeta').textContent = 'Yükleniyor...';
+    $('exPvBody').innerHTML = '';
+    $('exPreviewModal').classList.remove('hidden');
+    const r = await api(`/extre/preview?firmaNo=${firmaNo}&donemNo=${donemNo}&ind=${row.ind}`);
+    if (!r.success) { $('exPvMeta').textContent = ''; $('exPvErr').textContent = r.message || 'Önizleme alınamadı.'; return; }
+    $('exPvMeta').innerHTML = `<b>${esc(row.name)}</b> · Kod: ${esc(row.kod)} · Tel: ${esc(row.phone || '—')} · Bakiye: <b>${exFmt(r.net)} ₺</b> (${esc(r.durum)})`;
+    const rows = r.rows || [];
+    const trs = rows.map(x => `
+        <tr>
+            <td>${exDate(x.tarih)}</td>
+            <td>${esc(x.evrak)}</td>
+            <td>${esc(x.izahat)}</td>
+            <td class="c">${Number(x.borc) ? exFmt(x.borc) : ''}</td>
+            <td class="c">${Number(x.alacak) ? exFmt(x.alacak) : ''}</td>
+            <td class="c">${exFmt(x.bakiye)}</td>
+        </tr>`).join('');
+    $('exPvBody').innerHTML = `
+        <div class="tablewrap">
+            <table>
+                <thead><tr><th>Tarih</th><th>Evrak</th><th>Açıklama</th><th class="c">Borç</th><th class="c">Alacak</th><th class="c">Bakiye</th></tr></thead>
+                <tbody>${trs || `<tr><td colspan="6" class="muted" style="padding:14px">Bu dönemde hareket yok.</td></tr>`}</tbody>
+            </table>
+        </div>`;
+}
+
+async function sendExtreFromPreview() {
+    if (!exPv) return;
+    const firmaNo = $('ex_firma').value, donemNo = $('ex_donem').value;
+    const btn = $('exPvSend');
+    $('exPvErr').textContent = '';
+    btn.disabled = true; btn.textContent = 'Gönderiliyor...';
+    try {
+        const r = await api('/extre/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ firmaNo, donemNo, ind: exPv.ind }) });
+        if (r.success) {
+            exLog(`✓ ${exPv.name} (${exPv.phone}) — ekstre gönderildi`);
+            $('exPreviewModal').classList.add('hidden');
+        } else {
+            $('exPvErr').textContent = r.message || 'Gönderilemedi.';
+            exLog(`✗ ${exPv.name} — ${r.message || 'hata'}`);
+        }
+    } catch (e) {
+        $('exPvErr').textContent = 'Hata: ' + e.message;
+    }
+    btn.disabled = false; btn.textContent = 'Extreyi Gönder';
+}
+
+function exLog(line) {
+    const box = $('ex_log'); if (!box) return;
+    const div = document.createElement('div');
+    div.style.cssText = 'padding:6px 8px; border-bottom:1px solid var(--border); font-size:13px';
+    div.textContent = `${new Date().toLocaleTimeString('tr-TR')}  ${line}`;
+    box.prepend(div);
+}
 
 // ─── yardımcı ───
 function esc(s) {

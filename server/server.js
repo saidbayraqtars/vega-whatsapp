@@ -36,6 +36,7 @@ const reminders = require('./reminders');
 const activeCari = require('./activeCari');
 const license = require('./license');
 const antiban = require('./antiban');
+const { buildExtrePdf } = require('./extre');
 
 const QRCode = require('qrcode');
 
@@ -1053,6 +1054,156 @@ app.post('/api/active-cari/send', async (req, res) => {
         }
         const result = await waSend(c.phone, text, null, { simulateTyping: true, typingMs: 1500 });
         if (result.success) { antiban.recordSent(waStatus().me); return res.json({ success: true, message: 'Gönderildi.', phone: c.phone, name: c.name }); }
+        res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  HESAP EKSTRESİ (manuel, tek tek PDF gönderim)
+//  Vega'nın .fr3 tasarımı Node'da basılamaz → ekstre PDF'i CARIHAREKETLERI'nden
+//  üretilir (server/extre.js). Akış: bakiyeli carileri listele → tek tek "Gönder".
+//  Alacaklı (net<0) ENGELİ YOK — ekstre bilgi amaçlı, iki yön de gönderilir.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Firma kısa adı (TBLFIRMA.KISAAD). firmaNo "0101" → IND 101. PDF başlığı için.
+async function fetchFirmaName(firmaNo) {
+    try {
+        const ind = parseInt(firmaNo, 10);
+        if (!pool || !pool.connected || !Number.isFinite(ind)) return null;
+        const r = await pool.request().query(`SELECT KISAAD FROM TBLFIRMA WHERE IND=${ind}`);
+        return (r.recordset[0] && r.recordset[0].KISAAD) || null;
+    } catch { return null; }
+}
+
+// Carinin dönem hareket satırları + yürüyen bakiye. IZAHAT/EVRAKNO sürüme göre
+// değişebilir → INFORMATION_SCHEMA ile mevcut kolonlar tespit edilir.
+async function fetchHareketRows(firmaNo, donemNo, ind) {
+    const indNum = parseInt(ind, 10);
+    if (!pool || !pool.connected || !/^\d+$/.test(String(firmaNo)) || !/^\d+$/.test(String(donemNo)) || !Number.isFinite(indNum)) return { rows: [], net: 0 };
+    const tbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
+    if (!(await validateTableName(tbl))) return { rows: [], net: 0 };
+    const colRs = (await pool.request().input('t', sql.NVarChar, tbl)
+        .query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME=@t`)).recordset;
+    const have = new Set(colRs.map(c => c.COLUMN_NAME.toUpperCase()));
+    const tarihCol = have.has('TARIH') ? 'TARIH' : null;
+    const evrakCol = have.has('EVRAKNO') ? 'EVRAKNO' : null;
+    const izahatCol = have.has('IZAHAT') ? 'IZAHAT' : (have.has('ACIKLAMA') ? 'ACIKLAMA' : null);
+    const sel = [
+        tarihCol ? `${tarihCol} AS TARIH` : `CAST(NULL AS DATETIME) AS TARIH`,
+        evrakCol ? `${evrakCol} AS EVRAKNO` : `CAST('' AS NVARCHAR(1)) AS EVRAKNO`,
+        izahatCol ? `${izahatCol} AS IZAHAT` : `CAST('' AS NVARCHAR(1)) AS IZAHAT`,
+        `CAST(ISNULL(BORC,0) AS DECIMAL(18,2)) AS BORC`,
+        `CAST(ISNULL(ALACAK,0) AS DECIMAL(18,2)) AS ALACAK`,
+    ].join(', ');
+    const order = (tarihCol ? `${tarihCol} ASC, ` : '') + 'IND ASC';
+    const recs = (await pool.request().query(`SELECT ${sel} FROM [${tbl}] WHERE FIRMANO=${indNum} ORDER BY ${order}`)).recordset;
+    let run = 0; const rows = [];
+    for (const r of recs) {
+        run += Number(r.BORC) - Number(r.ALACAK);
+        rows.push({ tarih: r.TARIH, evrak: r.EVRAKNO, izahat: r.IZAHAT, borc: Number(r.BORC), alacak: Number(r.ALACAK), bakiye: run });
+    }
+    return { rows, net: run };
+}
+
+// Dönemde bakiyesi (net) sıfır OLMAYAN carileri listele (borçlu + alacaklı).
+app.get('/api/extre/list', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    const { firmaNo, donemNo } = req.query;
+    const search = (req.query.search || '').trim();
+    if (!firmaNo || !donemNo || !/^\d+$/.test(firmaNo) || !/^\d+$/.test(donemNo))
+        return res.status(400).json({ success: false, message: 'Geçerli firma/dönem gerekli.' });
+    try {
+        const tbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
+        if (!(await validateTableName(tbl)))
+            return res.status(404).json({ success: false, message: 'Cari hareket tablosu bulunamadı.' });
+        const netRows = (await pool.request().query(`
+            SELECT FIRMANO, CAST(SUM(BORC) - SUM(ALACAK) AS DECIMAL(18,2)) AS NET
+            FROM [${tbl}] GROUP BY FIRMANO HAVING SUM(BORC) - SUM(ALACAK) <> 0
+        `)).recordset;
+        const netMap = new Map(netRows.map(r => [r.FIRMANO, Number(r.NET)]));
+        let ids = [...netMap.keys()];
+        // Pasif (STATUS=2) / silinmiş carileri süz.
+        const active = await activeCariInds(firmaNo, ids);
+        ids = ids.filter(i => active.has(i));
+        const contacts = await resolveCariContacts(firmaNo, ids);
+        let data = ids.map(ind => {
+            const c = contacts.get(ind) || {};
+            const net = netMap.get(ind);
+            return {
+                ind, name: c.name || String(ind), kod: c.kod || '', firma: c.firma || c.name || '',
+                phone: c.phone || null, valid: !!c.valid, smsGonder: !!c.smsGonder,
+                bakiye: net, durum: net > 0 ? 'Borç' : net < 0 ? 'Alacak' : '',
+            };
+        });
+        if (search) {
+            const s = search.toLocaleLowerCase('tr');
+            data = data.filter(d =>
+                (d.name || '').toLocaleLowerCase('tr').includes(s) ||
+                String(d.kod || '').toLocaleLowerCase('tr').includes(s) ||
+                String(d.phone || '').includes(search));
+        }
+        data.sort((a, b) => Math.abs(b.bakiye) - Math.abs(a.bakiye));
+        res.json({ success: true, data, total: data.length });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Tek carinin ekstre satırları (göndermeden önce ekranda göster).
+app.get('/api/extre/preview', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    const { firmaNo, donemNo, ind } = req.query;
+    if (!firmaNo || !donemNo || !ind) return res.status(400).json({ success: false, message: 'firma/dönem/cari gerekli.' });
+    try {
+        const indNum = parseInt(ind, 10);
+        const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum);
+        const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum) || {};
+        res.json({
+            success: true,
+            cari: { name: c.name || String(indNum), kod: c.kod || '', firma: c.firma || c.name || '', phone: c.phone || null, valid: !!c.valid, pasif: !!c.pasif },
+            net, durum: net > 0 ? 'Borç' : net < 0 ? 'Alacak' : '', rows,
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Tek cariye PDF ekstre gönder (manuel). Anti-ban kapısı + WA doğrulama uygulanır.
+app.post('/api/extre/send', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    const firmaNo = req.body && req.body.firmaNo;
+    const donemNo = req.body && req.body.donemNo;
+    const indNum = parseInt(req.body && req.body.ind, 10);
+    if (!firmaNo || !donemNo || !Number.isFinite(indNum))
+        return res.status(400).json({ success: false, message: 'firma/dönem/cari gerekli.' });
+    if (!waStatus().ready) return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil. Önce QR okutun.' });
+    const me = waStatus().me;
+    const g = antiban.gate(me, DEFAULT_PACING.dailyCap);
+    if (!g.ok) return res.status(429).json({ success: false, message: g.reason || 'Anti-ban: gönderim sınırına ulaşıldı.' });
+    try {
+        const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum);
+        if (!c) return res.status(404).json({ success: false, message: 'Cari bulunamadı.' });
+        if (c.pasif) return res.status(400).json({ success: false, message: 'Cari pasif (STATUS=2) — gönderilmez.' });
+        if (!c.phone || !c.valid) return res.status(400).json({ success: false, message: 'Carinin geçerli telefonu yok.' });
+
+        const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum);
+        const firmaName = await fetchFirmaName(firmaNo);
+        const pdf = await buildExtrePdf({
+            firmaName: firmaName || '', cariName: c.name, cariKod: c.kod,
+            donem: donemNo, rows, net, generatedAt: new Date(),
+        });
+
+        const chk = await checkOnWhatsApp(c.phone);
+        if (!chk.exists) return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
+
+        const caption = (req.body && req.body.message && String(req.body.message).trim())
+            ? String(req.body.message)
+            : `Sayın ${c.firma || c.name}, hesap ekstreniz ektedir.`;
+        const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
+        const result = await waSend(c.phone, caption, { kind: 'document', buffer: pdf, mimetype: 'application/pdf', fileName }, { simulateTyping: true, typingMs: 1200 });
+        if (result.success) { antiban.recordSent(me); return res.json({ success: true, message: 'Ekstre gönderildi.', phone: c.phone, name: c.name }); }
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
