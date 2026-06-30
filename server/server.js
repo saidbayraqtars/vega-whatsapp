@@ -1170,6 +1170,29 @@ app.get('/api/extre/preview', async (req, res) => {
     }
 });
 
+// Gönderilecek PDF'in BİREBİR kendisi (önizleme). /send ile aynı üretici → ne
+// görünüyorsa o gider. Tarayıcı/Electron Chromium PDF'i iframe'de gösterir.
+app.get('/api/extre/pdf', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    const { firmaNo, donemNo, ind } = req.query;
+    if (!firmaNo || !donemNo || !ind) return res.status(400).json({ success: false, message: 'firma/dönem/cari gerekli.' });
+    try {
+        const indNum = parseInt(ind, 10);
+        const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum) || {};
+        const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum);
+        const firmaName = await fetchFirmaName(firmaNo);
+        const pdf = await buildExtrePdf({
+            firmaName: firmaName || '', cariName: c.name || String(indNum), cariKod: c.kod || '',
+            donem: donemNo, rows, net, generatedAt: new Date(),
+        });
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `inline; filename="ekstre-${indNum}.pdf"`);
+        res.send(pdf);
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 // Tek cariye PDF ekstre gönder (manuel). Anti-ban kapısı + WA doğrulama uygulanır.
 app.post('/api/extre/send', async (req, res) => {
     if (!requireDb(req, res)) return;

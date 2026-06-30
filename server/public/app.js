@@ -1539,33 +1539,15 @@ function renderExtreList() {
     $('ex_info').textContent = `${exRows.length} cari listelendi`;
 }
 
-async function openExtrePreview(row) {
+// Önizleme = gönderilecek PDF'in birebir kendisi (iframe'de Chromium PDF görüntüleyici).
+function openExtrePreview(row) {
     exPv = row;
     const firmaNo = $('ex_firma').value, donemNo = $('ex_donem').value;
     $('exPvErr').textContent = '';
-    $('exPvMeta').textContent = 'Yükleniyor...';
-    $('exPvBody').innerHTML = '';
+    $('exPvMeta').innerHTML = `<b>${esc(row.name)}</b> · Kod: ${esc(row.kod)} · Tel: ${esc(row.phone || '—')} · Bakiye: <b>${exFmt(row.bakiye)} ₺</b> (${esc(row.durum)})`;
+    const src = `/api/extre/pdf?firmaNo=${firmaNo}&donemNo=${donemNo}&ind=${row.ind}&t=${Date.now()}`;
+    $('exPvBody').innerHTML = `<iframe title="Ekstre PDF" src="${src}" style="width:100%; height:62vh; border:1px solid var(--border); border-radius:8px; background:#fff"></iframe>`;
     $('exPreviewModal').classList.remove('hidden');
-    const r = await api(`/extre/preview?firmaNo=${firmaNo}&donemNo=${donemNo}&ind=${row.ind}`);
-    if (!r.success) { $('exPvMeta').textContent = ''; $('exPvErr').textContent = r.message || 'Önizleme alınamadı.'; return; }
-    $('exPvMeta').innerHTML = `<b>${esc(row.name)}</b> · Kod: ${esc(row.kod)} · Tel: ${esc(row.phone || '—')} · Bakiye: <b>${exFmt(r.net)} ₺</b> (${esc(r.durum)})`;
-    const rows = r.rows || [];
-    const trs = rows.map(x => `
-        <tr>
-            <td>${exDate(x.tarih)}</td>
-            <td>${esc(x.evrak)}</td>
-            <td>${esc(x.izahat)}</td>
-            <td class="c">${Number(x.borc) ? exFmt(x.borc) : ''}</td>
-            <td class="c">${Number(x.alacak) ? exFmt(x.alacak) : ''}</td>
-            <td class="c">${exFmt(x.bakiye)}</td>
-        </tr>`).join('');
-    $('exPvBody').innerHTML = `
-        <div class="tablewrap">
-            <table>
-                <thead><tr><th>Tarih</th><th>Evrak</th><th>Açıklama</th><th class="c">Borç</th><th class="c">Alacak</th><th class="c">Bakiye</th></tr></thead>
-                <tbody>${trs || `<tr><td colspan="6" class="muted" style="padding:14px">Bu dönemde hareket yok.</td></tr>`}</tbody>
-            </table>
-        </div>`;
 }
 
 async function doExtreSend(ind) {
