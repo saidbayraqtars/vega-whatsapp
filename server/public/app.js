@@ -706,6 +706,7 @@ async function loadWatcherConfig() {
     $('wc_typing').checked = s.simulateTyping !== false;
     $('wc_allPhones').checked = s.sendAllPhones === true;
     $('wc_onlySms').checked = s.onlySmsGonder === true;
+    $('wc_sendAlacakli').checked = s.sendAlacakli !== false;
     $('wc_cariType').value = s.cariType || 'hepsi';
     $('wc_watchEdits').checked = s.watchEdits === true;
     $('wc_watchDeletes').checked = s.watchDeletes === true;
@@ -886,6 +887,7 @@ function collectWatcherConfig() {
         simulateTyping: $('wc_typing').checked,
         sendAllPhones: $('wc_allPhones').checked,
         onlySmsGonder: $('wc_onlySms').checked,
+        sendAlacakli: $('wc_sendAlacakli').checked,
         cariType: $('wc_cariType').value || 'hepsi',
         watchEdits: $('wc_watchEdits').checked,
         watchDeletes: $('wc_watchDeletes').checked,

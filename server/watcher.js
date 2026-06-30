@@ -114,6 +114,9 @@ const DEFAULT_CONFIG = {
     onlySmsGonder: false,
     // Cari tipi hedefleme (FIRMATIPI): hepsi | alici | satici | diger.
     cariType: 'hepsi',
+    // Alacaklı carilere de gönder (biz borçluyken, net bakiye < 0). VARSAYILAN AÇIK
+    // (kullanıcı talebi). Kapatılırsa eski "KESİN KURAL" döner: alacaklıya gönderme.
+    sendAlacakli: true,
     // ── Belge düzenleme / silme izleme (mesaj atılmış belgeler için) ──
     // watchEdits: belgenin tutarı sonradan değişince "düzenlendi" mesajı gönder.
     // watchDeletes: belge DB'den silinince gönderilen WhatsApp mesajını geri çek.
@@ -711,7 +714,7 @@ async function handleEdited(pool, tbl, key, e, curAmount) {
 
     // Guard'lar (insert yoluyla birebir aynı): pasif / alacaklı / tip / sms / telefon.
     if (c.pasif) { pushLog({ ...base, status: 'pasif', error: 'Cari pasif — düzenleme mesajı atlandı' }); return; }
-    if (kalanBorc != null && kalanBorc < 0) { pushLog({ ...base, status: 'alacakli', error: 'Cari alacaklı (biz borçluyuz) — düzenleme mesajı atlandı' }); return; }
+    if (config.sendAlacakli === false && kalanBorc != null && kalanBorc < 0) { pushLog({ ...base, status: 'alacakli', error: 'Cari alacaklı — "alacaklılara da gönder" kapalı, düzenleme atlandı' }); return; }
     if (!cariTipMatches(config.cariType, c.tip)) { pushLog({ ...base, status: 'wrongType', error: `Cari tipi filtre dışı (${c.tip || 'bilinmiyor'})` }); return; }
     if (config.onlySmsGonder && !c.smsGonder) { pushLog({ ...base, status: 'noSmsConsent', error: 'SMS Gönder izni yok' }); return; }
     if (!c.phone || !c.valid) { pushLog({ ...base, status: 'noPhone', error: 'Geçerli telefon yok' }); return; }
@@ -866,11 +869,11 @@ async function pollOnce() {
             if (c.pasif) {
                 skipped++; pushLog({ ...base, status: 'pasif', error: 'Cari pasif (STATUS=2)' }); continue;
             }
-            // KESİN KURAL: biz müşteriye borçluysak (net bakiye Alacak yönünde, < 0) HİÇ gönderme.
-            // Tahsilat/bakiye mesajı "müşteri bize borçlu" izlenimi verir; alacaklı cariye yanlıştır.
-            // (reminders.js zaten net>0 borçluları hedefler; watcher belge-tipi yolunda bu guard eksikti.)
-            if (kalanBorc != null && kalanBorc < 0) {
-                skipped++; pushLog({ ...base, status: 'alacakli', error: 'Cari alacaklı (biz borçluyuz) — gönderilmez' }); continue;
+            // Alacaklı cari (net bakiye < 0 = biz borçluyuz). VARSAYILAN: gönder.
+            // sendAlacakli=false ise eski KESİN KURAL döner (atla): tahsilat/bakiye mesajı
+            // "müşteri bize borçlu" izlenimi verir, kullanıcı kapatabilir.
+            if (config.sendAlacakli === false && kalanBorc != null && kalanBorc < 0) {
+                skipped++; pushLog({ ...base, status: 'alacakli', error: 'Cari alacaklı — "alacaklılara da gönder" kapalı, atlandı' }); continue;
             }
             if (!cariTipMatches(config.cariType, c.tip)) {
                 skipped++; pushLog({ ...base, status: 'wrongType', error: `Cari tipi filtre dışı (${c.tip || 'bilinmiyor'})` }); continue;
@@ -978,7 +981,7 @@ function getStatus() {
         table: tableName(), intervalSec: config.intervalSec,
         verifyOnWhatsApp: config.verifyOnWhatsApp, simulateTyping: config.simulateTyping,
         sendAllPhones: config.sendAllPhones === true, onlySmsGonder: config.onlySmsGonder === true,
-        cariType: config.cariType || 'hepsi',
+        cariType: config.cariType || 'hepsi', sendAlacakli: config.sendAlacakli !== false,
         watchEdits: config.watchEdits === true, watchDeletes: config.watchDeletes === true,
         editScanSec: config.editScanSec || 60, editTemplate: config.editTemplate || DEFAULT_CONFIG.editTemplate,
         docsCount: Object.values(docs).reduce((n, b) => n + Object.keys(b).length, 0),
