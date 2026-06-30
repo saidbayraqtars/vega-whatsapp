@@ -1346,6 +1346,32 @@ app.get('/api/extre/_izahat', async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+// ── GEÇİCİ TEŞHİS: havale/banka tahsilat satırını yakala (PARAMSIZ).
+// Firma/dönem watcher config'ten alınır. Arctos'ta havale girişi yapıp şu URL'i aç:
+//   http://localhost:3100/api/extre/_havale
+// En yeni satır en üstte gelir → FIRMANO(cari bağı), TUTAR, BELGENO, IZAHAT, IND.
+app.get('/api/extre/_havale', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    let firmaNo = req.query.firmaNo, donemNo = req.query.donemNo;
+    if (!firmaNo || !donemNo) {
+        try { const c = watcher.getConfig(); firmaNo = firmaNo || c.firmaNo; donemNo = donemNo || c.donemNo; } catch { /* yok say */ }
+    }
+    if (!/^\d+$/.test(String(firmaNo || '')) || !/^\d+$/.test(String(donemNo || '')))
+        return res.status(400).json({ success: false, message: 'firmaNo/donemNo bulunamadı (watcher config boş). ?firmaNo=..&donemNo=.. ekle.' });
+    try {
+        // Tüm banka/cari tahsilat HAREKET tablolarından son satırlar (IND DESC).
+        const HAR = ['BANKGIRHAREKET', 'BANKTAHSILHAREKET', 'BANKHARHAREKET', 'BANKGELIRHAREKET', 'EFTHAREKET', 'CARGIRHAREKET', 'CARCIKHAREKET'];
+        const out = {};
+        for (const h of HAR) {
+            const t = `F${firmaNo}D${donemNo}TBL${h}`;
+            if (!(await validateTableName(t))) continue;
+            try { out[h] = (await pool.request().query(`SELECT TOP 8 * FROM [${t}] ORDER BY IND DESC`)).recordset; }
+            catch (e) { out[h] = { error: e.message }; }
+        }
+        res.json({ success: true, firmaNo, donemNo, hareketRows: out });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  LİSANS (çevrimiçi lisans altyapısı — scaffold, şu an kısıtlamaz)
 // ═══════════════════════════════════════════════════════════════════════════
