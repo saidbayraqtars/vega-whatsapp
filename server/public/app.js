@@ -1519,12 +1519,20 @@ function renderExtreList() {
             <td class="c"></td>
         `;
         const cell = tr.lastElementChild;
+        cell.style.whiteSpace = 'nowrap';
+        const pv = document.createElement('button');
+        pv.className = 'btn ghost xs';
+        pv.textContent = 'Önizle';
+        pv.title = 'Ekstreyi göndermeden gör';
+        pv.onclick = () => openExtrePreview(row);
         const btn = document.createElement('button');
         btn.className = 'btn green xs';
+        btn.style.marginLeft = '6px';
         btn.textContent = 'Extre Gönder';
         btn.disabled = !row.phone || !row.valid;
-        btn.title = btn.disabled ? 'Geçerli telefon yok' : 'Önizle ve gönder';
-        btn.onclick = () => openExtrePreview(row);
+        btn.title = btn.disabled ? 'Geçerli telefon yok' : 'PDF ekstreyi gönder';
+        btn.onclick = () => sendExtreRow(row, btn);
+        cell.appendChild(pv);
         cell.appendChild(btn);
         body.appendChild(tr);
     }
@@ -1560,14 +1568,34 @@ async function openExtrePreview(row) {
         </div>`;
 }
 
+async function doExtreSend(ind) {
+    const firmaNo = $('ex_firma').value, donemNo = $('ex_donem').value;
+    return api('/extre/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ firmaNo, donemNo, ind }) });
+}
+
+// Satırdaki "Extre Gönder" — önizleme olmadan doğrudan gönder (confirm ile).
+async function sendExtreRow(row, btn) {
+    if (!row.phone || !row.valid) return;
+    if (!confirm(`${row.name} carisine PDF hesap ekstresi gönderilsin mi?`)) return;
+    const old = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Gönderiliyor...';
+    try {
+        const r = await doExtreSend(row.ind);
+        exLog(r.success ? `✓ ${row.name} (${row.phone}) — ekstre gönderildi` : `✗ ${row.name} — ${r.message || 'hata'}`);
+    } catch (e) {
+        exLog(`✗ ${row.name} — ${e.message}`);
+    }
+    btn.disabled = false; btn.textContent = old;
+}
+
+// Önizleme modalındaki "Extreyi Gönder".
 async function sendExtreFromPreview() {
     if (!exPv) return;
-    const firmaNo = $('ex_firma').value, donemNo = $('ex_donem').value;
     const btn = $('exPvSend');
     $('exPvErr').textContent = '';
     btn.disabled = true; btn.textContent = 'Gönderiliyor...';
     try {
-        const r = await api('/extre/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ firmaNo, donemNo, ind: exPv.ind }) });
+        const r = await doExtreSend(exPv.ind);
         if (r.success) {
             exLog(`✓ ${exPv.name} (${exPv.phone}) — ekstre gönderildi`);
             $('exPreviewModal').classList.add('hidden');
