@@ -779,7 +779,7 @@ app.get('/api/watcher', (req, res) => {
 });
 
 app.post('/api/watcher', (req, res) => {
-    const allowed = ['firmaNo', 'donemNo', 'intervalSec', 'verifyOnWhatsApp', 'simulateTyping', 'sendAllPhones', 'onlySmsGonder', 'cariType', 'rules', 'watchEdits', 'watchDeletes', 'editScanSec', 'editTemplate'];
+    const allowed = ['firmaNo', 'donemNo', 'intervalSec', 'verifyOnWhatsApp', 'simulateTyping', 'sendAllPhones', 'onlySmsGonder', 'sendAlacakli', 'cariType', 'rules', 'watchEdits', 'watchDeletes', 'editScanSec', 'editTemplate'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
     const prev = watcher.getConfig();
