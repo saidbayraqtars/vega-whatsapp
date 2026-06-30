@@ -84,9 +84,10 @@ function buildExtrePdf(data = {}) {
             y = drawHeader(y);
 
             // ─── Satırlar (+ belge içeriği = kalemler) ───
-            const ROW_H = 16, KALEM_H = 11;
+            const ROW_H = 16;
             const adX = COLS[2].x + 8;          // kalem girintisi (Açıklama sütunu altı)
             const sumX = COLS[3].x;             // kalem "miktar×fiyat=tutar" sağ blok başlangıcı
+            const nameW = sumX - adX - 8;       // kalem adı genişliği (Borç sütununa kadar)
             for (const r of rows) {
                 if (y + ROW_H > PAGE_BOTTOM) { doc.addPage(); y = 40; y = drawHeader(y); }
                 doc.font(REG).fontSize(8.5);
@@ -104,15 +105,18 @@ function buildExtrePdf(data = {}) {
                 }
                 y += ROW_H;
 
-                // Belge içeriği: faturanın/fişin kalemleri (ürün, miktar × fiyat = tutar).
+                // Belge içeriği: kalemler (ürün — miktar × fiyat = tutar). Ad uzun olabilir →
+                // yükseklik heightOfString ile dinamik; sayı bloğu ilk satıra sabit (sarmaz).
                 if (Array.isArray(r.kalemler) && r.kalemler.length) {
+                    doc.font(REG).fontSize(7);
                     for (const k of r.kalemler) {
-                        if (y + KALEM_H > PAGE_BOTTOM) { doc.addPage(); y = 40; y = drawHeader(y); }
-                        doc.font(REG).fontSize(7);
+                        const nameTxt = `• ${k.ad}`;
                         const sumStr = `${fmtNum(k.miktar)} ${k.birim} × ${fmtTR(k.fiyat)} = ${fmtTR(k.tutar)}`;
-                        doc.fillColor('#555').text(`• ${k.ad}`, adX, y + 1.5, { width: sumX - adX - 4, align: 'left', lineBreak: false, ellipsis: true });
-                        doc.fillColor('#777').text(sumStr, sumX, y + 1.5, { width: X1 - sumX - 2, align: 'right', lineBreak: false, ellipsis: true });
-                        y += KALEM_H;
+                        const h = Math.max(10, doc.heightOfString(nameTxt, { width: nameW }));
+                        if (y + h > PAGE_BOTTOM) { doc.addPage(); y = 40; y = drawHeader(y); doc.font(REG).fontSize(7); }
+                        doc.fillColor('#666').text(nameTxt, adX, y + 1, { width: nameW });
+                        doc.fillColor('#888').text(sumStr, sumX, y + 1, { width: X1 - sumX - 2, align: 'right', lineBreak: false });
+                        y += h + 1;
                     }
                 }
                 doc.moveTo(X0, y).lineTo(X1, y).strokeColor('#eee').lineWidth(0.5).stroke();
