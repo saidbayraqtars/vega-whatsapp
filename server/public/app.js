@@ -580,12 +580,36 @@ function addLogRaw(text, cls) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  Sekmeler + Belge Tipi Mesajları (watcher, çok kurallı)
 // ═══════════════════════════════════════════════════════════════════════════
+// ─── GEÇİCİ: Hesap Extresi (beta) erişim kilidi ─────────────────────────────────
+// Diğer kullanıcılarda pasif; sekmeye tıklayınca şifre sorar. Doğru şifre cihazda
+// (localStorage) hatırlanır. İleride bu blok + tab handler'daki guard kaldırılıp
+// herkese açılacak. Şifre düz değil, SHA-256 hash'i gömülü.
+const EXTRE_PW_HASH = '66202fae8c01b9b5014aefe8175ff064e25c0209ab4d58ef174c4bf070e3663f';
+function extreUnlocked() { try { return localStorage.getItem('vega.extreUnlock') === '1'; } catch { return false; } }
+async function sha256hex(s) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function ensureExtreUnlocked() {
+    if (extreUnlocked()) return true;
+    const pw = prompt('Hesap Extresi (beta) erişim şifresi:');
+    if (pw == null) return false; // iptal
+    try {
+        if ((await sha256hex(pw)) === EXTRE_PW_HASH) { try { localStorage.setItem('vega.extreUnlock', '1'); } catch { /* yok say */ } return true; }
+    } catch { /* crypto.subtle yoksa */ }
+    alert('Şifre hatalı.');
+    return false;
+}
+
 document.querySelectorAll('.tab').forEach(t => {
-    t.onclick = () => {
+    t.onclick = async () => {
+        // Hesap Extresi kilitli: açılmadan sekme değişmesin.
+        if (t.dataset.view === 'viewExtre' && !(await ensureExtreUnlocked())) return;
         document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
         t.classList.add('active');
         const v = t.dataset.view;
         ['viewBulk', 'viewWatcher', 'viewReminders', 'viewExtre'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
+        const at = $('appbarTitle'); if (at) at.textContent = t.dataset.title || t.textContent.trim();
         if (v === 'viewWatcher') initWatcherView();
         if (v === 'viewReminders' && typeof initRemindersView === 'function') initRemindersView();
         if (v === 'viewExtre' && typeof initExtreView === 'function') initExtreView();
@@ -1428,6 +1452,7 @@ function applyTheme(t) {
 // ─── Üst başlık: aktif sekme adını yansıt (mevcut .tab onclick'i EZME — ek dinleyici) ───
 document.querySelectorAll('.tab').forEach(t => {
     t.addEventListener('click', () => {
+        if (t.dataset.view === 'viewExtre') return; // kilit sonrası ana handler ayarlar
         const el = $('appbarTitle');
         if (el) el.textContent = t.dataset.title || t.textContent.trim();
     });
