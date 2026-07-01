@@ -11,10 +11,16 @@ const PDFDocument = require('pdfkit');
 const path = require('path');
 const fs = require('fs');
 
+// Fontlar BUFFER olarak yüklenir. pkg/exe içinde fontkit'e dosya YOLU verilirse
+// (openSync) snapshot fs yolu çözümü kırılabilir; buffer verilince pdfkit
+// fontkit.create(buffer) ile bellekte parse eder — fs/path'e dokunmaz.
+// NOT: exe'de standart font (Helvetica) AFM'i bundle EDİLMEZ; TTF olmadan
+// buildExtrePdf standart fonta düşer ve AFM eksikliğinden patlar → TTF şart.
 const FONT_DIR = path.join(__dirname, 'assets');
-const FONT_REG = path.join(FONT_DIR, 'arial.ttf');
-const FONT_BOLD = path.join(FONT_DIR, 'arialbd.ttf');
-const HAS_FONTS = fs.existsSync(FONT_REG) && fs.existsSync(FONT_BOLD);
+const tryFontBuf = (name) => { try { return fs.readFileSync(path.join(FONT_DIR, name)); } catch { return null; } };
+const FONT_REG_BUF = tryFontBuf('arial.ttf');
+const FONT_BOLD_BUF = tryFontBuf('arialbd.ttf');
+const HAS_FONTS = !!(FONT_REG_BUF && FONT_BOLD_BUF);
 
 const fmtTR = (n) => (Number(n) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 // Miktar: tam sayıysa ondalıksız, değilse 3 haneye kadar.
@@ -48,16 +54,48 @@ function buildExtrePdf(data = {}) {
             doc.on('end', () => resolve(Buffer.concat(chunks)));
             doc.on('error', reject);
 
-            if (HAS_FONTS) { doc.registerFont('reg', FONT_REG); doc.registerFont('bold', FONT_BOLD); }
+            if (HAS_FONTS) { doc.registerFont('reg', FONT_REG_BUF); doc.registerFont('bold', FONT_BOLD_BUF); }
             const REG = HAS_FONTS ? 'reg' : 'Helvetica';
             const BOLD = HAS_FONTS ? 'bold' : 'Helvetica-Bold';
 
             const rows = Array.isArray(data.rows) ? data.rows : [];
+            const firma = data.firma || {};
 
-            // ─── Başlık ───
-            doc.font(BOLD).fontSize(16).fillColor('#111').text(data.firmaName || 'HESAP EKSTRESİ', X0, 40, { width: X1 - X0 });
-            doc.font(REG).fontSize(11).fillColor('#555').text('Hesap Ekstresi', X0, doc.y + 2);
-            doc.moveTo(X0, doc.y + 6).lineTo(X1, doc.y + 6).strokeColor('#ccc').lineWidth(1).stroke();
+            // ─── Marka başlık (logo + firma bilgileri) ───
+            // Logo varsa sol üstte; firma adı + iletişim/vergi/IBAN bilgileri yanında.
+            let logoW = 0;
+            const headTop = 38;
+            if (data.logo) {
+                try { doc.image(data.logo, X0, headTop, { fit: [120, 50] }); logoW = 132; }
+                catch { logoW = 0; }
+            }
+            const infoX = X0 + logoW;
+            const infoW = X1 - infoX;
+            doc.font(BOLD).fontSize(15).fillColor('#111')
+                .text(firma.name || data.firmaName || 'HESAP EKSTRESİ', infoX, headTop, { width: infoW });
+            doc.font(REG).fontSize(8.5).fillColor('#555');
+            const line2 = [firma.address].filter(Boolean).join('');
+            if (line2) doc.text(line2, infoX, doc.y + 1, { width: infoW });
+            const line3 = [
+                firma.phone ? `Tel: ${firma.phone}` : null,
+                firma.email || null,
+                firma.web || null,
+            ].filter(Boolean).join('   ');
+            if (line3) doc.text(line3, infoX, doc.y + 1, { width: infoW });
+            const line4 = [
+                firma.taxOffice ? `V.D.: ${firma.taxOffice}` : null,
+                firma.taxNo ? `VKN/TCKN: ${firma.taxNo}` : null,
+            ].filter(Boolean).join('   ');
+            if (line4) doc.text(line4, infoX, doc.y + 1, { width: infoW });
+            if (firma.iban) doc.text(`IBAN: ${firma.iban}`, infoX, doc.y + 1, { width: infoW });
+
+            // Sağ üst köşe: belge tipi etiketi
+            doc.font(BOLD).fontSize(10).fillColor('#888')
+                .text('HESAP EKSTRESİ', X1 - 160, headTop, { width: 160, align: 'right' });
+
+            const dividerY = Math.max(doc.y, headTop + 52) + 6;
+            doc.moveTo(X0, dividerY).lineTo(X1, dividerY).strokeColor('#ccc').lineWidth(1).stroke();
+            doc.y = dividerY;
 
             // ─── Cari bilgisi ───
             let y = doc.y + 14;
@@ -136,6 +174,15 @@ function buildExtrePdf(data = {}) {
             y += 10;
             doc.font(BOLD).fontSize(12).fillColor(net < 0 ? '#b45309' : '#111')
                 .text(`GÜNCEL BAKİYE: ${fmtTR(Math.abs(net))} ₺  (${durum})`, X0, y, { width: X1 - X0, align: 'right' });
+            y = doc.y;
+
+            // ─── Yasal şartlar (firma bilgilerinden — belge altında küçük punto) ───
+            if (firma.legalTerms && String(firma.legalTerms).trim()) {
+                y += 14;
+                if (y + 40 > PAGE_BOTTOM) { doc.addPage(); y = 40; }
+                doc.font(REG).fontSize(7).fillColor('#777')
+                    .text(String(firma.legalTerms).trim(), X0, y, { width: X1 - X0, align: 'left' });
+            }
 
             // ─── Dipnot ───
             doc.font(REG).fontSize(7.5).fillColor('#999')

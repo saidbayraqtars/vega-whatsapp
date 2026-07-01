@@ -580,19 +580,23 @@ function addLogRaw(text, cls) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  Sekmeler + Belge Tipi Mesajları (watcher, çok kurallı)
 // ═══════════════════════════════════════════════════════════════════════════
-// ─── GEÇİCİ: Hesap Extresi (beta) erişim kilidi ─────────────────────────────────
-// Diğer kullanıcılarda pasif; sekmeye tıklayınca şifre sorar. Doğru şifre cihazda
-// (localStorage) hatırlanır. İleride bu blok + tab handler'daki guard kaldırılıp
-// herkese açılacak. Şifre düz değil, SHA-256 hash'i gömülü.
-const EXTRE_PW_HASH = '66202fae8c01b9b5014aefe8175ff064e25c0209ab4d58ef174c4bf070e3663f';
-function extreUnlocked() { try { return localStorage.getItem('vega.extreUnlock') === '1'; } catch { return false; } }
+// ─── Erişim kilidi (AI Oto-Yanıt + Hesap Extresi) ───────────────────────────────
+// Bu iki bölüm giriş şifresiyle sınırlıdır; Firma Bilgileri açıktır. Sekmeye tıklayınca
+// şifre sorulur; doğru şifre cihazda (localStorage) hatırlanır ve TEK giriş HER İKİ
+// bölümü açar. Şifre düz değil, SHA-256 hash'i gömülü. (Yerel araç — istemci koruması.)
+const ACCESS_PW_HASH = '66202fae8c01b9b5014aefe8175ff064e25c0209ab4d58ef174c4bf070e3663f';
+// Eski 'vega.extreUnlock' anahtarı da kabul edilir (geriye dönük — yeniden şifre sorMA).
+function accessUnlocked() {
+    try { return localStorage.getItem('vega.accessUnlock') === '1' || localStorage.getItem('vega.extreUnlock') === '1'; }
+    catch { return false; }
+}
 async function sha256hex(s) {
     const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
     return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 // NOT: Electron window.prompt() DESTEKLEMEZ (null döner) → özel modal kullanılır.
-function ensureExtreUnlocked() {
-    if (extreUnlocked()) return Promise.resolve(true);
+function ensureAccessUnlocked() {
+    if (accessUnlocked()) return Promise.resolve(true);
     return new Promise((resolve) => {
         const modal = $('extreLockModal'), inp = $('exLockPw'), err = $('exLockErr');
         const okB = $('exLockOk'), cancelB = $('exLockCancel');
@@ -606,7 +610,7 @@ function ensureExtreUnlocked() {
         };
         const finish = (v) => { modal.classList.add('hidden'); cleanup(); resolve(v); };
         const onOk = async () => {
-            try { if ((await sha256hex(inp.value)) === EXTRE_PW_HASH) { try { localStorage.setItem('vega.extreUnlock', '1'); } catch { /* yok say */ } return finish(true); } }
+            try { if ((await sha256hex(inp.value)) === ACCESS_PW_HASH) { try { localStorage.setItem('vega.accessUnlock', '1'); } catch { /* yok say */ } return finish(true); } }
             catch { /* crypto.subtle yoksa */ }
             err.textContent = 'Şifre hatalı.'; inp.select();
         };
@@ -620,16 +624,18 @@ function ensureExtreUnlocked() {
 
 document.querySelectorAll('.tab').forEach(t => {
     t.onclick = async () => {
-        // Hesap Extresi kilitli: açılmadan sekme değişmesin.
-        if (t.dataset.view === 'viewExtre' && !(await ensureExtreUnlocked())) return;
+        // AI Oto-Yanıt + Hesap Extresi kilitli: giriş şifresi girilmeden sekme değişmesin.
+        if ((t.dataset.view === 'viewExtre' || t.dataset.view === 'viewAiBot') && !(await ensureAccessUnlocked())) return;
         document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
         t.classList.add('active');
         const v = t.dataset.view;
-        ['viewBulk', 'viewWatcher', 'viewReminders', 'viewExtre'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
+        ['viewBulk', 'viewWatcher', 'viewReminders', 'viewExtre', 'viewAiBot', 'viewFirma'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
         const at = $('appbarTitle'); if (at) at.textContent = t.dataset.title || t.textContent.trim();
         if (v === 'viewWatcher') initWatcherView();
         if (v === 'viewReminders' && typeof initRemindersView === 'function') initRemindersView();
         if (v === 'viewExtre' && typeof initExtreView === 'function') initExtreView();
+        if (v === 'viewAiBot' && typeof initAiBotView === 'function') initAiBotView();
+        if (v === 'viewFirma' && typeof initFirmaView === 'function') initFirmaView();
     };
 });
 
@@ -1471,7 +1477,7 @@ function applyTheme(t) {
 // ─── Üst başlık: aktif sekme adını yansıt (mevcut .tab onclick'i EZME — ek dinleyici) ───
 document.querySelectorAll('.tab').forEach(t => {
     t.addEventListener('click', () => {
-        if (t.dataset.view === 'viewExtre') return; // kilit sonrası ana handler ayarlar
+        if (t.dataset.view === 'viewExtre' || t.dataset.view === 'viewAiBot') return; // kilit sonrası ana handler ayarlar
         const el = $('appbarTitle');
         if (el) el.textContent = t.dataset.title || t.textContent.trim();
     });
@@ -1641,6 +1647,260 @@ function exLog(line) {
     div.style.cssText = 'padding:6px 8px; border-bottom:1px solid var(--border); font-size:13px';
     div.textContent = `${new Date().toLocaleTimeString('tr-TR')}  ${line}`;
     box.prepend(div);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  AI Oto-Yanıt Botu
+// ═══════════════════════════════════════════════════════════════════════════
+let abLoaded = false;
+let abLogTimer = null;
+
+async function initAiBotView() {
+    if (!abLoaded) {
+        const fr = await api('/firmalar');
+        const sel = $('ab_firma');
+        sel.innerHTML = '';
+        if (fr.success) fr.data.forEach(f => {
+            const o = document.createElement('option');
+            o.value = f.FIRMANO; o.textContent = `${f.FIRMANO} — ${f.FIRMAADI}`;
+            sel.appendChild(o);
+        });
+        sel.onchange = () => loadAbDonemler();
+        $('ab_save').onclick = saveAiBot;
+        $('ab_test').onclick = testAiBotKey;
+        abLoaded = true;
+    }
+    await loadAiBotConfig();
+    abRefreshLog();
+    if (abLogTimer) clearInterval(abLogTimer);
+    abLogTimer = setInterval(() => { if ($('viewAiBot').style.display !== 'none') abRefreshLog(); else { clearInterval(abLogTimer); abLogTimer = null; } }, 5000);
+}
+
+async function loadAbDonemler(selectDonem) {
+    const firmaNo = $('ab_firma').value;
+    const sel = $('ab_donem');
+    sel.innerHTML = '<option>...</option>';
+    const r = await api(`/donemler?firmaNo=${firmaNo}`);
+    sel.innerHTML = '';
+    if (r.success && r.data.length) {
+        r.data.forEach(d => {
+            const o = document.createElement('option');
+            o.value = d.donemNo;
+            o.textContent = d.donem ? `${d.donemNo} — ${d.donem}` : d.donemNo;
+            sel.appendChild(o);
+        });
+        sel.value = selectDonem || r.data[r.data.length - 1].donemNo;
+    } else {
+        sel.innerHTML = '<option value="">dönem yok</option>';
+    }
+}
+
+async function loadAiBotConfig() {
+    const r = await api('/aibot');
+    if (!r.success) return;
+    const c = r.config;
+    $('ab_enabled').checked = !!c.enabled;
+    $('ab_apiKey').value = '';
+    $('ab_keyState').textContent = c.hasApiKey ? '(kayıtlı ✓)' : '(girilmedi)';
+    const ctx = (typeof localContext === 'function') ? localContext() : {};
+    const firma = c.firmaNo || state.firmaNo || ctx.firmaNo;
+    if (firma) $('ab_firma').value = firma;
+    await loadAbDonemler(c.donemNo || state.donemNo || ctx.donemNo);
+    $('ab_businessName').value = c.businessName || '';
+    $('ab_paymentInfo').value = c.paymentInfo || '';
+    $('ab_extra').value = c.extraInstructions || '';
+    $('ab_startHour').value = c.startHour ?? 9;
+    $('ab_endHour').value = c.endHour ?? 21;
+    $('ab_dailyCap').value = c.dailyCap ?? 100;
+    $('ab_minGap').value = c.minGapSec ?? 30;
+    $('ab_onlySms').checked = !!c.onlySmsGonder;
+    $('ab_movements').checked = c.includeMovements !== false;
+    abStatus(r.status);
+}
+
+async function saveAiBot() {
+    $('ab_err').textContent = '';
+    const patch = {
+        enabled: $('ab_enabled').checked,
+        firmaNo: $('ab_firma').value || null,
+        donemNo: $('ab_donem').value || null,
+        businessName: $('ab_businessName').value.trim(),
+        paymentInfo: $('ab_paymentInfo').value.trim(),
+        extraInstructions: $('ab_extra').value.trim(),
+        startHour: Number($('ab_startHour').value) || 0,
+        endHour: Number($('ab_endHour').value) || 0,
+        dailyCap: Number($('ab_dailyCap').value) || 0,
+        minGapSec: Number($('ab_minGap').value) || 0,
+        onlySmsGonder: $('ab_onlySms').checked,
+        includeMovements: $('ab_movements').checked,
+    };
+    const key = $('ab_apiKey').value.trim();
+    if (key) patch.apiKey = key;
+    const r = await api('/aibot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+    if (r.success) {
+        $('ab_apiKey').value = '';
+        $('ab_keyState').textContent = r.config.hasApiKey ? '(kayıtlı ✓)' : '(girilmedi)';
+        abStatus(r.status);
+        const btn = $('ab_save'); const old = btn.textContent;
+        btn.textContent = 'Kaydedildi ✓'; setTimeout(() => btn.textContent = old, 1500);
+    } else {
+        $('ab_err').textContent = r.message || 'Kaydedilemedi.';
+    }
+}
+
+async function testAiBotKey() {
+    const el = $('ab_testResult');
+    el.style.display = ''; el.textContent = 'Sınanıyor...';
+    const key = $('ab_apiKey').value.trim();
+    const r = await api('/aibot/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(key ? { apiKey: key } : {}) });
+    el.textContent = r.success ? `Anahtar geçerli ✓ (${r.sample || 'yanıt alındı'})` : `Hata: ${r.message || 'geçersiz'}`;
+    el.style.color = r.success ? 'var(--green, #16a34a)' : 'var(--danger, #dc2626)';
+}
+
+function abStatus(st) {
+    if (!st) return;
+    const on = st.enabled ? 'AÇIK' : 'kapalı';
+    const key = st.hasApiKey ? 'anahtar var' : 'anahtar YOK';
+    $('ab_status').textContent = `Bot: ${on} · ${key} · bugün ${st.sentToday}/${st.dailyCap} cevap · saat ${st.startHour}:00–${st.endHour}:00`;
+}
+
+const AB_KIND = {
+    reply: { t: 'Cevap', c: 'var(--green, #16a34a)' },
+    silent: { t: 'Sessiz', c: '#64748b' },
+    skip: { t: 'Atlandı', c: '#b45309' },
+    error: { t: 'Hata', c: 'var(--danger, #dc2626)' },
+};
+
+async function abRefreshLog() {
+    const r = await api('/aibot/log');
+    if (!r.success) return;
+    abStatus(r.status);
+    const box = $('ab_log'); if (!box) return;
+    if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:12px">Henüz gelen mesaj yok.</div>'; return; }
+    box.innerHTML = r.log.map(e => {
+        const k = AB_KIND[e.kind] || { t: e.kind, c: '#64748b' };
+        const time = new Date(e.at).toLocaleTimeString('tr-TR');
+        const who = esc(e.name || e.phone || '');
+        const detail = e.kind === 'reply'
+            ? `<div style="font-size:12px;color:#64748b">↩ ${esc(e.incoming || '')}</div><div style="font-size:13px;margin-top:2px">${esc(e.reply || '')}</div>`
+            : e.kind === 'silent'
+                ? `<div style="font-size:12px;color:#64748b">↩ ${esc(e.incoming || '')}</div>`
+                : `<div style="font-size:12px;color:#64748b">${esc(e.reason || '')}</div>`;
+        return `<div style="padding:8px; border-bottom:1px solid var(--border)">
+            <div style="font-size:13px"><b style="color:${k.c}">${k.t}</b> · ${who} <span class="muted" style="font-size:11px">${time}</span></div>
+            ${detail}
+        </div>`;
+    }).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Firma Bilgileri (ekstre/belge başlığı + logo)
+// ═══════════════════════════════════════════════════════════════════════════
+let fiLoaded = false;
+
+async function initFirmaView() {
+    if (!fiLoaded) {
+        const fr = await api('/firmalar');
+        const sel = $('fi_firma');
+        sel.innerHTML = '';
+        if (fr.success) fr.data.forEach(f => {
+            const o = document.createElement('option');
+            o.value = f.FIRMANO; o.textContent = `${f.FIRMANO} — ${f.FIRMAADI}`;
+            sel.appendChild(o);
+        });
+        sel.onchange = () => loadFirmaInfo();
+        $('fi_save').onclick = saveFirmaInfo;
+        $('fi_logoPick').onclick = () => $('fi_logoFile').click();
+        $('fi_logoFile').onchange = uploadFirmaLogo;
+        $('fi_logoClear').onclick = clearFirmaLogo;
+        $('fi_logoUrlBtn').onclick = fetchFirmaLogoUrl;
+        fiLoaded = true;
+    }
+    const ctx = (typeof localContext === 'function') ? localContext() : {};
+    const firma = state.firmaNo || ctx.firmaNo;
+    if (firma) $('fi_firma').value = firma;
+    await loadFirmaInfo();
+}
+
+async function loadFirmaInfo() {
+    const firmaNo = $('fi_firma').value;
+    if (!firmaNo) return;
+    const r = await api(`/firma/info?firmaNo=${firmaNo}`);
+    if (!r.success) return;
+    const i = r.info || {};
+    $('fi_name').value = i.name || '';
+    $('fi_phone').value = i.phone || '';
+    $('fi_email').value = i.email || '';
+    $('fi_web').value = i.web || '';
+    $('fi_address').value = i.address || '';
+    $('fi_taxOffice').value = i.taxOffice || '';
+    $('fi_taxNo').value = i.taxNo || '';
+    $('fi_iban').value = i.iban || '';
+    $('fi_legal').value = i.legalTerms || '';
+    renderFirmaLogo(r.hasLogo, firmaNo);
+}
+
+function renderFirmaLogo(hasLogo, firmaNo) {
+    const box = $('fi_logoBox');
+    if (hasLogo) {
+        box.innerHTML = `<img src="/api/firma/logo?firmaNo=${firmaNo}&t=${Date.now()}" style="max-width:100%; max-height:100%; object-fit:contain" />`;
+    } else {
+        box.innerHTML = '<span class="muted" style="font-size:12px">logo yok</span>';
+    }
+}
+
+async function saveFirmaInfo() {
+    $('fi_err').textContent = '';
+    const body = {
+        firmaNo: $('fi_firma').value,
+        name: $('fi_name').value.trim(),
+        phone: $('fi_phone').value.trim(),
+        email: $('fi_email').value.trim(),
+        web: $('fi_web').value.trim(),
+        address: $('fi_address').value.trim(),
+        taxOffice: $('fi_taxOffice').value.trim(),
+        taxNo: $('fi_taxNo').value.trim(),
+        iban: $('fi_iban').value.trim(),
+        legalTerms: $('fi_legal').value.trim(),
+    };
+    const r = await api('/firma/info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (r.success) {
+        const btn = $('fi_save'); const old = btn.textContent;
+        btn.textContent = 'Kaydedildi ✓'; setTimeout(() => btn.textContent = old, 1500);
+    } else {
+        $('fi_err').textContent = r.message || 'Kaydedilemedi.';
+    }
+}
+
+async function uploadFirmaLogo(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const fd = new FormData();
+    fd.append('firmaNo', $('fi_firma').value);
+    fd.append('logo', file);
+    const r = await fetch('/api/firma/logo', { method: 'POST', body: fd }).then(x => x.json()).catch(() => ({ success: false }));
+    firmaLogoMsg(r.success ? 'Logo yüklendi ✓' : (r.message || 'Yüklenemedi'), r.success);
+    if (r.success) renderFirmaLogo(true, $('fi_firma').value);
+    e.target.value = '';
+}
+
+async function fetchFirmaLogoUrl() {
+    const url = $('fi_logoUrl').value.trim();
+    if (!url) return;
+    const r = await api('/firma/logo/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ firmaNo: $('fi_firma').value, url }) });
+    firmaLogoMsg(r.success ? 'Logo getirildi ✓' : (r.message || 'Getirilemedi'), r.success);
+    if (r.success) { $('fi_logoUrl').value = ''; renderFirmaLogo(true, $('fi_firma').value); }
+}
+
+async function clearFirmaLogo() {
+    const r = await api('/firma/logo/clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ firmaNo: $('fi_firma').value }) });
+    if (r.success) renderFirmaLogo(false, $('fi_firma').value);
+}
+
+function firmaLogoMsg(msg, ok) {
+    const el = $('fi_logoMsg');
+    el.style.display = ''; el.textContent = msg;
+    el.style.color = ok ? 'var(--green, #16a34a)' : 'var(--danger, #dc2626)';
 }
 
 // ─── yardımcı ───

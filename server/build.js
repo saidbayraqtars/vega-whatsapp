@@ -24,11 +24,16 @@ const outExe = path.join(root, '..', 'VegaWhatsApp.exe');
         logLevel: 'warning',
     });
 
-    console.log('[2/3] public kopyala + pkg ayarı...');
+    console.log('[2/3] public + assets kopyala + pkg ayarı...');
     fs.cpSync(path.join(root, 'public'), path.join(buildDir, 'public'), { recursive: true });
+    // assets/ (arial.ttf, arialbd.ttf) → PDF ekstre için ŞART. Bundle edilmezse
+    // exe'de font bulunamaz, Helvetica AFM'i de yok → buildExtrePdf patlar (PDF gitmez).
+    if (fs.existsSync(path.join(root, 'assets'))) {
+        fs.cpSync(path.join(root, 'assets'), path.join(buildDir, 'assets'), { recursive: true });
+    }
     fs.writeFileSync(
         path.join(buildDir, 'package.json'),
-        JSON.stringify({ name: 'vega-wa-build', bin: 'app.cjs', pkg: { assets: ['public/**/*'] } }, null, 2)
+        JSON.stringify({ name: 'vega-wa-build', bin: 'app.cjs', pkg: { assets: ['public/**/*', 'assets/**/*'] } }, null, 2)
     );
 
     // @yao-pkg/pkg (bakımlı fork) — Node 22 base shipler. Node 18'in WebCrypto

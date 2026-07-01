@@ -30,7 +30,42 @@ let qrTimer = null;
 let meId = null;
 let _baileys = null;
 
+// Gelen mesaj işleyici (AI oto-yanıt botu için). server.js kaydeder; sock her
+// yeniden bağlanışta baştan kurulduğu için dinleyici initializeWhatsApp içinde
+// bağlanır ve bu callback'i çağırır (removeAllListeners sonrası kaybolmasın diye).
+let incomingHandler = null;
+const setIncomingHandler = (fn) => { incomingHandler = fn; };
+
+// Baileys mesaj gövdesinden düz metni çıkar (farklı sarmalayıcı tipleri).
+const extractText = (msg) => {
+    if (!msg) return '';
+    // viewOnce / ephemeral sarmalayıcılarını aç
+    const inner = msg.ephemeralMessage?.message
+        || msg.viewOnceMessage?.message
+        || msg.viewOnceMessageV2?.message
+        || msg;
+    return (
+        inner.conversation
+        || inner.extendedTextMessage?.text
+        || inner.imageMessage?.caption
+        || inner.videoMessage?.caption
+        || inner.documentMessage?.caption
+        || ''
+    ).trim();
+};
+
 const ensureDir = (d) => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); };
+
+// ─── Gönderilen mesaj önbelleği (retry/yeniden şifreleme için) ───────────────
+// WhatsApp karşı taraf mesajı çözemeyince retry ister; Baileys getMessage(key)
+// ile orijinali isteyip YENİDEN şifreler. undefined dönersek mesaj karşıda
+// "Mesaj bekleniyor..." takılır. id → message proto (son ~400 gönderim tutulur).
+const sentMsgCache = new Map();
+const cacheSentMessage = (id, message) => {
+    if (!id || !message) return;
+    sentMsgCache.set(id, message);
+    if (sentMsgCache.size > 400) sentMsgCache.delete(sentMsgCache.keys().next().value);
+};
 
 // ─── Günlük gönderim sayacı (kalıcı) ─────────────────────────────────────────
 // Günlük tavan iş (job) bazlı değil hesap bazlı anlamlı: aynı gün başlatılan
@@ -211,9 +246,12 @@ const initializeWhatsApp = async () => {
             defaultQueryTimeoutMs: 60_000,
             keepAliveIntervalMs: 25_000,
             browser: ['Vega Toplu Mesaj', 'Chrome', '120.0'],
-            // Baileys mesaj yeniden gönderimi için gerekli (yoksa retry/decrypt uyarıları);
-            // geçmişi tutmuyoruz, undefined dönmek güvenli.
-            getMessage: async () => undefined,
+            // Karşı taraf mesajı çözemeyince (yeni oturum/anahtar uyuşmazlığı) WA bir
+            // "retry receipt" gönderir; Baileys mesajı YENİDEN şifreleyip göndermek için
+            // getMessage(key) ile orijinal içeriği ister. Burada undefined dönersek
+            // yeniden gönderim OLMAZ → mesaj karşıda "Mesaj bekleniyor..." takılır.
+            // Bu yüzden gönderdiğimiz mesajları kısa süre cache'te tutup buradan döndürüyoruz.
+            getMessage: async (key) => sentMsgCache.get(key?.id) || undefined,
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -227,6 +265,39 @@ const initializeWhatsApp = async () => {
             for (const u of (updates || [])) {
                 if (u?.key?.fromMe && u?.update && u.update.status != null) {
                     waEvent(`ack id=${u.key.id} to=${u.key.remoteJid} status=${u.update.status}`);
+                }
+            }
+        });
+
+        // Gelen mesajlar → AI oto-yanıt botu. Yalnız: bize gelen (fromMe değil),
+        // birebir sohbet (@s.whatsapp.net — grup/broadcast/status hariç), metin
+        // içeren. Filtre/karar/gönderim incomingHandler'da (ai-bot.js). type
+        // 'notify' = canlı yeni mesaj (append = geçmiş senkronu, atlanır).
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify' || !incomingHandler) return;
+            for (const m of (messages || [])) {
+                try {
+                    if (!m.message || m.key?.fromMe) continue;
+                    const jid = m.key?.remoteJid || '';
+                    // Birebir sohbet: @s.whatsapp.net VEYA @lid (WhatsApp gizli-numara /
+                    // Linked ID formatı). @lid'de gerçek telefon key.senderPn'de gelir.
+                    // Grup(@g.us)/broadcast/status hariç.
+                    let phone = null;
+                    if (jid.endsWith('@s.whatsapp.net')) {
+                        phone = jid.split('@')[0];
+                    } else if (jid.endsWith('@lid')) {
+                        const pn = m.key?.senderPn || m.key?.participantPn || '';
+                        if (pn.includes('@')) phone = pn.split('@')[0];
+                    } else {
+                        continue;
+                    }
+                    const text = extractText(m.message);
+                    if (!text) continue;
+                    if (!phone) { waEvent(`incoming-nopn jid=${jid}`); continue; }
+                    waEvent(`incoming from=${phone} jid=${jid} len=${text.length}`);
+                    await incomingHandler({ phone, text, jid, id: m.key?.id || null });
+                } catch (err) {
+                    waEvent(`incoming-err ${err.message}`);
                 }
             }
         });
@@ -434,6 +505,8 @@ const sendMessage = async (phone, text, media = null, opts = {}) => {
         }
 
         const sent = await sock.sendMessage(jid, content);
+        // Retry/yeniden şifreleme için orijinali sakla (getMessage buradan döndürür).
+        cacheSentMessage(sent?.key?.id, sent?.message);
         bumpDailySent();
         // TANILAMA: relay sonucu. id varsa Baileys WA sunucusuna iletti; ardından gelen
         // 'ack' satırları (messages.update) gerçek teslimi gösterir. id YOKSA relay olmadı.
@@ -475,6 +548,7 @@ module.exports = {
     checkOnWhatsApp,
     getDailySent,
     waitForReady,
+    setIncomingHandler,
     toJid,
     get client() { return sock; },
 };

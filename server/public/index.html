@@ -77,6 +77,15 @@
                 <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h8M8 9h2"/></svg>
                 <span>Hesap Extresi</span>
             </button>
+            <div class="nav-group">Otomasyon</div>
+            <button class="tab" id="tabAiBot" data-view="viewAiBot" data-title="AI Oto-Yanıt">
+                <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2M20 14h2M15 13v2M9 13v2"/></svg>
+                <span>AI Oto-Yanıt</span>
+            </button>
+            <button class="tab" id="tabFirma" data-view="viewFirma" data-title="Firma Bilgileri">
+                <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18M5 21V7l8-4v18M19 21V11l-6-4M9 9h.01M9 13h.01M9 17h.01"/></svg>
+                <span>Firma Bilgileri</span>
+            </button>
         </nav>
 
         <div class="sb-foot">
@@ -91,6 +100,7 @@
                 <button class="btn ghost sm" id="licBtn" title="Lisans">Lisans</button>
                 <button class="btn ghost sm" id="themeBtn" title="Gece / gündüz modu">🌙 Tema</button>
             </div>
+            <div class="sb-ver" style="margin-top:8px;font-size:11px;opacity:.5;text-align:center">v1.1.0</div>
         </div>
     </aside>
 
@@ -347,6 +357,140 @@
                 </div>
             </div>
         </div>
+
+        <!-- ─── AI OTO-YANIT ─── -->
+        <div class="wrap" id="viewAiBot" style="display:none">
+            <!-- SOL: Ayarlar -->
+            <div class="card">
+                <h2>AI Oto-Yanıt Botu</h2>
+                <p class="sub">Gelen WhatsApp mesajlarına Claude ile <b>seçmeli</b> otomatik cevap: yalnız <b>bakiye</b>, <b>ödeme bilgisi</b> ve <b>borç sebebi</b> sorularına yanıt verir; diğer mesajlara (şikayet, sohbet, pazarlık…) <b>sessiz</b> kalır, size bırakır. Yalnız cari kartında kayıtlı numaralara cevap verilir.</p>
+
+                <label class="check" style="margin:6px 0 12px"><input type="checkbox" id="ab_enabled" /> <b>Botu aç</b> (gelen mesajlara otomatik cevaplasın)</label>
+
+                <div class="field">
+                    <label>Anthropic API Anahtarı <span class="muted" id="ab_keyState"></span></label>
+                    <input id="ab_apiKey" type="password" placeholder="sk-ant-... (değişmeyecekse boş bırak)" />
+                    <div class="hint">Anahtar bu bilgisayarda <b>şifreli</b> saklanır. <a href="https://console.anthropic.com/settings/keys" target="_blank">console.anthropic.com</a>'dan alınır.</div>
+                </div>
+                <div class="toolbar" style="margin:-4px 0 8px">
+                    <button class="btn ghost sm" id="ab_test">Anahtarı Sına</button>
+                    <span class="hint" id="ab_testResult" style="display:none"></span>
+                </div>
+
+                <div class="row">
+                    <div class="field"><label>Firma</label><select id="ab_firma"></select></div>
+                    <div class="field"><label>Dönem</label><select id="ab_donem"></select></div>
+                </div>
+                <div class="hint">Gelen numara bu firmanın cari kartlarında aranır; bakiye bu dönemden hesaplanır.</div>
+
+                <div class="field" style="margin-top:10px">
+                    <label>İşletme Adı (imza)</label>
+                    <input id="ab_businessName" placeholder="Örn. Expert Bilişim" />
+                </div>
+                <div class="field">
+                    <label>Ödeme Bilgisi (IBAN vb.) — "nereye ödeyeyim" cevabı</label>
+                    <textarea id="ab_paymentInfo" rows="3" placeholder="Örn. Ziraat Bankası TR00 0000 ... — Expert Bilişim Ltd."></textarea>
+                    <div class="hint">Boş bırakılırsa bot ödeme bilgisi sorularına cevap vermez (sessiz kalır).</div>
+                </div>
+                <div class="field">
+                    <label>Ek Talimat (opsiyonel)</label>
+                    <textarea id="ab_extra" rows="2" placeholder="Örn. Resmi ve kısa konuş. Vade sorulursa ay sonu de."></textarea>
+                </div>
+
+                <details class="adv" style="margin-top:6px">
+                    <summary>Gelişmiş (saat, tavan, güvenlik)</summary>
+                    <div class="row" style="margin-top:10px">
+                        <div class="field"><label>Çalışma Başlangıç (saat)</label><input id="ab_startHour" type="number" min="0" max="23" /></div>
+                        <div class="field"><label>Çalışma Bitiş (saat)</label><input id="ab_endHour" type="number" min="0" max="23" /></div>
+                    </div>
+                    <div class="hint">Bu saatler dışında gelen mesajlara cevap verilmez.</div>
+                    <div class="row" style="margin-top:8px">
+                        <div class="field"><label>Günlük Cevap Tavanı</label><input id="ab_dailyCap" type="number" min="0" /></div>
+                        <div class="field"><label>Aynı Numara Min Aralık (sn)</label><input id="ab_minGap" type="number" min="0" /></div>
+                    </div>
+                    <label class="check" style="margin-top:8px"><input type="checkbox" id="ab_onlySms" /> Yalnız 'SMS Gönder' izinli carilere cevap ver</label>
+                    <label class="check" style="margin-top:6px"><input type="checkbox" id="ab_movements" /> Borç sebebi için son işlemleri bağlama ekle</label>
+                </details>
+
+                <div class="row" style="margin-top:14px">
+                    <button class="btn green" id="ab_save" style="flex:1">Kaydet</button>
+                </div>
+                <div class="err" id="ab_err"></div>
+            </div>
+
+            <!-- SAĞ: Durum + canlı kayıt -->
+            <div class="panel">
+                <div class="card">
+                    <h2>Durum</h2>
+                    <div class="muted" id="ab_status" style="font-size:13px; margin-bottom:8px">—</div>
+                    <p class="sub">Botun gelen mesajlara verdiği kararlar: <b>cevap</b>, <b>sessiz</b> (kapsam dışı), <b>atlandı</b> (numara yok / saat dışı / tavan).</p>
+                    <div class="log" id="ab_log" style="max-height:520px"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ─── FİRMA BİLGİLERİ ─── -->
+        <div class="wrap" id="viewFirma" style="display:none">
+            <!-- SOL: Bilgiler -->
+            <div class="card">
+                <h2>Firma Bilgileri</h2>
+                <p class="sub">Hesap ekstresi / belge <b>başlığında</b> görünür. Firmayı seç — bilgiler Vega'dan (TBLFIRMA) otomatik gelir; düzeltebilir, IBAN ve yasal şartları ekleyebilirsin.</p>
+
+                <div class="toolbar"><select id="fi_firma"></select></div>
+
+                <div class="muted" style="font-weight:600; margin:14px 0 8px">Genel Bilgiler</div>
+                <div class="field"><label>Firma Adı</label><input id="fi_name" placeholder="Örn. Arc Teknik" /></div>
+                <div class="row">
+                    <div class="field"><label>Telefon</label><input id="fi_phone" placeholder="05xx..." /></div>
+                    <div class="field"><label>E-posta</label><input id="fi_email" placeholder="info@..." /></div>
+                </div>
+                <div class="row">
+                    <div class="field"><label>Web Sitesi</label><input id="fi_web" placeholder="www..." /></div>
+                    <div class="field"><label>Adres</label><input id="fi_address" placeholder="Mah. Cad. No..." /></div>
+                </div>
+
+                <div class="muted" style="font-weight:600; margin:16px 0 8px">Fatura Bilgileri (belge başlığında görünür)</div>
+                <div class="row">
+                    <div class="field"><label>Vergi Dairesi</label><input id="fi_taxOffice" placeholder="Örn: Merkez V.D." /></div>
+                    <div class="field"><label>Vergi / TC No</label><input id="fi_taxNo" placeholder="1234567890" /></div>
+                    <div class="field"><label>IBAN</label><input id="fi_iban" placeholder="TR.. .... ...." /></div>
+                </div>
+
+                <div class="muted" style="font-weight:600; margin:16px 0 8px">Yasal Şartlar (ekstre altında küçük puntolarla görünür)</div>
+                <div class="field"><textarea id="fi_legal" rows="4" placeholder="Örn. Bu ekstre bilgilendirme amaçlıdır..."></textarea></div>
+
+                <div class="row" style="margin-top:12px">
+                    <button class="btn green" id="fi_save" style="flex:1">Kaydet</button>
+                </div>
+                <div class="err" id="fi_err"></div>
+            </div>
+
+            <!-- SAĞ: Logo -->
+            <div class="panel">
+                <div class="card">
+                    <h2>Logo</h2>
+                    <p class="sub">PNG/JPG. Ekstre başlığının sol üstünde görünür.</p>
+                    <div style="display:flex; align-items:center; gap:16px; margin:8px 0 14px">
+                        <div id="fi_logoBox" style="width:130px; height:70px; border:1px dashed var(--border); border-radius:8px; display:flex; align-items:center; justify-content:center; overflow:hidden; background:var(--bg2, #f8fafc)">
+                            <span class="muted" style="font-size:12px">logo yok</span>
+                        </div>
+                        <div>
+                            <input type="file" id="fi_logoFile" accept="image/png,image/jpeg" style="display:none" />
+                            <button class="btn ghost sm" id="fi_logoPick">Logo Seç</button>
+                            <button class="btn ghost sm" id="fi_logoClear">Kaldır</button>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label>veya Logo URL</label>
+                        <div class="toolbar">
+                            <input id="fi_logoUrl" placeholder="https://.../logo.png" />
+                            <button class="btn sm" id="fi_logoUrlBtn">Getir</button>
+                        </div>
+                    </div>
+                    <div class="hint" id="fi_logoMsg" style="display:none"></div>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -480,11 +624,11 @@
     </div>
 </div>
 
-<!-- ─── HESAP EXTRESİ KİLİT MODAL (beta şifre) ─── -->
+<!-- ─── ERİŞİM KİLİT MODAL (AI Oto-Yanıt + Hesap Extresi) ─── -->
 <div id="extreLockModal" class="overlay hidden">
     <div class="modal" style="max-width:380px">
-        <h2>Hesap Extresi (beta)</h2>
-        <p class="sub">Bu bölüm şu an şifre korumalı. Erişim şifresini girin.</p>
+        <h2>Korumalı Bölüm</h2>
+        <p class="sub">AI Oto-Yanıt ve Hesap Extresi giriş şifresiyle korunur. Şifreyi girin (tek giriş her ikisini açar).</p>
         <div class="field"><label>Şifre</label><input id="exLockPw" type="password" autocomplete="off" /></div>
         <div class="err" id="exLockErr"></div>
         <div class="actions">

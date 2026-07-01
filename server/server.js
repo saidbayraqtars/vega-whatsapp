@@ -28,12 +28,13 @@ const multer = require('multer');
 const {
     initializeWhatsApp, refreshWhatsApp, logoutWhatsApp,
     getStatus: waStatus, sendMessage: waSend, deleteMessage: waDelete, checkOnWhatsApp, getDailySent,
-    waitForReady: waWaitForReady,
+    waitForReady: waWaitForReady, setIncomingHandler,
 } = require('./whatsapp');
 const { normalizePhone, isLikelyValid } = require('./phone');
 const watcher = require('./watcher');
 const reminders = require('./reminders');
 const activeCari = require('./activeCari');
+const aiBot = require('./aiBot');
 const license = require('./license');
 const antiban = require('./antiban');
 const { buildExtrePdf } = require('./extre');
@@ -691,6 +692,101 @@ async function resolveCariContacts(firmaNo, indList) {
     return map;
 }
 
+// ─── Telefon → cari (AI bot: gelen numaradan cariyi bul) ─────────────────────
+// Numaranın son 7 hanesiyle telefon sütunlarında eşleştirir (0/90/+90 önekleri
+// ve ayraç farklarını aşmak için LIKE %son7%). Birden çok eşleşme olursa ilki.
+async function findCariByPhone(firmaNo, phone) {
+    if (!pool || !pool.connected) return null;
+    const norm = normalizePhone(phone);
+    if (!norm || norm.length < 7) return null;
+    const tail = norm.slice(-7); // son 7 hane → önek/ayraç bağımsız eşleşme
+    const info = await detectCariColumns(firmaNo);
+    if (!info.phoneCols.length) return null;
+    const T = `[${info.table}]`;
+
+    const hasAdSoyad = info.all.some(c => c.toUpperCase() === 'ADI') && info.all.some(c => c.toUpperCase() === 'SOYADI');
+    const nameParts = [];
+    if (info.hasUnvan) nameParts.push(`NULLIF(LTRIM(RTRIM(UNVAN)),'')`);
+    if (info.hasFirmaadi) nameParts.push(`NULLIF(LTRIM(RTRIM(FIRMAADI)),'')`);
+    if (hasAdSoyad) nameParts.push(`NULLIF(LTRIM(RTRIM(ISNULL(ADI,'')+' '+ISNULL(SOYADI,''))),'')`);
+    const nameExpr = nameParts.length ? `COALESCE(${nameParts.join(', ')}, CAST(IND AS NVARCHAR))` : `CAST(IND AS NVARCHAR)`;
+    const firmaExpr = info.hasFirmaadi ? `NULLIF(LTRIM(RTRIM(FIRMAADI)),'')` : nameExpr;
+    const smsSelect = info.hasSmsGonder ? 'ISNULL(SMSGONDER,0) AS SMSGONDER' : 'CAST(0 AS BIT) AS SMSGONDER';
+    const hasBakiye = info.all.some(c => c.toUpperCase() === 'BAKIYE');
+    const bakiyeSelect = hasBakiye ? 'BAKIYE AS BAKIYE' : 'CAST(NULL AS DECIMAL(18,2)) AS BAKIYE';
+
+    const whereParts = [];
+    if (info.hasDeleted) whereParts.push('ISNULL(DELETED,0)=0');
+    if (info.hasStatus) whereParts.push('ISNULL(STATUS,1)<>2'); // pasif hariç
+    // Son 7 haneyi rakam-dışı temizlenmiş sütunda ara. REPLACE zinciri: boşluk/(/)/-/+ temizle.
+    const clean = (col) => `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL([${col}],''),' ',''),'(',''),')',''),'-',''),'+','')`;
+    const phoneWhere = info.phoneCols.map(c => `${clean(c)} LIKE @tail`).join(' OR ');
+    whereParts.push(`(${phoneWhere})`);
+    const where = 'WHERE ' + whereParts.join(' AND ');
+
+    const r = pool.request();
+    r.input('tail', sql.NVarChar, `%${tail}`);
+    const rows = (await r.query(`
+        SELECT TOP 1 IND, ${nameExpr} AS UNVAN, ${firmaExpr} AS FIRMA, ${smsSelect}, ${bakiyeSelect}
+        FROM ${T} ${where}
+    `)).recordset;
+    if (!rows.length) return null;
+    const row = rows[0];
+    return {
+        ind: row.IND,
+        name: row.UNVAN,
+        firma: row.FIRMA || row.UNVAN || null,
+        smsGonder: !!row.SMSGONDER,
+        bakiye: row.BAKIYE != null ? Number(row.BAKIYE) : null,
+    };
+}
+
+// ─── Net bakiye (AI bot: cari hareketten SUM(BORC)-SUM(ALACAK)) ──────────────
+// reminders.fetchNetBalances ile aynı kaynak; net>0 = borçlu. Map<ind, net>.
+async function fetchNetBalances(poolArg, firmaNo, donemNo, ids) {
+    const map = new Map();
+    const p = poolArg || pool;
+    if (!p || !p.connected || !donemNo) return map;
+    const tbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
+    if (!(await validateTableName(tbl))) return map;
+    const idNums = (ids || []).map(n => parseInt(n, 10)).filter(Number.isFinite);
+    const idFilter = idNums.length ? ` WHERE FIRMANO IN (${idNums.join(',')})` : '';
+    const rows = (await p.request().query(`
+        SELECT FIRMANO, CAST(SUM(BORC) - SUM(ALACAK) AS DECIMAL(18,2)) AS NET
+        FROM [${tbl}]${idFilter} GROUP BY FIRMANO
+    `)).recordset;
+    for (const r of rows) map.set(r.FIRMANO, Number(r.NET));
+    return map;
+}
+
+// ─── Son cari hareketler (AI bot: "borç sebebi" bağlamı) ─────────────────────
+async function fetchRecentMovements(firmaNo, donemNo, ind, limit = 5) {
+    if (!pool || !pool.connected || !donemNo) return [];
+    const tbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
+    if (!(await validateTableName(tbl))) return [];
+    const cols = (await pool.request().query(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='${tbl}'`
+    )).recordset.map(x => x.COLUMN_NAME.toUpperCase());
+    const has = (c) => cols.includes(c);
+    if (!has('FIRMANO')) return [];
+    const tarih = has('TARIH') ? 'TARIH' : (has('VADETARIHI') ? 'VADETARIHI' : null);
+    const izahat = has('IZAHAT') ? 'IZAHAT' : null;
+    const sel = [
+        tarih ? `${tarih} AS TARIH` : 'CAST(NULL AS DATETIME) AS TARIH',
+        has('BORC') ? 'BORC' : 'CAST(0 AS DECIMAL(18,2)) AS BORC',
+        has('ALACAK') ? 'ALACAK' : 'CAST(0 AS DECIMAL(18,2)) AS ALACAK',
+        izahat ? `${izahat} AS IZAHAT` : `'' AS IZAHAT`,
+    ].join(', ');
+    const order = tarih ? `${tarih} DESC` : 'IND DESC';
+    const r = pool.request();
+    r.input('ind', sql.Int, parseInt(ind, 10));
+    const rows = (await r.query(`
+        SELECT TOP ${Math.max(1, Math.min(20, limit))} ${sel}
+        FROM [${tbl}] WHERE FIRMANO=@ind ORDER BY ${order}
+    `)).recordset;
+    return rows.map(r => ({ tarih: r.TARIH, borc: r.BORC, alacak: r.ALACAK, izahat: r.IZAHAT }));
+}
+
 // ─── Hatırlatma aday carileri (kategori + bakiye filtresi) ───────────────────
 // reminders.js için: FIRMATIPI + BAKIYE kategorisine uyan carilerin IND/BAKIYE/
 // FIRMATIPI/OPSIYON(vade günü) listesi. Telefon/isim resolveCariContacts ile çözülür.
@@ -804,6 +900,118 @@ app.post('/api/watcher/stop', (req, res) => {
 
 app.get('/api/watcher/log', (req, res) => {
     res.json({ success: true, log: watcher.getLog(), status: watcher.getStatus() });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  AI OTO-YANIT BOTU
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/aibot', (req, res) => {
+    res.json({ success: true, config: aiBot.getConfig(), status: aiBot.getStatus() });
+});
+
+app.post('/api/aibot', (req, res) => {
+    const allowed = [
+        'enabled', 'apiKey', 'clearApiKey', 'model', 'firmaNo', 'donemNo',
+        'businessName', 'paymentInfo', 'extraInstructions', 'startHour', 'endHour',
+        'dailyCap', 'minGapSec', 'onlySmsGonder', 'includeMovements',
+    ];
+    const patch = {};
+    for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    const config = aiBot.setConfig(patch);
+    res.json({ success: true, config, status: aiBot.getStatus() });
+});
+
+app.get('/api/aibot/log', (req, res) => {
+    res.json({ success: true, log: aiBot.getLog(), status: aiBot.getStatus() });
+});
+
+// Anahtarı sına: gövdede apiKey verilirse onu, yoksa kayıtlıyı dener.
+app.post('/api/aibot/test', async (req, res) => {
+    try {
+        const out = await aiBot.testApiKey(req.body && req.body.apiKey);
+        res.json({ success: true, ...out });
+    } catch (err) {
+        res.status(200).json({ success: false, message: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  FİRMA BİLGİLERİ (belge/ekstre başlığı için) + LOGO
+//  Alanlar TBLFIRMA'dan otomatik gelir; kullanıcı UI'dan düzeltir/ekler (IBAN,
+//  yasal şartlar…). Ekstre PDF başlığı bu bilgilere ve logoya göre şekillenir.
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/firma/info', async (req, res) => {
+    const { firmaNo } = req.query;
+    if (!firmaNo) return res.status(400).json({ success: false, message: 'firmaNo gerekli.' });
+    try {
+        const info = await fetchFirmaInfo(firmaNo);
+        res.json({ success: true, info, hasLogo: !!firmaLogoPath(firmaNo) });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/firma/info', (req, res) => {
+    const firmaNo = req.body && req.body.firmaNo;
+    if (!firmaNo) return res.status(400).json({ success: false, message: 'firmaNo gerekli.' });
+    const allowed = ['name', 'phone', 'email', 'web', 'address', 'taxOffice', 'taxNo', 'iban', 'legalTerms'];
+    const patch = {};
+    for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    saveFirmaOverride(firmaNo, patch);
+    res.json({ success: true });
+});
+
+// Logo yükle (multipart 'logo'). PNG/JPG. data/firma-logo-<ind>.<ext>.
+app.post('/api/firma/logo', upload.single('logo'), (req, res) => {
+    const firmaNo = req.body && req.body.firmaNo;
+    if (!firmaNo || !req.file) return res.status(400).json({ success: false, message: 'firmaNo ve logo gerekli.' });
+    const ind = parseInt(firmaNo, 10);
+    if (!Number.isFinite(ind)) return res.status(400).json({ success: false, message: 'Geçersiz firmaNo.' });
+    const mt = req.file.mimetype || '';
+    const ext = mt.includes('png') ? 'png' : (mt.includes('jpeg') || mt.includes('jpg')) ? 'jpg' : null;
+    if (!ext) return res.status(400).json({ success: false, message: 'Yalnız PNG/JPG.' });
+    try {
+        ensureDataDir();
+        // önce eski uzantıları temizle (png↔jpg değişimi için)
+        for (const e of ['png', 'jpg', 'jpeg']) { const f = path.join(baseDir, 'data', `firma-logo-${ind}.${e}`); if (fs.existsSync(f)) fs.unlinkSync(f); }
+        fs.writeFileSync(path.join(baseDir, 'data', `firma-logo-${ind}.${ext}`), req.file.buffer);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Logo URL'den indir + kaydet.
+app.post('/api/firma/logo/url', async (req, res) => {
+    const firmaNo = req.body && req.body.firmaNo;
+    const url = req.body && req.body.url;
+    const ind = parseInt(firmaNo, 10);
+    if (!Number.isFinite(ind) || !url) return res.status(400).json({ success: false, message: 'firmaNo ve url gerekli.' });
+    try {
+        const buf = await downloadToBuffer(url);
+        const ext = /\.png($|\?)/i.test(url) ? 'png' : 'jpg';
+        ensureDataDir();
+        for (const e of ['png', 'jpg', 'jpeg']) { const f = path.join(baseDir, 'data', `firma-logo-${ind}.${e}`); if (fs.existsSync(f)) fs.unlinkSync(f); }
+        fs.writeFileSync(path.join(baseDir, 'data', `firma-logo-${ind}.${ext}`), buf);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(200).json({ success: false, message: 'Logo indirilemedi: ' + err.message });
+    }
+});
+
+app.post('/api/firma/logo/clear', (req, res) => {
+    const ind = parseInt(req.body && req.body.firmaNo, 10);
+    if (!Number.isFinite(ind)) return res.status(400).json({ success: false, message: 'firmaNo gerekli.' });
+    for (const e of ['png', 'jpg', 'jpeg']) { const f = path.join(baseDir, 'data', `firma-logo-${ind}.${e}`); try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch { /* yok say */ } }
+    res.json({ success: true });
+});
+
+// Logo önizleme (UI'da göster). ?firmaNo=
+app.get('/api/firma/logo', (req, res) => {
+    const f = firmaLogoPath(req.query.firmaNo);
+    if (!f) return res.status(404).end();
+    res.setHeader('Cache-Control', 'no-store');
+    res.sendFile(f);
 });
 
 // Belge tipi kuralına eklenecek görsel/video yükle / kaldır (kural başına).
@@ -1077,6 +1285,122 @@ async function fetchFirmaName(firmaNo) {
     } catch { return null; }
 }
 
+// ─── Firma bilgileri (TBLFIRMA — kolonlar otomatik tespit) + kullanıcı override ─
+// TBLFIRMA şeması sürümlere göre değişir; sabit kolon adı yerine INFORMATION_SCHEMA
+// ile ADRES/TELEFON/VERGI* kolonlarını yakalayıp eşleriz. Kullanıcı UI'dan
+// düzenlerse data/firma-info.json'daki override kazanır (IBAN, e-posta vb. eklenir).
+const FIRMA_INFO_PATH = path.join(baseDir, 'data', 'firma-info.json');
+function loadFirmaOverrides() {
+    try { return JSON.parse(fs.readFileSync(FIRMA_INFO_PATH, 'utf8')); } catch { return {}; }
+}
+function saveFirmaOverride(firmaNo, patch) {
+    const all = loadFirmaOverrides();
+    all[String(firmaNo)] = { ...(all[String(firmaNo)] || {}), ...patch };
+    try { ensureDataDir(); fs.writeFileSync(FIRMA_INFO_PATH, JSON.stringify(all, null, 2), 'utf8'); } catch (e) { console.error('firma-info yazılamadı:', e.message); }
+    return all[String(firmaNo)];
+}
+function ensureDataDir() { const d = path.join(baseDir, 'data'); if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); }
+
+const firmaColCache = {}; // firmaNo -> { info, at }
+async function fetchFirmaInfo(firmaNo) {
+    const ind = parseInt(firmaNo, 10);
+    const ov = loadFirmaOverrides()[String(firmaNo)] || {};
+    if (!pool || !pool.connected || !Number.isFinite(ind)) {
+        return { name: ov.name || '', ...ov };
+    }
+    try {
+        const cols = (await pool.request().query(
+            `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='TBLFIRMA'`
+        )).recordset.map(x => x.COLUMN_NAME);
+        const up = cols.map(c => c.toUpperCase());
+        const pick = (...cands) => { for (const c of cands) { const i = up.indexOf(c); if (i >= 0) return cols[i]; } return null; };
+        // Vega TBLFIRMA (canlı doğrulandı): unvan AD1+AD2, kısa ad KISAAD; adres
+        // parçalı (MAHALLE/CADDE/SOKAK/APARTMANADI/APARTMANNO/DAIRE/ILCE/SEHIR/POSTAKODU);
+        // vergi dairesi VDAIRESI, vergi no VNO/TCKIMLIKNO; mail MAIL; web WEBSITE.
+        // Telefon kolonu bu şemada yok → boş (kullanıcı elle girer).
+        const map = {
+            ad1: pick('AD1', 'UNVAN', 'FIRMAADI'),
+            ad2: pick('AD2'),
+            kisaad: pick('KISAAD', 'ADI'),
+            mahalle: pick('MAHALLE'), cadde: pick('CADDE'), sokak: pick('SOKAK'),
+            apartmanAdi: pick('APARTMANADI'), apartmanNo: pick('APARTMANNO'), daire: pick('DAIRE'),
+            ilce: pick('ILCE'), sehir: pick('SEHIR', 'IL'), postaKodu: pick('POSTAKODU'),
+            phone: pick('TELEFON', 'TELEFON1', 'TEL', 'GSM', 'CEP'),
+            email: pick('MAIL', 'EPOSTA', 'EMAIL', 'E_POSTA'),
+            taxOffice: pick('VDAIRESI', 'VERGIDAIRESI', 'VDAIRE'),
+            taxNo: pick('VNO', 'VERGINO', 'VKN'),
+            tckn: pick('TCKIMLIKNO'),
+            web: pick('WEBSITE', 'WEB', 'INTERNETADRESI'),
+        };
+        const selCols = [...new Set(Object.values(map).filter(Boolean))];
+        const row = selCols.length
+            ? (await pool.request().query(`SELECT ${selCols.map(c => `[${c}]`).join(', ')} FROM TBLFIRMA WHERE IND=${ind}`)).recordset[0] || {}
+            : {};
+        const val = (col) => (col && row[col] != null ? String(row[col]).trim() : '');
+        // Adres: parçaları oku (boş olanları at). "No:x D:y  İlçe/Şehir Posta".
+        const apt = [val(map.apartmanAdi), val(map.apartmanNo) ? `No:${val(map.apartmanNo)}` : '', val(map.daire) ? `D:${val(map.daire)}` : ''].filter(Boolean).join(' ');
+        const yer = [val(map.ilce), val(map.sehir)].filter(Boolean).join('/');
+        const address = [val(map.mahalle), val(map.cadde), val(map.sokak), apt, yer, val(map.postaKodu)].filter(Boolean).join(' ');
+        const db = {
+            name: [val(map.ad1), val(map.ad2)].filter(Boolean).join(' ') || val(map.kisaad),
+            address,
+            phone: val(map.phone),
+            email: val(map.email),
+            taxOffice: val(map.taxOffice),
+            taxNo: val(map.taxNo) || val(map.tckn),
+            web: val(map.web),
+            city: val(map.sehir),
+            district: val(map.ilce),
+        };
+        // Override (kullanıcı UI) DB üstüne yazar; boş override DB'yi ezmesin.
+        const merged = { ...db };
+        for (const [k, v] of Object.entries(ov)) if (v != null && String(v).trim() !== '') merged[k] = v;
+        merged.iban = ov.iban || ''; // IBAN yalnız override'dan
+        return merged;
+    } catch (e) {
+        console.error('fetchFirmaInfo:', e.message);
+        return { name: ov.name || '', ...ov };
+    }
+}
+
+// Firma logosu: data/firma-logo-<ind>.<ext>. Buffer döner (PDF için) ya da null.
+function loadFirmaLogo(firmaNo) {
+    const ind = parseInt(firmaNo, 10);
+    if (!Number.isFinite(ind)) return null;
+    for (const ext of ['png', 'jpg', 'jpeg']) {
+        const f = path.join(baseDir, 'data', `firma-logo-${ind}.${ext}`);
+        try { if (fs.existsSync(f)) return fs.readFileSync(f); } catch { /* yok say */ }
+    }
+    return null;
+}
+function firmaLogoPath(firmaNo) {
+    const ind = parseInt(firmaNo, 10);
+    for (const ext of ['png', 'jpg', 'jpeg']) {
+        const f = path.join(baseDir, 'data', `firma-logo-${ind}.${ext}`);
+        if (fs.existsSync(f)) return f;
+    }
+    return null;
+}
+
+// URL'den buffer indir (logo URL için). Boyut sınırı 3MB.
+function downloadToBuffer(url) {
+    return new Promise((resolve, reject) => {
+        let mod;
+        try { mod = require(url.startsWith('https') ? 'https' : 'http'); } catch { return reject(new Error('geçersiz URL')); }
+        const req = mod.get(url, { timeout: 15000 }, (res) => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                res.resume(); return resolve(downloadToBuffer(res.headers.location));
+            }
+            if (res.statusCode !== 200) { res.resume(); return reject(new Error('HTTP ' + res.statusCode)); }
+            const chunks = []; let size = 0;
+            res.on('data', (c) => { size += c.length; if (size > 3_000_000) { req.destroy(); reject(new Error('dosya çok büyük')); } else chunks.push(c); });
+            res.on('end', () => resolve(Buffer.concat(chunks)));
+        });
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error('zaman aşımı')));
+    });
+}
+
 // CARIHAREKETLERI.IZAHAT = Vega işlem kodu (canlı doğrulandı F0101). Belge tipi
 // etiketi + "belge içeriği" (kalem) için kaynak belge tablosu eşlemesi.
 const IZAHAT_LABEL = {
@@ -1243,9 +1567,10 @@ app.get('/api/extre/pdf', async (req, res) => {
         const indNum = parseInt(ind, 10);
         const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum) || {};
         const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum, { withKalemler: true });
-        const firmaName = await fetchFirmaName(firmaNo);
+        const firma = await fetchFirmaInfo(firmaNo);
         const pdf = await buildExtrePdf({
-            firmaName: firmaName || '', cariName: c.name || String(indNum), cariKod: c.kod || '',
+            firmaName: (firma && firma.name) || '', firma, logo: loadFirmaLogo(firmaNo),
+            cariName: c.name || String(indNum), cariKod: c.kod || '',
             donem: donemNo, rows, net, generatedAt: new Date(),
         });
         res.setHeader('Content-Type', 'application/pdf');
@@ -1275,9 +1600,10 @@ app.post('/api/extre/send', async (req, res) => {
         if (!c.phone || !c.valid) return res.status(400).json({ success: false, message: 'Carinin geçerli telefonu yok.' });
 
         const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum, { withKalemler: true });
-        const firmaName = await fetchFirmaName(firmaNo);
+        const firma = await fetchFirmaInfo(firmaNo);
         const pdf = await buildExtrePdf({
-            firmaName: firmaName || '', cariName: c.name, cariKod: c.kod,
+            firmaName: (firma && firma.name) || '', firma, logo: loadFirmaLogo(firmaNo),
+            cariName: c.name, cariKod: c.kod,
             donem: donemNo, rows, net, generatedAt: new Date(),
         });
 
@@ -1723,6 +2049,44 @@ reminders.configure({
 
 // Arctos'ta o an açık cariyi plan cache'ten tespit eden izleyici (yüzen buton için).
 activeCari.configure({ getPool: () => pool, sql });
+
+// AI oto-yanıt botu: gelen WA mesajlarına Claude Haiku ile SEÇMELİ cevap.
+// Anahtar config.json'daki DB parolasıyla aynı makine anahtarıyla şifrelenir.
+aiBot.configure({
+    getPool: () => pool,
+    sql,
+    findCariByPhone,
+    fetchNetBalances,
+    fetchRecentMovements,
+    waSend,
+    waStatus,
+    encryptSecret,
+    decryptSecret,
+    // Bot "borç sebebi / ekstre" sorusunda PDF hesap ekstresi üretir (manuel gönderimle aynı üretici).
+    buildCariExtre: async (firmaNo, donemNo, ind) => {
+        const indNum = parseInt(ind, 10);
+        const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum) || {};
+        const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum, { withKalemler: true });
+        const firma = await fetchFirmaInfo(firmaNo);
+        const pdf = await buildExtrePdf({
+            firmaName: (firma && firma.name) || '', firma, logo: loadFirmaLogo(firmaNo),
+            cariName: c.name || String(indNum), cariKod: c.kod || '',
+            donem: donemNo, rows, net, generatedAt: new Date(),
+        });
+        const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
+        return { buffer: pdf, fileName };
+    },
+    recordSent: () => { try { antiban.recordSent(waStatus().me, 'aibot'); } catch { /* yok say */ } },
+    // firma/dönem config'te boşsa uygulama bağlamına düş.
+    getContext: () => {
+        const c = loadConfigFile();
+        if (c && c.uiContext) return c.uiContext;
+        try { const w = watcher.getConfig(); return { firmaNo: w.firmaNo, donemNo: w.donemNo }; } catch { return null; }
+    },
+    baseDir,
+});
+// Baileys gelen-mesaj dinleyicisini bota bağla (her yeniden bağlanışta yeniden kurulur).
+setIncomingHandler(aiBot.handleIncoming);
 
 app.listen(PORT, async () => {
     const url = `http://localhost:${PORT}`;
