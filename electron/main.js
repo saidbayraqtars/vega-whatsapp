@@ -7,7 +7,7 @@
 //    otomatik DB bağlantısı + watcher (kullanıcı PIN girmeden takip sürer).
 // ═══════════════════════════════════════════════════════════════════════════
 
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, safeStorage, dialog } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, safeStorage } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
@@ -85,34 +85,73 @@ function installUpdateNow() {
     autoUpdater.quitAndInstall(true, true); // sessiz kur + kurulunca yeniden başlat
 }
 
+// ─── Güncelleme durum penceresi ────────────────────────────────────────────────
+// İndirme arka planda sürer; sağ-altta küçük, logolu "Güncelleme yükleniyor..."
+// kartı çıkar (odak çalmaz). İndirme bitince aynı kartta "Şimdi Kur / Sonra".
+let updateWindow = null;
+let updateWinState = null;
+
+function sendUpdateState(state) {
+    updateWinState = state;
+    if (updateWindow && !updateWindow.isDestroyed()) {
+        updateWindow.webContents.send('updater:state', state);
+    }
+}
+
+function createUpdateWindow() {
+    if (updateWindow && !updateWindow.isDestroyed()) { return; }
+    const { screen } = require('electron');
+    const wa = screen.getPrimaryDisplay().workArea;
+    updateWindow = new BrowserWindow({
+        width: 380, height: 160,
+        x: wa.x + wa.width - 396, y: wa.y + wa.height - 176,
+        frame: false, transparent: true, hasShadow: false,
+        resizable: false, maximizable: false, minimizable: false, fullscreenable: false,
+        skipTaskbar: true, alwaysOnTop: true, show: false,
+        title: 'Güncelleme',
+        webPreferences: { preload: path.join(__dirname, 'updater-preload.js'), contextIsolation: true },
+    });
+    updateWindow.loadFile(path.join(__dirname, 'updater.html'));
+    updateWindow.webContents.on('did-finish-load', () => {
+        if (updateWinState) updateWindow.webContents.send('updater:state', updateWinState);
+    });
+    updateWindow.once('ready-to-show', () => {
+        if (updateWindow && !updateWindow.isDestroyed()) updateWindow.showInactive(); // odak çalma
+    });
+    updateWindow.on('closed', () => { updateWindow = null; });
+}
+
+function closeUpdateWindow() {
+    if (updateWindow && !updateWindow.isDestroyed()) updateWindow.close();
+}
+
 function setupAutoUpdater() {
     if (!app.isPackaged) return; // geliştirmede (npm start) denetleme yapma
 
     autoUpdater.autoDownload = true;
     autoUpdater.autoInstallOnAppQuit = true; // kullanıcı "Sonra" derse çıkışta kurulur
 
+    // İndirme başladı → durum penceresini göster (arka planda inmeye devam eder).
+    autoUpdater.on('update-available', (info) => {
+        updateVersion = info.version;
+        createUpdateWindow();
+        sendUpdateState({ phase: 'downloading', version: info.version, percent: 0 });
+    });
+
+    autoUpdater.on('download-progress', (p) => {
+        sendUpdateState({ phase: 'downloading', version: updateVersion, percent: Math.round(p?.percent || 0) });
+    });
+
     autoUpdater.on('update-downloaded', (info) => {
         updateDownloaded = true;
         updateVersion = info.version;
         refreshTrayMenu();
-        if (tray) tray.displayBalloon?.({
-            title: 'Expert Bilişim',
-            content: `Yeni sürüm ${info.version} indirildi. Tray menüsünden kurabilir veya çıkışta otomatik kurulmasını bekleyebilirsiniz.`,
-        });
-        // Pencere açıksa kullanıcıya sor; tray'de gizliyse rahatsız etme.
-        if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
-            dialog.showMessageBox(mainWindow, {
-                type: 'info',
-                buttons: ['Şimdi Kur ve Yeniden Başlat', 'Sonra'],
-                defaultId: 0, cancelId: 1,
-                title: 'Güncelleme hazır',
-                message: `Yeni sürüm ${info.version} indirildi.`,
-                detail: 'Şimdi kurulursa uygulama yeniden başlar; tahsilat takibi kurulum sonrası kaldığı yerden sürer (watermark kalıcıdır).',
-            }).then(r => { if (r.response === 0) installUpdateNow(); });
-        }
+        // Aynı kartta "Şimdi Kur / Sonra" — native dialog yok.
+        createUpdateWindow();
+        sendUpdateState({ phase: 'ready', version: info.version });
     });
 
-    autoUpdater.on('error', (e) => console.error('[Updater]', e?.message || e));
+    autoUpdater.on('error', (e) => { console.error('[Updater]', e?.message || e); closeUpdateWindow(); });
 
     // Açılışta + her 4 saatte bir denetle (uygulama tray'de uzun süre açık kalıyor).
     autoUpdater.checkForUpdates().catch(() => { /* ağ yoksa sessiz geç */ });
@@ -232,6 +271,10 @@ ipcMain.handle('pin:has', () => fs.existsSync(AUTH_BIN));
 ipcMain.handle('pin:clear', () => { clearPin(); return true; });
 ipcMain.handle('autostart:get', () => app.getLoginItemSettings().openAtLogin);
 ipcMain.handle('autostart:set', (_e, on) => { app.setLoginItemSettings({ openAtLogin: !!on, args: ['--hidden'] }); return true; });
+
+// Güncelleme penceresi butonları.
+ipcMain.on('updater:install', () => installUpdateNow());
+ipcMain.on('updater:later', () => closeUpdateWindow()); // çıkışta otomatik kurulur
 
 // Yüzen buton: pencere boyutu (önizleme açılınca büyür) + gizle.
 ipcMain.on('float:size', (_e, { w, h } = {}) => {

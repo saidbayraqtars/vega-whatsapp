@@ -591,12 +591,13 @@ async function sendOne(id, ind) {
 
     // Silinmiş cari koruması: kart DB'den silinmişse resolveCariContacts boş döner ama
     // withManualPhone elle-numarayı enjekte edip FANTOM gönderim yapabilir → önce varlığı
-    // doğrula. Yoksa gönderme + log/dedup/elle-numara kalıntısını temizle. (Varlık sorgusu
-    // patlarsa engelleme, normal akış sürsün — yanlış "silinmiş" ile meşru gönderimi kesme.)
+    // doğrula. existingCariInds null = kontrol edilemedi (engelleme, normal akış sürsün);
+    // Set = kesin sonuç, tek ind kümede yoksa cari silinmiş → gönderme + kalıntıyı temizle.
+    // (Eski `exists.size &&` koşulu tek-ind sorguda hep boş küme gördüğünden hiç tetiklenmiyordu.)
     try {
         if (deps.existingCariInds) {
             const exists = await deps.existingCariInds(firmaNo, [indNum]);
-            if (exists && exists.size && !exists.has(indNum)) {
+            if (exists && !exists.has(indNum)) {
                 purgeCariFromState([indNum], firmaNo);
                 return { success: false, message: 'Cari veritabanında yok (silinmiş) — gönderilmedi' };
             }
@@ -681,7 +682,10 @@ async function reconcileWithDb(force = false) {
     // log + perCariTried + (aktif firmanın) elle-numaralarındaki tüm ind'leri topla.
     const inds = new Set();
     for (const e of log) if (e && e.ind != null) { const n = parseInt(e.ind, 10); if (Number.isFinite(n)) inds.add(n); }
-    for (const rem of config.reminders || []) for (const k of Object.keys(rem.perCariTried || {})) { const n = parseInt(k, 10); if (Number.isFinite(n)) inds.add(n); }
+    for (const rem of config.reminders || []) {
+        for (const k of Object.keys(rem.perCariTried || {})) { const n = parseInt(k, 10); if (Number.isFinite(n)) inds.add(n); }
+        for (const k of Object.keys(rem.perCariLastSent || {})) { const n = parseInt(k, 10); if (Number.isFinite(n)) inds.add(n); }
+    }
     const prefix = `${firmaNo}:`;
     for (const k of Object.keys(manualPhones)) if (k.startsWith(prefix)) { const n = parseInt(k.slice(prefix.length), 10); if (Number.isFinite(n)) inds.add(n); }
     const idList = [...inds];
@@ -689,7 +693,8 @@ async function reconcileWithDb(force = false) {
     let existing;
     try { existing = await deps.existingCariInds(firmaNo, idList); }
     catch (e) { console.error('[Reminders] DB uzlaştırma sorgusu:', e.message); return; }
-    // existingCariInds boş dönerse (DB anlık kopması vb.) hepsini silinmiş sanma.
+    // null = kontrol edilemedi. Boş küme "hepsi silinmiş" demek ama izlenen TÜM carilerin
+    // birden silinmesi anormal — güvenli taraf: toplu temizliği atla (tek-ind guard sendOne'da).
     if (!existing || !existing.size) return;
     const goneList = idList.filter(i => !existing.has(i));
     if (!goneList.length) return;

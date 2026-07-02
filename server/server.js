@@ -837,17 +837,22 @@ async function activeCariInds(firmaNo, indList) {
 // Verilen IND'ler içinden DB'de HÂLÂ VAR OLAN carileri döner (kart silinmiş mi kontrolü).
 // activeCariInds'ten farkı: STATUS'e BAKMAZ → pasif (STATUS=2) cari yine "var" sayılır.
 // Yalnız gerçekten silinmiş (TBLCARI'de satır yok / DELETED=1) olanlar kümede DEĞİL.
+// SÖZLEŞME: sorgu ÇALIŞAMADIYSA (pool yok / geçersiz girdi) null döner = "bilinmiyor",
+// çağıran engelleme yapmaz (fail-open). Set döndüyse sonuç KESİNDİR: kümede olmayan
+// ind gerçekten silinmiştir — boş küme "hepsi silinmiş" demektir, "DB kopuk" değil.
+// (Eski hali her iki durumda da boş küme dönüyordu; tek-ind kontrolünde "silinmiş" ile
+// "kontrol edilemedi" ayırt edilemiyor, sendOne guard'ı hiç tetiklenmiyordu.)
 // reminders DB-uzlaştırması: silinen carinin log/dedup/elle-numara kalıntısını temizler,
 // pasif carinin kalıcı verisine (perCariLastSent / manuel numara) DOKUNMADAN.
 async function existingCariInds(firmaNo, indList) {
-    const set = new Set();
-    if (!pool || !pool.connected || !Array.isArray(indList) || !indList.length) return set;
+    if (!pool || !pool.connected || !Array.isArray(indList) || !indList.length) return null;
     const ids = indList.map(n => parseInt(n, 10)).filter(Number.isFinite);
-    if (!ids.length) return set;
+    if (!ids.length) return null;
     const info = await detectCariColumns(firmaNo);
     const where = [`IND IN (${ids.join(',')})`];
     if (info.hasDeleted) where.push('ISNULL(DELETED,0)=0');
     const rows = (await pool.request().query(`SELECT IND FROM [${info.table}] WHERE ${where.join(' AND ')}`)).recordset;
+    const set = new Set();
     for (const row of rows) set.add(row.IND);
     return set;
 }

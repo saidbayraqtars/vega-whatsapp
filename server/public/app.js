@@ -127,6 +127,9 @@ async function loadFirmalar() {
 $('firmaSel').onchange = async () => { await saveContext($('firmaSel').value, state.donemNo); await loadCari(); };
 $('searchBtn').onclick = loadCari;
 $('searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadCari(); });
+// Canlı arama: yazdıkça (350ms bekleyerek) otomatik ara — Ara butonu kalktı.
+let searchDebounce = null;
+$('searchInput').addEventListener('input', () => { clearTimeout(searchDebounce); searchDebounce = setTimeout(loadCari, 350); });
 $('onlySms').onchange = loadCari;
 $('cariTypeSel').onchange = loadCari;
 $('onlyBalance').onchange = loadCari;
@@ -217,6 +220,8 @@ $('selClear').onclick = () => { state.selected.clear(); renderCari(); };
 
 function updateSelCount() {
     $('selCount').textContent = state.selected.size;
+    // "Temizle" yalnız seçim varken görünsün (ekranda gereksiz buton kalmasın).
+    $('selClear').style.display = state.selected.size ? '' : 'none';
     updateEstimate();
 }
 
@@ -1460,7 +1465,7 @@ function applyTheme(t) {
     const dark = t === 'dark';
     document.documentElement.classList.toggle('dark', dark);
     const b = $('themeBtn');
-    if (b) b.textContent = dark ? '☀️ Tema' : '🌙 Tema';
+    if (b) b.textContent = dark ? '☀️' : '🌙';
 }
 (function initTheme() {
     let t = 'light';

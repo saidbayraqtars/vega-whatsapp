@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8" />
+<title>Güncelleme</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { background: transparent; overflow: hidden; }
+    body {
+        font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+        padding: 10px; /* gölge payı */
+        -webkit-user-select: none; user-select: none;
+    }
+    .card {
+        background: #101828;
+        border: 1px solid #263349;
+        border-radius: 14px;
+        padding: 14px 16px;
+        color: #dbe2ec;
+        box-shadow: 0 12px 36px rgba(0, 0, 0, .45);
+        -webkit-app-region: drag; /* pencere sürüklenebilir */
+    }
+    .head { display: flex; align-items: center; gap: 11px; }
+    .logo {
+        width: 34px; height: 34px; border-radius: 9px; flex: none;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 15px; font-weight: 800; color: #fff;
+        background: linear-gradient(135deg, #22c55e 0%, #15803d 100%);
+        box-shadow: 0 4px 12px rgba(22, 163, 74, .35);
+    }
+    .logo img { width: 34px; height: 34px; border-radius: 9px; display: block; }
+    .brand { font-weight: 700; font-size: 13.5px; color: #f2f5f9; line-height: 1.2; }
+    .brand span { color: #22c55e; }
+    .msg { font-size: 12px; color: #93a0b4; margin-top: 2px; }
+    .bar {
+        height: 7px; background: #1e2a40; border-radius: 999px;
+        overflow: hidden; margin-top: 12px;
+    }
+    .bar > div {
+        height: 100%; width: 0%;
+        background: linear-gradient(90deg, #16a34a, #22c55e);
+        border-radius: 999px;
+        transition: width .35s ease;
+    }
+    /* Yüzde bilinmiyorken kayan animasyon */
+    .bar.indet > div {
+        width: 35%;
+        animation: slide 1.2s ease-in-out infinite alternate;
+    }
+    @keyframes slide { from { margin-left: 0; } to { margin-left: 65%; } }
+    .pct { font-size: 11px; color: #5f6c80; margin-top: 6px; text-align: right; min-height: 13px; }
+    .actions { display: none; gap: 8px; margin-top: 12px; -webkit-app-region: no-drag; }
+    .actions button {
+        font-family: inherit; cursor: pointer; border: none;
+        border-radius: 9px; padding: 8px 12px; font-size: 12.5px; font-weight: 600;
+        flex: 1;
+    }
+    .b-install { background: #16a34a; color: #fff; }
+    .b-install:hover { background: #12813c; }
+    .b-later { background: transparent; border: 1px solid #263349 !important; color: #93a0b4; }
+    .b-later:hover { color: #dbe2ec; background: rgba(148, 163, 184, .09); }
+    .ready .bar, .ready .pct { display: none; }
+    .ready .actions { display: flex; }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+    <div class="head">
+        <div class="logo"><img src="icon.png" alt="" onerror="var p=this.parentElement; this.remove(); p.textContent='EB'" /></div>
+        <div>
+            <div class="brand">Expert <span>Bilişim</span></div>
+            <div class="msg" id="msg">Güncelleme yükleniyor...</div>
+        </div>
+    </div>
+    <div class="bar indet" id="bar"><div id="fill"></div></div>
+    <div class="pct" id="pct"></div>
+    <div class="actions">
+        <button class="b-install" id="bInstall">Şimdi Kur</button>
+        <button class="b-later" id="bLater">Sonra</button>
+    </div>
+</div>
+<script>
+    const $ = (id) => document.getElementById(id);
+    $('bInstall').onclick = () => window.vegaUpdater.install();
+    $('bLater').onclick = () => window.vegaUpdater.later();
+
+    window.vegaUpdater.onState((s) => {
+        if (!s) return;
+        const v = s.version ? ' (v' + s.version + ')' : '';
+        if (s.phase === 'downloading') {
+            $('card').classList.remove('ready');
+            $('msg').textContent = 'Güncelleme yükleniyor...' + v;
+            const p = Math.max(0, Math.min(100, Math.round(s.percent || 0)));
+            if (p > 0) {
+                $('bar').classList.remove('indet');
+                $('fill').style.width = p + '%';
+                $('pct').textContent = '%' + p;
+            } else {
+                $('bar').classList.add('indet');
+                $('pct').textContent = '';
+            }
+        } else if (s.phase === 'ready') {
+            $('card').classList.add('ready');
+            $('msg').textContent = 'Yeni sürüm hazır' + v + ' — kurulsun mu?';
+        }
+    });
+</script>
+</body>
+</html>
