@@ -834,6 +834,24 @@ async function activeCariInds(firmaNo, indList) {
     return set;
 }
 
+// Verilen IND'ler içinden DB'de HÂLÂ VAR OLAN carileri döner (kart silinmiş mi kontrolü).
+// activeCariInds'ten farkı: STATUS'e BAKMAZ → pasif (STATUS=2) cari yine "var" sayılır.
+// Yalnız gerçekten silinmiş (TBLCARI'de satır yok / DELETED=1) olanlar kümede DEĞİL.
+// reminders DB-uzlaştırması: silinen carinin log/dedup/elle-numara kalıntısını temizler,
+// pasif carinin kalıcı verisine (perCariLastSent / manuel numara) DOKUNMADAN.
+async function existingCariInds(firmaNo, indList) {
+    const set = new Set();
+    if (!pool || !pool.connected || !Array.isArray(indList) || !indList.length) return set;
+    const ids = indList.map(n => parseInt(n, 10)).filter(Number.isFinite);
+    if (!ids.length) return set;
+    const info = await detectCariColumns(firmaNo);
+    const where = [`IND IN (${ids.join(',')})`];
+    if (info.hasDeleted) where.push('ISNULL(DELETED,0)=0');
+    const rows = (await pool.request().query(`SELECT IND FROM [${info.table}] WHERE ${where.join(' AND ')}`)).recordset;
+    for (const row of rows) set.add(row.IND);
+    return set;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  DÖNEMLER (cari hareket tabloları → dönem listesi)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2041,6 +2059,7 @@ reminders.configure({
     resolveCariContacts,
     reminderCandidateInds,
     activeCariInds,
+    existingCariInds,
     waSend,
     checkOnWhatsApp,
     waStatus,

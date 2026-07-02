@@ -589,6 +589,20 @@ async function sendOne(id, ind) {
     const indNum = parseInt(ind, 10);
     if (!Number.isFinite(indNum)) return { success: false, message: 'Geçersiz cari' };
 
+    // Silinmiş cari koruması: kart DB'den silinmişse resolveCariContacts boş döner ama
+    // withManualPhone elle-numarayı enjekte edip FANTOM gönderim yapabilir → önce varlığı
+    // doğrula. Yoksa gönderme + log/dedup/elle-numara kalıntısını temizle. (Varlık sorgusu
+    // patlarsa engelleme, normal akış sürsün — yanlış "silinmiş" ile meşru gönderimi kesme.)
+    try {
+        if (deps.existingCariInds) {
+            const exists = await deps.existingCariInds(firmaNo, [indNum]);
+            if (exists && exists.size && !exists.has(indNum)) {
+                purgeCariFromState([indNum], firmaNo);
+                return { success: false, message: 'Cari veritabanında yok (silinmiş) — gönderilmedi' };
+            }
+        }
+    } catch (e) { console.error('[Reminders] sendOne varlık kontrolü:', e.message); }
+
     let bakiye = null;
     if (rem.type === 'anyBalance') {
         const netMap = await fetchNetBalances(pool, firmaNo, config.donemNo, [indNum]);
@@ -628,6 +642,60 @@ async function sendOne(id, ind) {
     return { success: false, message: res.error || 'Gönderilemedi' };
 }
 
+// ─── DB uzlaştırma (silinen cari kalıntısını temizle) ──────────────────────────
+// Log/dedup/elle-numara SNAPSHOT tutar; cari DB'den SİLİNİRSE bu kayıtlar kalır →
+// UI'da "veritabanında olmayan" satır + "Yeniden dene"/elle-numarayla FANTOM gönderim
+// riski. Bu fonksiyon log + perCari* + elle-numaralardaki ind'leri DB ile karşılaştırıp
+// GERÇEKTEN SİLİNMİŞ (existingCariInds'te olmayan) olanları temizler. Pasif cariye
+// DOKUNMAZ (o "var", verisi korunur). Saatte bir (tick içinde throttle'lı).
+function purgeCariFromState(indNums, firmaNo) {
+    const gone = new Set((indNums || []).map(n => parseInt(n, 10)).filter(Number.isFinite));
+    if (!gone.size) return false;
+    let changed = false;
+    const before = log.length;
+    log = log.filter(e => !(e && e.ind != null && gone.has(parseInt(e.ind, 10))));
+    if (log.length !== before) { try { writeJsonAtomic(LOG_PATH, JSON.stringify(log)); } catch { /* bellekte devam */ } changed = true; }
+    let cfg = false;
+    for (const rem of config.reminders || []) {
+        for (const i of gone) {
+            if (rem.perCariTried && rem.perCariTried[i] != null) { delete rem.perCariTried[i]; cfg = true; }
+            if (rem.perCariLastSent && rem.perCariLastSent[i] != null) { delete rem.perCariLastSent[i]; cfg = true; }
+        }
+    }
+    if (cfg) { saveConfig(); changed = true; }
+    let mp = false;
+    for (const i of gone) { const k = manualKey(firmaNo, i); if (manualPhones[k] != null) { delete manualPhones[k]; mp = true; } }
+    if (mp) { saveManualPhones(); changed = true; }
+    return changed;
+}
+
+let lastReconcileAt = 0;
+const RECONCILE_MS = 60 * 60 * 1000; // saatte bir yeterli (DB yükü minimum)
+async function reconcileWithDb(force = false) {
+    if (!force && Date.now() - lastReconcileAt < RECONCILE_MS) return;
+    const pool = deps.getPool();
+    if (!pool || !pool.connected) return; // DB yokken "hepsi silinmiş" sanma
+    const firmaNo = config.firmaNo;
+    if (!firmaNo || !deps.existingCariInds) return;
+    lastReconcileAt = Date.now();
+    // log + perCariTried + (aktif firmanın) elle-numaralarındaki tüm ind'leri topla.
+    const inds = new Set();
+    for (const e of log) if (e && e.ind != null) { const n = parseInt(e.ind, 10); if (Number.isFinite(n)) inds.add(n); }
+    for (const rem of config.reminders || []) for (const k of Object.keys(rem.perCariTried || {})) { const n = parseInt(k, 10); if (Number.isFinite(n)) inds.add(n); }
+    const prefix = `${firmaNo}:`;
+    for (const k of Object.keys(manualPhones)) if (k.startsWith(prefix)) { const n = parseInt(k.slice(prefix.length), 10); if (Number.isFinite(n)) inds.add(n); }
+    const idList = [...inds];
+    if (!idList.length) return;
+    let existing;
+    try { existing = await deps.existingCariInds(firmaNo, idList); }
+    catch (e) { console.error('[Reminders] DB uzlaştırma sorgusu:', e.message); return; }
+    // existingCariInds boş dönerse (DB anlık kopması vb.) hepsini silinmiş sanma.
+    if (!existing || !existing.size) return;
+    const goneList = idList.filter(i => !existing.has(i));
+    if (!goneList.length) return;
+    if (purgeCariFromState(goneList, firmaNo)) console.log(`[Reminders] DB uzlaştırma: ${goneList.length} silinmiş cari log/dedup/elle-numaradan temizlendi.`);
+}
+
 // ─── Zamanlayıcı ────────────────────────────────────────────────────────────────
 // isDue false ise SEBEBİ döner (UI'da "neden göndermedi" görünsün); due ise null.
 function dueReason(rem, now = new Date()) {
@@ -663,6 +731,8 @@ async function tick() {
     lastTickAt = new Date().toISOString();
     lastError = null;
     try {
+        // Silinen cari kalıntısını DB ile uzlaştır (saatte bir; ilk tick'te hemen).
+        try { await reconcileWithDb(); } catch (e) { console.error('[Reminders] uzlaştırma:', e.message); }
         let ranAny = false;
         const skips = [];
         for (const rem of config.reminders || []) {

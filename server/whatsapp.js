@@ -245,6 +245,11 @@ const initializeWhatsApp = async () => {
             connectTimeoutMs: 60_000,
             defaultQueryTimeoutMs: 60_000,
             keepAliveIntervalMs: 25_000,
+            // Bağlanınca hesabı "online" İŞARETLEME. Varsayılan true; online olunca WA
+            // bildirimleri aktif cihaza (bu programa) yönlendirir → telefon/diğer bağlı
+            // cihazlar push ALMAZ. false → telefon birincil kalır, bildirimler oraya düşer;
+            // program yine sessizce mesaj gönderir/alır.
+            markOnlineOnConnect: false,
             browser: ['Vega Toplu Mesaj', 'Chrome', '120.0'],
             // Karşı taraf mesajı çözemeyince (yeni oturum/anahtar uyuşmazlığı) WA bir
             // "retry receipt" gönderir; Baileys mesajı YENİDEN şifreleyip göndermek için
