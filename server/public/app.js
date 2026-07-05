@@ -356,6 +356,8 @@ async function openSettings() {
             $('sw_enabled').checked = sw.window.enabled !== false;
             $('sw_start').value = sw.window.start || '10:00';
             $('sw_end').value = sw.window.end || '20:00';
+            const days = Array.isArray(sw.window.days) ? sw.window.days : [1, 2, 3, 4, 5, 6];
+            [0, 1, 2, 3, 4, 5, 6].forEach(d => { const el = $('sw_day_' + d); if (el) el.checked = days.includes(d); });
         }
     } catch { /* yok say */ }
     await loadSettingsFirmalar();
@@ -366,11 +368,16 @@ $('sw_save').onclick = async () => {
     const box = $('sw_result');
     box.style.display = ''; box.className = 'hint'; box.textContent = 'Kaydediliyor...';
     try {
+        const days = [0, 1, 2, 3, 4, 5, 6].filter(d => { const el = $('sw_day_' + d); return el && el.checked; });
         const r = await api('/send-window', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled: $('sw_enabled').checked, start: $('sw_start').value, end: $('sw_end').value }),
+            body: JSON.stringify({ enabled: $('sw_enabled').checked, start: $('sw_start').value, end: $('sw_end').value, days }),
         });
-        if (r.success) { box.className = 'hint ok'; box.textContent = `✓ Kaydedildi (${r.window.start}–${r.window.end}${r.window.enabled ? '' : ', kapalı'})`; }
+        if (r.success) {
+            const DN = ['Paz', 'Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt'];
+            const dl = (r.window.days || []).map(d => DN[d]).join(',') || 'hiç';
+            box.className = 'hint ok'; box.textContent = `✓ Kaydedildi (${r.window.start}–${r.window.end} · ${dl}${r.window.enabled ? '' : ', kapalı'})`;
+        }
         else { box.className = 'err'; box.textContent = 'Kaydedilemedi.'; }
     } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
 };

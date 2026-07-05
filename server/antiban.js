@@ -127,18 +127,30 @@ function recordSent(accountId, channel = 'default') {
     save();
 }
 
-// ─── Gönderim saati penceresi (gece gönderme koruması) ───────────────────────
-// Otomatik gönderimler (hatırlatma + belge watcher) yalnız [start,end] arasında
-// yapılır; dışında sırada bekler. Manuel gönderim (toplu/Şimdi gönder/float) bu
-// pencereye TABİ DEĞİL — kullanıcı bizzat tetikler. Varsayılan 10:00–20:00
-// (akşam 20:00 → sabah 10:00 arası gönderilmez). data/antiban.json'da tutulur.
-const DEFAULT_SEND_WINDOW = { enabled: true, start: '10:00', end: '20:00' };
+// ─── Gönderim saati + günü penceresi (gece/haftasonu gönderme koruması) ───────
+// Otomatik gönderimler (hatırlatma + belge watcher) yalnız SEÇİLİ GÜNLERDE ve
+// [start,end] saatleri arasında yapılır; dışında sırada bekler. Manuel gönderim
+// (toplu/Şimdi gönder/float) bu pencereye TABİ DEĞİL — kullanıcı bizzat tetikler.
+// Varsayılan 10:00–20:00, Pzt–Cmt (Pazar kapalı). days: haftagünü indeksleri
+// (0=Pazar … 6=Cumartesi, JS getDay ile aynı). data/antiban.json'da tutulur.
+const DEFAULT_SEND_WINDOW = { enabled: true, start: '10:00', end: '20:00', days: [1, 2, 3, 4, 5, 6] };
 const validTime = (t) => (/^\d{1,2}:\d{2}$/.test(String(t || '')) ? t : null);
 const toMin = (t) => { const [h, m] = String(t).split(':').map(Number); return (h || 0) * 60 + (m || 0); };
+// days doğrulama: 0..6 tam sayılar, tekilleştir + sırala. Dizi değilse varsayılan
+// (Pazar kapalı). Boş dizi geçerli — kullanıcı hiçbir gün seçmezse hiç gönderilmez.
+const validDays = (d) => {
+    if (!Array.isArray(d)) return DEFAULT_SEND_WINDOW.days.slice();
+    return [...new Set(d.map(Number).filter(n => Number.isInteger(n) && n >= 0 && n <= 6))].sort((a, b) => a - b);
+};
 
 function getSendWindow() {
     const w = state.sendWindow || {};
-    return { enabled: w.enabled !== false, start: validTime(w.start) || DEFAULT_SEND_WINDOW.start, end: validTime(w.end) || DEFAULT_SEND_WINDOW.end };
+    return {
+        enabled: w.enabled !== false,
+        start: validTime(w.start) || DEFAULT_SEND_WINDOW.start,
+        end: validTime(w.end) || DEFAULT_SEND_WINDOW.end,
+        days: validDays(w.days),
+    };
 }
 function setSendWindow(patch = {}) {
     const cur = getSendWindow();
@@ -146,22 +158,26 @@ function setSendWindow(patch = {}) {
         enabled: patch.enabled !== undefined ? patch.enabled !== false : cur.enabled,
         start: validTime(patch.start) || cur.start,
         end: validTime(patch.end) || cur.end,
+        days: patch.days !== undefined ? validDays(patch.days) : cur.days,
     };
     save();
     return getSendWindow();
 }
-// Şu an gönderim YASAK pencerede mi? (gece). Pencere gece yarısını aşabilir (örn 22:00–06:00).
+// Şu an gönderim YASAK pencerede mi? Gün seçili değilse tüm gün yasak; seçiliyse
+// saat penceresi uygulanır. Saat penceresi gece yarısını aşabilir (örn 22:00–06:00).
 function inQuietHours(now = new Date()) {
     const w = getSendWindow();
     if (!w.enabled) return false;
+    if (!w.days.includes(now.getDay())) return true; // bugün seçili gün değil → kapalı
     const t = now.getHours() * 60 + now.getMinutes();
     const s = toMin(w.start), e = toMin(w.end);
     if (s === e) return false; // 24 saat açık
     const allowed = s < e ? (t >= s && t < e) : (t >= s || t < e);
     return !allowed;
 }
-function quietReason() {
+function quietReason(now = new Date()) {
     const w = getSendWindow();
+    if (!w.days.includes(now.getDay())) return 'Bugün otomatik gönderim kapalı (gün seçimi dışında) — sırada bekliyor';
     return `Gönderim saati dışı (${w.start}–${w.end} arası gönderilir) — sırada bekliyor`;
 }
 

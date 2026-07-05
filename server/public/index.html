@@ -496,7 +496,19 @@
             <div class="field"><label>Bitiş</label><input id="sw_end" type="time" value="20:00" /></div>
             <div class="field" style="display:flex; align-items:flex-end"><button class="btn green sm" id="sw_save" style="width:100%">Kaydet</button></div>
         </div>
-        <div class="hint">Saat dışında hatırlatma/belge mesajı sırada bekler, saat gelince gider. Toplu ve "Şimdi gönder" etkilenmez.</div>
+        <div style="margin-top:8px">
+            <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:4px">Gönderim günleri</label>
+            <div id="sw_days" style="display:flex; flex-wrap:wrap; gap:10px">
+                <label class="check"><input type="checkbox" id="sw_day_1" /> Pzt</label>
+                <label class="check"><input type="checkbox" id="sw_day_2" /> Sal</label>
+                <label class="check"><input type="checkbox" id="sw_day_3" /> Çar</label>
+                <label class="check"><input type="checkbox" id="sw_day_4" /> Per</label>
+                <label class="check"><input type="checkbox" id="sw_day_5" /> Cum</label>
+                <label class="check"><input type="checkbox" id="sw_day_6" /> Cmt</label>
+                <label class="check"><input type="checkbox" id="sw_day_0" /> Paz</label>
+            </div>
+        </div>
+        <div class="hint">Seçili gün/saat dışında hatırlatma/belge mesajı sırada bekler, pencere açılınca gider. Toplu ve "Şimdi gönder" etkilenmez.</div>
         <div class="hint" id="sw_result" style="display:none"></div>
 
         <div style="border-top:1px solid var(--border); margin:12px 0 12px"></div>
