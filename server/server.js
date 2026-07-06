@@ -2055,6 +2055,8 @@ watcher.configure({
     checkOnWhatsApp,
     waStatus,
     baseDir,
+    // {firmaadi} imzası: Firma Bilgileri (TBLFIRMA + kullanıcı override) adı.
+    getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
 });
 
 // Periyodik bakiye/borç hatırlatma zamanlayıcısı.

@@ -99,7 +99,7 @@ const PRESET_RULES = [
     {
         id: 'cariGiris', docType: 'cariGiris', name: 'Cari Giriş / Havale (Tahsilat)',
         direction: 'alacak', izahatCodes: [13, 83], excludeFatura: true, enabled: false,
-        template: 'Sayın {firma}, {tarih} tarihinde hesabınıza {tutar} TL tutarında ödemeniz alınmıştır. Güncel bakiyeniz: {bakiye} TL ({durum}). Teşekkür ederiz.',
+        template: 'Değerli müşterimiz {firma}, {tarih} itibari ile {tutar} TL. tutarındaki ödemeniz başarıyla alınmış ve hesabınıza işlenmiştir.\nSon durum Cari Hesap Bakiyeniz {bakiye} TL. dir.\nBilgi amaçlıdır. Bakiyede farklılık olduğunu düşünüyorsanız lütfen iletişime geçiniz.\n{firmaadi}',
     },
     {
         id: 'cariCikis', docType: 'cariCikis', name: 'Cari Çıkış / Banka Tediye',
@@ -516,11 +516,25 @@ function fmtAmount(n) {
     return num.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+// Firma Bilgileri'ndeki "biz" adı ({firmaadi} imzası) — pollOnce başına 1 kez, 6s TTL cache.
+let bizFirmaCache = { no: null, name: '', at: 0 };
+async function getBizFirma() {
+    if (!config.firmaNo || !deps || typeof deps.getFirmaName !== 'function') return '';
+    const now = Date.now();
+    if (bizFirmaCache.no === config.firmaNo && (now - bizFirmaCache.at) < 6 * 60 * 60 * 1000) return bizFirmaCache.name;
+    try {
+        const name = (await deps.getFirmaName(config.firmaNo)) || '';
+        bizFirmaCache = { no: config.firmaNo, name, at: now };
+        return name;
+    } catch { return bizFirmaCache.name || ''; }
+}
+
 function renderTemplate(tpl, vars) {
     return antiban.applySpintax(tpl)
         .replace(/\{ad\}/gi, vars.ad || '')
         .replace(/\{unvan\}/gi, vars.ad || '')
         .replace(/\{firma\}/gi, vars.firma || vars.ad || '')
+        .replace(/\{firmaadi\}/gi, vars.firmaadi || '')
         .replace(/\{tutar\}/gi, vars.tutar || '')
         .replace(/\{eskiTutar\}/gi, vars.eskiTutar || '')
         .replace(/\{yeniTutar\}/gi, vars.yeniTutar || '')
@@ -531,7 +545,8 @@ function renderTemplate(tpl, vars) {
         .replace(/\{bakiye\}/gi, vars.bakiye || '')
         .replace(/\{borc\}/gi, vars.bakiye || '')
         .replace(/\{durum\}/gi, vars.durum || '')
-        .replace(/ ?\(\s*\)/g, '');
+        .replace(/ ?\(\s*\)/g, '')
+        .replace(/\n+\s*$/, ''); // {firmaadi} boşsa dipteki boş satırı at
 }
 
 async function tableExists(pool, name) {
@@ -853,6 +868,7 @@ async function pollOnce() {
         const inds = [...new Set(matched.map(x => x.row.FIRMANO).filter(v => v != null))];
         const contacts = await deps.resolveCariContacts(config.firmaNo, inds);
         const borcMap = await fetchKalanBorc(pool, tbl, inds);
+        const bizFirma = await getBizFirma(); // {firmaadi} imzası (Firma Bilgileri)
 
         for (const { row, rule, amount } of matched) {
             // INSERT-guard: bu belge zaten bildirilmişse (sil+ekle ile gelen düzenleme)
@@ -896,7 +912,7 @@ async function pollOnce() {
 
             const text = renderTemplate(rule.template, {
                 ad: c.name, firma: c.firma, tutar: fmtAmount(amount), kod: c.kod, evrak: row.EVRAKNO || '',
-                belge: rule.name,
+                belge: rule.name, firmaadi: bizFirma,
                 tarih: row.TARIH ? new Date(row.TARIH).toLocaleDateString('tr-TR') : '',
                 bakiye: bakiyeStr, durum,
             });

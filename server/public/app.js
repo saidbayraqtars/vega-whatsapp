@@ -652,7 +652,7 @@ document.querySelectorAll('.tab').forEach(t => {
 });
 
 // Belge tipi şablonunda kullanılabilir değişkenler (kart başına chip).
-const WC_VARS = ['{firma}', '{ad}', '{tutar}', '{kod}', '{evrak}', '{tarih}', '{bakiye}', '{durum}', '{belge}'];
+const WC_VARS = ['{firma}', '{ad}', '{tutar}', '{kod}', '{evrak}', '{tarih}', '{bakiye}', '{durum}', '{belge}', '{firmaadi}'];
 
 // Hazır belge türleri (backend PRESET_RULES ile birebir) + Özel.
 const WC_DOCTYPES = [
@@ -789,7 +789,7 @@ function createRuleCard(rule) {
             <label>Mesaj şablonu</label>
             <textarea class="rc_template" placeholder="Sayın {firma} müşterimiz, ...">${esc(rule.template || '')}</textarea>
             <div class="chips rc_chips">${WC_VARS.map(v => `<span class="chip" data-v="${v}">${v}</span>`).join('')}</div>
-            <div class="hint">{firma}=firma adı, {tutar}=bu belgenin tutarı, {bakiye}=güncel kalan bakiye, {durum}=Borç/Alacak, {belge}=tür adı.</div>
+            <div class="hint">{firma}=cari adı, {tutar}=bu belgenin tutarı, {bakiye}=güncel kalan bakiye, {durum}=Borç/Alacak, {belge}=tür adı, {firmaadi}=kendi firma adın (Firma Bilgileri'nden).</div>
         </div>
         <div class="field">
             <label>Görsel / Video (opsiyonel)</label>
