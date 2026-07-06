@@ -35,6 +35,11 @@ let _baileys = null;
 // bağlanır ve bu callback'i çağırır (removeAllListeners sonrası kaybolmasın diye).
 let incomingHandler = null;
 const setIncomingHandler = (fn) => { incomingHandler = fn; };
+// Bağlantı kapanışını üst katmana (anti-ban) bildir. statusCode ile çağrılır;
+// anti-ban ban-şüpheli kapanışta gönderimi soğutur. whatsapp.js düşük seviyede
+// kalsın diye doğrudan antiban require etmez — server.js bağlar.
+let disconnectHandler = null;
+const setDisconnectHandler = (fn) => { disconnectHandler = fn; };
 
 // Baileys mesaj gövdesinden düz metni çıkar (farklı sarmalayıcı tipleri).
 const extractText = (msg) => {
@@ -340,6 +345,8 @@ const initializeWhatsApp = async () => {
                 waEvent(`close code=${statusCode} msg=${errMsg || ''}`);
                 isReady = false;
                 cleanupSocket();
+                // Anti-ban: ban-şüpheli kapanış / fırtına → gönderim soğuması.
+                try { disconnectHandler && disconnectHandler(statusCode); } catch { /* yok say */ }
 
                 // badSession (500) çoğu zaman geçici senkron hatası; ilk gelişte
                 // oturumu SİLMEDEN diskten yeniden bağlan, ÜST ÜSTE 2. kez gelirse
@@ -554,6 +561,7 @@ module.exports = {
     getDailySent,
     waitForReady,
     setIncomingHandler,
+    setDisconnectHandler,
     toJid,
     get client() { return sock; },
 };

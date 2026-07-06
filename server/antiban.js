@@ -25,8 +25,21 @@ const path = require('path');
 // (resmî olmayan) için güvenli kademe. Gerekirse buradan gevşetilir.
 const WARMUP_RAMP = [20, 40, 60, 90, 130, 170, 200];
 // Saatlik tavan: günlük tavanı tek saate sığdırmayı engeller. Olgun numarada
-// 200/gün ≈ 40/saat ⇒ en az ~5 saate yayılır.
+// 200/gün ≈ 40/saat ⇒ en az ~5 saate yayılır. Taze numarada bu üst sınır,
+// warm-up günlük tavanına oranla küçültülür (bkz. effectiveHourlyCap).
 const HOURLY_CAP = 40;
+
+// ─── Ban-şüphesi devre kesici (soğuma) ───────────────────────────────────────
+// Bağlantı ban-şüpheli kapanınca (403 forbidden / 401 loggedOut) veya kısa sürede
+// çok kopunca (ağ fırtınası), hesaba SOĞUMA konur → gate() o süre gönderime izin
+// vermez. Amaç: FLAGLENEN numarayı dövmeyi kes. Flaglenen numaraya gönderime devam
+// etmek uyarıyı tam bana çevirir; iki numaranın da yanmasının asıl mekanizması buydu.
+const COOLDOWN_FORBIDDEN_MS = 24 * 60 * 60 * 1000; // 403 = hesap kısıtlı (kesin)
+const COOLDOWN_LOGGEDOUT_MS = 2 * 60 * 60 * 1000;  // 401 = oturum düşürüldü (çoğu kez flag)
+const COOLDOWN_STORM_MS = 30 * 60 * 1000;          // reconnect fırtınası
+// Fırtına eşiği: STORM_WINDOW_MS içinde >= STORM_MAX_CLOSES kopma = anormal.
+const STORM_WINDOW_MS = 10 * 60 * 1000;
+const STORM_MAX_CLOSES = 8;
 
 let STATE_PATH = null;
 // accounts[accountId] = {
@@ -96,6 +109,15 @@ function rampDailyCap(acc) {
     return WARMUP_RAMP[idx];
 }
 
+// Saatlik tavanı günlük tavana oranla — taze numara günlük hakkını tek saatte
+// boşaltmasın (gün-0: 20/gün → ~7/saat). Olgun numarada üst sınır HOURLY_CAP.
+// Gözlemlenen ban: gün-0 numaraya 90 sn'de 6 mesaj + tek saatte 23 mesaj; sabit
+// 40 saatlik tavan bunları hiç durdurmuyordu.
+function effectiveHourlyCap(dailyCap) {
+    const scaled = Math.ceil((Number(dailyCap) || HOURLY_CAP) / 3);
+    return Math.max(6, Math.min(HOURLY_CAP, scaled));
+}
+
 // Gönderim ÖNCESİ izin sorgusu. channel = bağımsız günlük sayaç ('belge'|'reminder'|
 // 'bulk'|'manual'…). userDailyCap verilirse warm-up tavanıyla küçüğü alınır.
 // GÜNLÜK tavan KANAL-BAŞI; SAATLİK tavan hesap-geneli (ortak).
@@ -106,16 +128,26 @@ function gate(accountId, userDailyCap, channel = 'default') {
     const dayIndex = daysBetween(acc.firstActiveDate, dayKey());
     const rampCap = rampDailyCap(acc);
     const dailyCap = (Number(userDailyCap) > 0) ? Math.min(rampCap, Number(userDailyCap)) : rampCap;
+    const hourCap = effectiveHourlyCap(dailyCap);
+
+    // Ban-şüphesi soğuması aktifse hiç gönderme — flaglenen numarayı dövme.
+    const now = Date.now();
+    if (acc.cooldownUntil && acc.cooldownUntil > now) {
+        const mins = Math.ceil((acc.cooldownUntil - now) / 60000);
+        return { ok: false, capType: 'cooldown', channel,
+            reason: `Ban koruması: gönderim ${mins} dk durduruldu (${acc.cooldownReason || 'anormal kopma'})`,
+            dailyCap, daySent: ch.count, hourCap, hourSent: acc.hour.count, dayIndex, cooldownUntil: acc.cooldownUntil };
+    }
 
     if (ch.count >= dailyCap) {
         return { ok: false, capType: 'daily', channel, reason: `Günlük tavan doldu (${ch.count}/${dailyCap}${dayIndex < WARMUP_RAMP.length - 1 ? ', ısınma günü ' + (dayIndex + 1) : ''})`,
-            dailyCap, daySent: ch.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
+            dailyCap, daySent: ch.count, hourCap, hourSent: acc.hour.count, dayIndex };
     }
-    if (acc.hour.count >= HOURLY_CAP) {
-        return { ok: false, capType: 'hourly', channel, reason: `Saatlik tavan doldu (${acc.hour.count}/${HOURLY_CAP}) — sonraki saat sürer`,
-            dailyCap, daySent: ch.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
+    if (acc.hour.count >= hourCap) {
+        return { ok: false, capType: 'hourly', channel, reason: `Saatlik tavan doldu (${acc.hour.count}/${hourCap}) — sonraki saat sürer`,
+            dailyCap, daySent: ch.count, hourCap, hourSent: acc.hour.count, dayIndex };
     }
-    return { ok: true, channel, dailyCap, daySent: ch.count, hourCap: HOURLY_CAP, hourSent: acc.hour.count, dayIndex };
+    return { ok: true, channel, dailyCap, daySent: ch.count, hourCap, hourSent: acc.hour.count, dayIndex };
 }
 
 // Gönderim BAŞARILI olunca çağır: kanal-günlük + ortak-saatlik sayacı artır, diske yaz.
@@ -125,6 +157,39 @@ function recordSent(accountId, channel = 'default') {
     ch.count++;
     acc.hour.count++;
     save();
+}
+
+// Bağlantı kapanışını anti-ban açısından değerlendir (whatsapp.js close olayından
+// çağrılır). Ban-şüpheli kapanışta (403 forbidden / 401 loggedOut) veya kısa sürede
+// çok kopmada (ağ fırtınası) hesaba SOĞUMA koy → gate() o süre gönderime izin vermez.
+// 403/401'de warm-up da sıfırlanır: kick yiyen numara sıfırdan yavaş ısınmalı.
+// NOT: 440 (connectionReplaced = WA Web başka yerde açıldı) iyi huyludur; tek başına
+// soğuma tetiklemez, yalnız fırtına sayımına girer.
+function noteDisconnect(accountId, statusCode) {
+    if (!STATE_PATH) return null;
+    const { acc } = touch(accountId);
+    const now = Date.now();
+    const code = Number(statusCode);
+    let ms = 0, reason = null, resetWarmup = false;
+
+    if (code === 403) { ms = COOLDOWN_FORBIDDEN_MS; reason = 'hesap kısıtlı (403)'; resetWarmup = true; }
+    else if (code === 401) { ms = COOLDOWN_LOGGEDOUT_MS; reason = 'oturum düşürüldü (401)'; resetWarmup = true; }
+    else if (acc.cooldownUntil && acc.cooldownUntil > now) {
+        return null; // zaten soğumada — fırtına sayımıyla disk churn yapma
+    } else {
+        // Fırtına: son STORM_WINDOW_MS içindeki kopmaları say.
+        acc.closes = (acc.closes || []).filter(t => now - t < STORM_WINDOW_MS);
+        acc.closes.push(now);
+        if (acc.closes.length >= STORM_MAX_CLOSES) {
+            ms = COOLDOWN_STORM_MS; reason = `ağ fırtınası (${acc.closes.length} kopma/10dk)`; acc.closes = [];
+        } else { save(); return null; }
+    }
+
+    acc.cooldownUntil = Math.max(acc.cooldownUntil || 0, now + ms);
+    acc.cooldownReason = reason;
+    if (resetWarmup) acc.firstActiveDate = dayKey(); // yeniden ısınma
+    save();
+    return { cooldownMs: ms, reason };
 }
 
 // ─── Gönderim saati + günü penceresi (gece/haftasonu gönderme koruması) ───────
@@ -209,8 +274,10 @@ function snapshot(accountId, userDailyCap) {
     const dailyCap = (Number(userDailyCap) > 0) ? Math.min(rampCap, Number(userDailyCap)) : rampCap;
     return {
         dayIndex, warmup: dayIndex < WARMUP_RAMP.length - 1,
-        dailyCap, daySent: totalDaySent(acc), hourCap: HOURLY_CAP, hourSent: acc.hour.count,
+        dailyCap, daySent: totalDaySent(acc), hourCap: effectiveHourlyCap(dailyCap), hourSent: acc.hour.count,
+        cooldownUntil: (acc.cooldownUntil && acc.cooldownUntil > Date.now()) ? acc.cooldownUntil : null,
+        cooldownReason: (acc.cooldownUntil && acc.cooldownUntil > Date.now()) ? acc.cooldownReason : null,
     };
 }
 
-module.exports = { configure, gate, recordSent, snapshot, applySpintax, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };
+module.exports = { configure, gate, recordSent, noteDisconnect, snapshot, applySpintax, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };

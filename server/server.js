@@ -28,7 +28,7 @@ const multer = require('multer');
 const {
     initializeWhatsApp, refreshWhatsApp, logoutWhatsApp,
     getStatus: waStatus, sendMessage: waSend, deleteMessage: waDelete, checkOnWhatsApp, getDailySent,
-    waitForReady: waWaitForReady, setIncomingHandler,
+    waitForReady: waWaitForReady, setIncomingHandler, setDisconnectHandler,
 } = require('./whatsapp');
 const { normalizePhone, isLikelyValid } = require('./phone');
 const watcher = require('./watcher');
@@ -2044,6 +2044,9 @@ license.configure({ baseDir });
 
 // Anti-ban katmanı: warm-up rampı + saatlik/günlük tavan (hesap-başı sayaç).
 antiban.configure(baseDir);
+// Ban-şüpheli bağlantı kapanışını anti-ban'a bildir: 403/401 veya reconnect
+// fırtınasında gate() gönderimi soğutur (flaglenen numarayı dövmeyi keser).
+setDisconnectHandler((code) => { try { antiban.noteDisconnect(waStatus().me, code); } catch { /* yok say */ } });
 
 // Watcher'ı bağımlılıklarıyla yapılandır (config/state data/ altına yazılır).
 watcher.configure({
