@@ -479,7 +479,7 @@ async function _runReminder(rem, opts = {}) {
                 continue;
             }
         }
-        const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
+        const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400), channel: 'reminder' });
         if (res.success) {
             antiban.recordSent(deps.waStatus().me, 'reminder');
             sent++; rem.perCariLastSent[c.IND] = nowIso; delete rem.perCariTried[c.IND];
@@ -629,7 +629,7 @@ async function sendOne(id, ind) {
         if (!chk.exists) return { success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin' : 'Numara WhatsApp kullanıcısı değil' };
     }
     const media = loadMediaFromDescriptor(rem.media);
-    const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400) });
+    const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400), channel: 'reminder' });
     if (res.success) {
         antiban.recordSent(deps.waStatus().me, 'reminder');
         rem.perCariLastSent = rem.perCariLastSent || {}; rem.perCariTried = rem.perCariTried || {};

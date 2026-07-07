@@ -10,6 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 const { normalizePhone } = require('./phone');
+const stats = require('./stats'); // gönderim/teslim/okundu/yanıt sayacı (güven paneli)
 
 // pkg altında exe dizinini, geliştirmede klasörü kullan.
 const isPkg = typeof process.pkg !== 'undefined';
@@ -20,6 +21,10 @@ const STATS_PATH = path.join(DATA_DIR, 'wa-stats.json');
 const VERSION_PATH = path.join(DATA_DIR, 'wa-version.json');
 const EVENTS_PATH = path.join(DATA_DIR, 'wa-events.log');
 const QR_TIMEOUT_MS = 60_000;
+
+// Güven paneli sayacını baseDir'e bağla (data/stats.json). Ledger + son gönderim
+// seti bellekte; makbuz (ack) ve gelen mesaj olayları buradan beslenir.
+stats.configure(baseDir);
 
 let sock = null;
 let isReady = false;
@@ -275,6 +280,8 @@ const initializeWhatsApp = async () => {
             for (const u of (updates || [])) {
                 if (u?.key?.fromMe && u?.update && u.update.status != null) {
                     waEvent(`ack id=${u.key.id} to=${u.key.remoteJid} status=${u.update.status}`);
+                    // Güven paneli: teslim (3) / okundu (4) sayımı.
+                    try { stats.onAck(u.key.id, u.update.status); } catch { /* yok say */ }
                 }
             }
         });
@@ -301,6 +308,8 @@ const initializeWhatsApp = async () => {
                     } else {
                         continue;
                     }
+                    // Güven paneli: bize mesaj attığımız numaradan gelen = yanıt (metin/medya farketmez).
+                    try { stats.onIncoming(phone); } catch { /* yok say */ }
                     const text = extractText(m.message);
                     if (!text) continue;
                     if (!phone) { waEvent(`incoming-nopn jid=${jid}`); continue; }
@@ -520,6 +529,8 @@ const sendMessage = async (phone, text, media = null, opts = {}) => {
         // Retry/yeniden şifreleme için orijinali sakla (getMessage buradan döndürür).
         cacheSentMessage(sent?.key?.id, sent?.message);
         bumpDailySent();
+        // Güven paneli: gönderim kaydı (ack geldikçe teslim/okundu bu id'ye işlenir).
+        try { stats.recordSent({ id: sent?.key?.id, phone: clean, channel: opts.channel }); } catch { /* yok say */ }
         // TANILAMA: relay sonucu. id varsa Baileys WA sunucusuna iletti; ardından gelen
         // 'ack' satırları (messages.update) gerçek teslimi gösterir. id YOKSA relay olmadı.
         waEvent(`send-ok to=${clean} id=${sent?.key?.id || 'YOK'}`);
@@ -527,6 +538,7 @@ const sendMessage = async (phone, text, media = null, opts = {}) => {
     } catch (err) {
         console.error('[WhatsApp] Gönderim hatası →', clean, err.message);
         waEvent(`send-fail to=${clean} err=${err.message}`);
+        try { stats.recordFail(opts.channel); } catch { /* yok say */ }
         return { success: false, error: err.message };
     }
 };

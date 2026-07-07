@@ -342,7 +342,7 @@ async function handleIncoming({ phone, text, jid, id }) {
     const outText = caption || (media ? 'Hesap ekstreniz ektedir.' : '');
     if (!outText && !media) { addLog({ phone, name: ctx.name, kind: 'silent', incoming: text.slice(0, 80) }); return; }
 
-    const r = await deps.waSend(phone, outText, media, { simulateTyping: true, typingMs: 1200 });
+    const r = await deps.waSend(phone, outText, media, { simulateTyping: true, typingMs: 1200, channel: 'aibot' });
     if (r && r.success) {
         state.sent++;
         state.lastByPhone[phone] = Date.now();

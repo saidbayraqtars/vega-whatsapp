@@ -488,7 +488,7 @@ async function processPending() {
                 continue;
             }
         }
-        const res = await deps.waSend(item.phone, item.text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
+        const res = await deps.waSend(item.phone, item.text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400), channel: 'belge' });
         if (res.success) {
             antiban.recordSent(deps.waStatus().me, 'belge');
             recordSentDoc(tableName(), item, item.phone, res.id);
@@ -765,7 +765,7 @@ async function handleEdited(pool, tbl, key, e, curAmount) {
             return;
         }
     }
-    const res = await deps.waSend(c.phone, text, null, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
+    const res = await deps.waSend(c.phone, text, null, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400), channel: 'belge' });
     if (res.success) {
         antiban.recordSent(deps.waStatus().me, 'belge');
         if (res.id) { e.waMsgs.push({ phone: c.phone, id: res.id }); saveDocs(); }  // sonraki silmede bu da geri çekilir
@@ -939,7 +939,7 @@ async function pollOnce() {
                         continue;
                     }
                 }
-                const res = await deps.waSend(phone, text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400) });
+                const res = await deps.waSend(phone, text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400), channel: 'belge' });
                 if (res.success) { antiban.recordSent(deps.waStatus().me, 'belge'); recordSentDoc(tbl, base, phone, res.id); sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
                 else { enqueue(base, phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`, rule.media); queued++; }
                 await sleep(rand(8000, 20000));

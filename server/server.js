@@ -37,12 +37,21 @@ const activeCari = require('./activeCari');
 const aiBot = require('./aiBot');
 const license = require('./license');
 const antiban = require('./antiban');
+const stats = require('./stats');
 const { buildExtrePdf } = require('./extre');
 
 const QRCode = require('qrcode');
 
 const app = express();
 const PORT = process.env.PORT || 3100;
+
+// Uygulama sürümü — kök package.json'dan (Electron/electron-builder tek doğruluk
+// kaynağı). Sürüm sidebar'da elle yazılıp releaslerde unutulup duruyordu (v1.1.2
+// donmuş kalmıştı, gerçek 1.1.5'ti); artık her açılışta buradan okunup UI'a geçer.
+const APP_VERSION = (() => {
+    try { return require(path.join(__dirname, '..', 'package.json')).version; }
+    catch { try { return require('./package.json').version; } catch { return null; } }
+})();
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -223,7 +232,7 @@ async function validateTableName(tableName) {
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/check-setup', (req, res) => {
     const st = readStoredConfig();
-    res.json({ success: true, isSetup: st.exists, needsReauth: !!st.needsReauth });
+    res.json({ success: true, isSetup: st.exists, needsReauth: !!st.needsReauth, version: APP_VERSION });
 });
 
 // Kurulum — PIN istenmez; parola makine anahtarıyla şifrelenip kaydedilir.
@@ -1283,7 +1292,7 @@ app.post('/api/active-cari/send', async (req, res) => {
         if (!chk.exists) {
             return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
         }
-        const result = await waSend(c.phone, text, null, { simulateTyping: true, typingMs: 1500 });
+        const result = await waSend(c.phone, text, null, { simulateTyping: true, typingMs: 1500, channel: 'manual' });
         if (result.success) { antiban.recordSent(waStatus().me, 'manual'); return res.json({ success: true, message: 'Gönderildi.', phone: c.phone, name: c.name }); }
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
@@ -1637,7 +1646,7 @@ app.post('/api/extre/send', async (req, res) => {
             ? String(req.body.message)
             : `Sayın ${c.firma || c.name}, hesap ekstreniz ektedir.`;
         const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
-        const result = await waSend(c.phone, caption, { kind: 'document', buffer: pdf, mimetype: 'application/pdf', fileName }, { simulateTyping: true, typingMs: 1200 });
+        const result = await waSend(c.phone, caption, { kind: 'document', buffer: pdf, mimetype: 'application/pdf', fileName }, { simulateTyping: true, typingMs: 1200, channel: 'extre' });
         if (result.success) { antiban.recordSent(me, 'manual'); return res.json({ success: true, message: 'Ekstre gönderildi.', phone: c.phone, name: c.name }); }
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
@@ -1777,6 +1786,33 @@ app.post('/api/wa/logout', async (req, res) => {
     catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
+// ─── Güven paneli (Pano) ─────────────────────────────────────────────────────
+// Bugünkü gönderim/teslim/okundu/yanıt/hata + son 7 gün + anti-ban durumu (warm-up
+// günü / tavan doluluk / cooldown). Hepsi sayaç; AI yok.
+app.get('/api/stats', (req, res) => {
+    try {
+        const st = waStatus();
+        const ab = st.ready ? antiban.snapshot(st.me, DEFAULT_PACING.dailyCap) : null;
+        res.json({ success: true, today: stats.today(), history: stats.history(7), antiban: ab });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Günlük özeti kendi WhatsApp numarana gönder (kendine mesaj). st.me = bağlı hesap.
+app.post('/api/stats/push-summary', async (req, res) => {
+    try {
+        const st = waStatus();
+        if (!st.ready || !st.me) return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil.' });
+        const myPhone = String(st.me).split(':')[0].split('@')[0];
+        const result = await waSend(myPhone, stats.summaryText(), null, { channel: 'manual' });
+        if (result.success) return res.json({ success: true });
+        return res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  TOPLU GÖNDERİM (pacing + SSE ilerleme)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1885,6 +1921,7 @@ async function runJob(job) {
         let result = await waSend(phone, text, job.media, {
             simulateTyping: p.simulateTyping,
             typingMs: rand(1200, 2600),
+            channel: 'bulk',
         });
 
         // Gönderim sırasında kopma: bağlantı gelene kadar bekle, aynı alıcıya
@@ -1895,6 +1932,7 @@ async function runJob(job) {
             result = await waSend(phone, text, job.media, {
                 simulateTyping: p.simulateTyping,
                 typingMs: rand(1200, 2600),
+                channel: 'bulk',
             });
         }
         if (job.cancelled) { pushEvent(job, { type: 'cancelled', index: i }); break; }

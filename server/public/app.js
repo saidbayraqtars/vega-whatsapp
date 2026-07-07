@@ -33,6 +33,7 @@ function localContext() { try { return JSON.parse(localStorage.getItem('vega.ctx
 // ═══════════════════════════════════════════════════════════════════════════
 async function boot() {
     const r = await api('/check-setup');
+    if (r.version) { const v = $('sbVer'); if (v) v.textContent = 'v' + r.version; }
     if (!r.isSetup) { show('setupScreen'); return; }
     // Giriş PIN'i kaldırıldı: sunucu açılışta otomatik bağlanır. Bağlı değilse dene.
     try {
@@ -641,8 +642,9 @@ document.querySelectorAll('.tab').forEach(t => {
         document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
         t.classList.add('active');
         const v = t.dataset.view;
-        ['viewBulk', 'viewWatcher', 'viewReminders', 'viewExtre', 'viewAiBot', 'viewFirma'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
+        ['viewDashboard', 'viewBulk', 'viewWatcher', 'viewReminders', 'viewExtre', 'viewAiBot', 'viewFirma'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
         const at = $('appbarTitle'); if (at) at.textContent = t.dataset.title || t.textContent.trim();
+        if (v === 'viewDashboard') initDashboardView();
         if (v === 'viewWatcher') initWatcherView();
         if (v === 'viewReminders' && typeof initRemindersView === 'function') initRemindersView();
         if (v === 'viewExtre' && typeof initExtreView === 'function') initExtreView();
@@ -650,6 +652,108 @@ document.querySelectorAll('.tab').forEach(t => {
         if (v === 'viewFirma' && typeof initFirmaView === 'function') initFirmaView();
     };
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PANO (güven paneli) — gönderim/teslim/okundu/yanıt + anti-ban durumu
+// ═══════════════════════════════════════════════════════════════════════════
+let panoTimer = null;
+let panoWired = false;
+
+function initDashboardView() {
+    if (!panoWired) {
+        $('pn_refresh').onclick = () => refreshDashboard();
+        $('pn_push').onclick = async () => {
+            const b = $('pn_push'); const old = b.textContent;
+            b.disabled = true; b.textContent = 'Gönderiliyor...';
+            try {
+                const r = await api('/stats/push-summary', { method: 'POST' });
+                b.textContent = r.success ? '✓ Gönderildi' : (r.message || 'Hata');
+            } catch { b.textContent = 'Hata'; }
+            setTimeout(() => { b.disabled = false; b.textContent = old; }, 2500);
+        };
+        panoWired = true;
+    }
+    refreshDashboard();
+    if (panoTimer) clearInterval(panoTimer);
+    // Görünürken 6 sn'de bir tazele; sekme değişince dur (boşa istek atma).
+    panoTimer = setInterval(() => {
+        if ($('viewDashboard').style.display !== 'none') refreshDashboard();
+        else { clearInterval(panoTimer); panoTimer = null; }
+    }, 6000);
+}
+
+async function refreshDashboard() {
+    try {
+        const r = await api('/stats');
+        if (!r.success) return;
+        renderDashboard(r);
+    } catch { /* yok say */ }
+}
+
+function renderDashboard(r) {
+    const t = r.today || {};
+    $('pn_date').textContent = t.date || '';
+    $('pn_sent').textContent = t.sent ?? 0;
+    $('pn_delivered').textContent = t.delivered ?? 0;
+    $('pn_read').textContent = t.read ?? 0;
+    $('pn_replies').textContent = t.replies ?? 0;
+    $('pn_failed').textContent = t.failed ?? 0;
+    $('pn_deliveredRate').textContent = `%${t.deliveredRate ?? 0}`;
+    $('pn_readRate').textContent = `%${t.readRate ?? 0}`;
+
+    $('pn_dr_txt').textContent = `%${t.deliveredRate ?? 0}`;
+    $('pn_dr_bar').style.width = `${t.deliveredRate ?? 0}%`;
+    $('pn_rr_txt').textContent = `%${t.readRate ?? 0}`;
+    $('pn_rr_bar').style.width = `${t.readRate ?? 0}%`;
+
+    // Anti-ban
+    const ab = r.antiban;
+    if (ab) {
+        $('pn_ab_body').style.display = '';
+        $('pn_ab_off').style.display = 'none';
+        const warmTxt = ab.warmup ? `Isınma günü ${(ab.dayIndex ?? 0) + 1} · günlük tavan` : 'Günlük tavan';
+        $('pn_warm').textContent = warmTxt;
+        const dcap = ab.dailyCap || 0, dsent = ab.daySent || 0;
+        $('pn_daycap_txt').textContent = `${dsent}/${dcap}`;
+        $('pn_daycap_bar').style.width = `${dcap ? Math.min(100, Math.round(dsent / dcap * 100)) : 0}%`;
+        const hcap = ab.hourCap || 0, hsent = ab.hourSent || 0;
+        $('pn_hourcap_txt').textContent = `${hsent}/${hcap}`;
+        $('pn_hourcap_bar').style.width = `${hcap ? Math.min(100, Math.round(hsent / hcap * 100)) : 0}%`;
+        const cd = $('pn_cooldown');
+        if (ab.cooldownUntil) {
+            const mins = Math.max(1, Math.ceil((ab.cooldownUntil - Date.now()) / 60000));
+            cd.classList.remove('hidden');
+            cd.textContent = `⚠ Ban koruması aktif: gönderim durduruldu (~${mins} dk) — ${ab.cooldownReason || 'anormal kopma'}`;
+        } else cd.classList.add('hidden');
+    } else {
+        $('pn_ab_body').style.display = 'none';
+        $('pn_ab_off').style.display = '';
+    }
+
+    // 7 günlük mini grafik
+    const hist = r.history || [];
+    const max = Math.max(1, ...hist.map(d => d.sent || 0));
+    const H = 84;
+    $('pn_spark').innerHTML = hist.map(d => {
+        const day = (d.date || '').slice(5); // MM-DD
+        const bh = v => Math.round((v || 0) / max * H);
+        return `<div class="spark-col" title="${esc(d.date)} — gönderildi ${d.sent || 0}, ulaştı ${d.delivered || 0}, okundu ${d.read || 0}, yanıt ${d.replies || 0}">
+            <div class="spark-bars">
+                <i class="sw-sent" style="height:${bh(d.sent)}px"></i>
+                <i class="sw-del" style="height:${bh(d.delivered)}px"></i>
+                <i class="sw-read" style="height:${bh(d.read)}px"></i>
+            </div>
+            <span>${esc(day)}</span>
+        </div>`;
+    }).join('');
+
+    // Kanal kırılımı
+    const CH_TR = { bulk: 'Toplu', reminder: 'Hatırlatma', belge: 'Belge', manual: 'Manuel', extre: 'Ekstre', aibot: 'AI Yanıt', other: 'Diğer' };
+    const rows = t.byChannel || [];
+    $('pn_chBody').innerHTML = rows.length
+        ? rows.map(c => `<tr><td>${esc(CH_TR[c.ch] || c.ch)}</td><td class="r">${c.sent}</td><td class="r">${c.delivered}</td><td class="r">${c.read}</td></tr>`).join('')
+        : '<tr><td colspan="4" class="muted" style="padding:14px">Bugün gönderim yok.</td></tr>';
+}
 
 // Belge tipi şablonunda kullanılabilir değişkenler (kart başına chip).
 const WC_VARS = ['{firma}', '{ad}', '{tutar}', '{kod}', '{evrak}', '{tarih}', '{bakiye}', '{durum}', '{belge}', '{firmaadi}'];

@@ -415,3 +415,46 @@ textarea { min-height: 110px; resize: vertical; line-height: 1.55; }
 /* İsteğe bağlı "Filtreler" kutusu */
 .filters { margin: -4px 0 10px; }
 .filters .toolbar { flex-wrap: wrap; margin: 10px 0 0; }
+
+/* ─── PANO (güven paneli) ─────────────────────────────────────────────────── */
+.pano { padding: 20px 24px; max-width: 1080px; }
+.pano-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+.pano-title { font-size: 18px; font-weight: 700; color: var(--text-strong); }
+.pano-actions { display: flex; gap: 8px; }
+
+.stat-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 16px; }
+@media (max-width: 820px) { .stat-grid { grid-template-columns: repeat(2, 1fr); } }
+.stat {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 14px 16px; box-shadow: var(--shadow-card);
+}
+.stat .lbl { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+.stat .num { font-size: 26px; font-weight: 700; color: var(--text-strong); line-height: 1.1; }
+.stat .num.accent { color: var(--primary); }
+.stat .num.danger { color: var(--danger); }
+.stat .sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
+
+.pano-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+@media (max-width: 820px) { .pano-cols { grid-template-columns: 1fr; } }
+.pano .card { margin-bottom: 16px; }
+.card-h { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; }
+.ratio-lbl { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); margin: 10px 0 4px; }
+.ratio-lbl b { color: var(--text-strong); }
+.cooldown {
+    margin-top: 12px; padding: 8px 11px; border-radius: 8px; font-size: 12.5px; font-weight: 600;
+    background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger);
+}
+
+/* 7 günlük mini grafik */
+.spark { display: flex; align-items: flex-end; gap: 10px; height: 104px; padding-top: 6px; }
+.spark-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 5px; min-width: 0; }
+.spark-bars { display: flex; align-items: flex-end; gap: 2px; height: 84px; }
+.spark-bars i { width: 7px; border-radius: 2px 2px 0 0; min-height: 2px; display: block; }
+.spark-col span { font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+.sw-sent { background: var(--muted-2); }
+.sw-del { background: var(--primary); }
+.sw-read { background: #3b82f6; }
+.spark-legend { display: flex; gap: 16px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.spark-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+
+.pano table th.r, .pano table td.r { text-align: right; }

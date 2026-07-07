@@ -57,6 +57,10 @@
         </div>
 
         <nav class="nav">
+            <button class="tab" id="tabDashboard" data-view="viewDashboard" data-title="Pano">
+                <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9M13 17V5M8 17v-3"/></svg>
+                <span>Pano</span>
+            </button>
             <button class="tab active" id="tabBulk" data-view="viewBulk" data-title="Toplu Mesaj">
                 <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
                 <span>Toplu Mesaj</span>
@@ -91,7 +95,7 @@
                 <span class="dot" id="dbDot"></span><span>Ayarlar</span><span class="arrow">›</span>
             </button>
             <span class="pill hidden" id="licPill" title="Lisans durumu"><span class="dot" id="licDot"></span> <span id="licLabel">Lisans</span></span>
-            <div class="sb-ver">v1.1.2</div>
+            <div class="sb-ver" id="sbVer">v1.1.6</div>
         </div>
     </aside>
 
@@ -102,6 +106,72 @@
             <div class="spacer"></div>
             <button class="iconbtn" id="themeBtn" title="Gece / gündüz modu">🌙</button>
         </header>
+
+        <!-- ─── PANO (güven paneli) ─── -->
+        <div class="pano" id="viewDashboard" style="display:none">
+            <div class="pano-head">
+                <div>
+                    <div class="pano-title">Bugünkü gönderim</div>
+                    <div class="muted" id="pn_date">—</div>
+                </div>
+                <div class="pano-actions">
+                    <button class="btn sm ghost" id="pn_refresh">Yenile</button>
+                    <button class="btn sm" id="pn_push" title="Bugünkü özeti bağlı WhatsApp numarana gönderir">Özeti telefonuma gönder</button>
+                </div>
+            </div>
+
+            <!-- 5 sayaç kartı -->
+            <div class="stat-grid">
+                <div class="stat"><div class="lbl">Gönderildi</div><div class="num" id="pn_sent">0</div></div>
+                <div class="stat"><div class="lbl">Ulaştı</div><div class="num" id="pn_delivered">0</div><div class="sub" id="pn_deliveredRate">%0</div></div>
+                <div class="stat"><div class="lbl">Okundu</div><div class="num" id="pn_read">0</div><div class="sub" id="pn_readRate">%0</div></div>
+                <div class="stat"><div class="lbl">Yanıt</div><div class="num accent" id="pn_replies">0</div></div>
+                <div class="stat"><div class="lbl">Hata</div><div class="num danger" id="pn_failed">0</div></div>
+            </div>
+
+            <div class="pano-cols">
+                <!-- Teslim / okunma oranı -->
+                <div class="card">
+                    <div class="card-h">Teslim & okunma</div>
+                    <div class="ratio-lbl"><span>Teslim oranı</span><b id="pn_dr_txt">%0</b></div>
+                    <div class="bar"><div id="pn_dr_bar" style="width:0%"></div></div>
+                    <div class="ratio-lbl"><span>Okunma oranı (teslim edilenin)</span><b id="pn_rr_txt">%0</b></div>
+                    <div class="bar"><div id="pn_rr_bar" style="width:0%;background:linear-gradient(90deg,#2563eb,#3b82f6)"></div></div>
+                    <p class="hint">Okundu bilgisi karşı taraf "okundu"yu kapattıysa gelmez — düşük okunma oranı "okunmadı" demek değildir. Teslim ve yanıt sayıları kesindir.</p>
+                </div>
+
+                <!-- Anti-ban durumu -->
+                <div class="card">
+                    <div class="card-h">Güvenlik (anti-ban)</div>
+                    <div id="pn_ab_body">
+                        <div class="ratio-lbl"><span id="pn_warm">Isınma —</span><b id="pn_daycap_txt">0/0</b></div>
+                        <div class="bar"><div id="pn_daycap_bar" style="width:0%"></div></div>
+                        <div class="ratio-lbl"><span>Saatlik tavan</span><b id="pn_hourcap_txt">0/0</b></div>
+                        <div class="bar"><div id="pn_hourcap_bar" style="width:0%;background:linear-gradient(90deg,#d97706,#f59e0b)"></div></div>
+                        <div id="pn_cooldown" class="cooldown hidden"></div>
+                    </div>
+                    <p class="hint" id="pn_ab_off" style="display:none">WhatsApp bağlı değil — güvenlik sayaçları bağlanınca görünür.</p>
+                </div>
+            </div>
+
+            <!-- Son 7 gün -->
+            <div class="card">
+                <div class="card-h">Son 7 gün</div>
+                <div class="spark" id="pn_spark"></div>
+                <div class="spark-legend"><span><i class="sw-sent"></i> Gönderildi</span><span><i class="sw-del"></i> Ulaştı</span><span><i class="sw-read"></i> Okundu</span></div>
+            </div>
+
+            <!-- Kanal kırılımı -->
+            <div class="card" id="pn_chWrap">
+                <div class="card-h">Kanal kırılımı (bugün)</div>
+                <div class="tablewrap">
+                    <table>
+                        <thead><tr><th>Kanal</th><th class="r">Gönderildi</th><th class="r">Ulaştı</th><th class="r">Okundu</th></tr></thead>
+                        <tbody id="pn_chBody"><tr><td colspan="4" class="muted" style="padding:14px">—</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
 
         <!-- ─── TOPLU MESAJ ─── -->
         <div class="wrap" id="viewBulk">

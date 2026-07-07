@@ -1,13 +1,14 @@
 # Vega WhatsApp
 
-VegaDB (SQL Server) carilerine **toplu WhatsApp mesajı** gönderen ve cari hareketleri izleyip
-**tahsilat alındığında otomatik bildirim** atan Windows masaüstü uygulaması (Electron).
+VegaDB (SQL Server) carilerine **toplu WhatsApp mesajı** gönderen, cari hareketleri izleyip
+**tahsilat alındığında otomatik bildirim** atan ve gönderim sağlığını (teslim/okundu/yanıt)
+izleyen Windows masaüstü uygulaması (Electron).
 
 - **WhatsApp:** Baileys (WebSocket — chromium gerekmez). QR ile bağlanır, oturum kalıcıdır.
 - **Veritabanı:** `F{firma}TBLCARI` cari + telefon sütunları otomatik tespit edilir
   (TELEFON1/2/3, YGSM, YTELEFON1/2 — KEFIL/FAKS/MODEM hariç).
 - **Masaüstü:** Pencere kapatılınca tray'e gizlenir, izleme durmaz. Windows açılışında
-  otomatik başlar; PIN, DPAPI (safeStorage) ile şifreli saklanıp açılışta otomatik bağlanır.
+  otomatik başlar; DB parolası DPAPI (safeStorage) ile şifreli saklanıp açılışta otomatik bağlanır.
 - **Güncelleme:** GitHub Releases üzerinden otomatik (aşağıya bakın).
 
 ## Çalıştırma (geliştirme)
@@ -21,31 +22,66 @@ npm start
 
 ## Sekmeler
 
-### Toplu Mesaj
-Firma + arama → cari seç → metin (+ opsiyonel görsel/video, `{ad}` `{unvan}` `{kod}`
-değişkenleri) → Gönder. Canlı ilerleme (SSE), durdurma, sonuç logu.
+### Pano
+Gönderim sağlığı — bugünkü **gönderildi / ulaştı / okundu / yanıt / hata** sayaçları,
+teslim ve okunma oranı, son 7 günün mini grafiği, kanal kırılımı (toplu/hatırlatma/belge/
+manuel/ekstre/AI) ve anti-ban durumu (ısınma günü, günlük/saatlik tavan doluluk, ban
+koruması aktifse uyarı). "Özeti telefonuma gönder" ile günlük özet kendi WhatsApp'ına gider.
+Okundu bilgisi karşı taraf kapattıysa gelmez — düşük okunma oranı "okunmadı" anlamına gelmez;
+teslim ve yanıt sayıları kesindir.
 
-### Otomatik Tahsilat
-`F{firma}D{dönem}TBLCARIHAREKETLERI` tablosu periyodik taranır (varsayılan 30 sn);
-yeni **ALACAK** girişi (devir 103/104 hariç) bulununca cariye şablon mesaj gönderilir
-(`{ad}` `{tutar}` `{kod}` `{evrak}` `{tarih}` `{bakiye}`).
-- Watermark (`data/watcher-state.json`) kalıcı: uygulama kapalıyken biriken ödemeler
-  açılışta yakalanır; geçmişe asla mesaj atılmaz (ilk çalıştırmada watermark = MAX(IND)).
-- WhatsApp kapalıysa watermark ilerletilmez — bağlanınca kaldığı yerden dener.
-- IZAHAT kodları boş = tüm tahsilatlar; "Bu dönemdeki kodları göster" ile canlı dağılım.
+### Toplu Mesaj
+Firma + arama → cari seç → metin (+ opsiyonel görsel/video, `{ad}` `{unvan}` `{firma}` `{kod}`
+değişkenleri + `{a|b|c}` spintax varyasyonu) → Gönder. Canlı ilerleme (SSE), durdurma, sonuç logu.
+
+### Belge Mesajları (Otomatik Tahsilat)
+`F{firma}D{dönem}TBLCARIHAREKETLERI` tablosu periyodik taranır (varsayılan 30 sn); satış
+faturası/irsaliyesi, cari giriş/çıkış (tahsilat/ödeme), alış faturası vb. belge tiplerinden
+seçilenler oluştuğunda cariye şablon mesaj gönderilir (`{ad}` `{tutar}` `{kod}` `{evrak}`
+`{tarih}` `{bakiye}` `{durum}` `{belge}` `{firmaadi}`).
+- Watermark (`data/watcher.json`) kalıcı: uygulama kapalıyken biriken hareketler açılışta
+  yakalanır; geçmişe asla mesaj atılmaz.
+- Belge tutarı sonradan değişirse "güncellendi" mesajı, silinirse WhatsApp mesajı geri
+  çekilir (~2 gün WhatsApp sınırı içinde).
+- Alacaklı olduğumuz (net bakiye negatif) cariye asla mesaj atılmaz.
+
+### Bakiye Hatırlatma
+Seçilen carilere periyodik bakiye hatırlatma mesajı; kendi zamanlayıcısı, son gönderim
+tarihini cari bazında tutar, kaldığı yerden devam eder.
+
+### Hesap Extresi
+Bakiyeli carileri listeler → seçilen cariye PDF hesap ekstresi üretilip (uygulama içi
+`pdfkit` ile, firma logosu/yasal şartla markalı) WhatsApp'tan belge olarak gönderilir.
+Giriş şifresiyle kilitlidir (bkz. Erişim kilidi).
+
+### AI Oto-Yanıt
+Gelen mesajlara Claude Haiku ile seçmeli otomatik yanıt. Kullanıcı serbest metin yazdığında
+model `[SESSIZ]` (yanıt verme) veya `[EKSTRE]` (bakiye ekstresi gönder) kararı da verebilir.
+API anahtarı yerel makinede şifreli saklanır. Giriş şifresiyle kilitlidir.
+
+### Firma Bilgileri
+Firma adı, logo ve yasal şart metni — Hesap Extresi PDF'inin başlık/logo/altbilgisinde kullanılır.
+
+## Erişim kilidi
+
+**AI Oto-Yanıt** ve **Hesap Extresi** sekmeleri tek bir giriş şifresiyle korunur (client-side);
+**Firma Bilgileri** açıktır. Diğer sekmelerin normal kullanımını etkilemez.
 
 ## Bot koruması (anti-ban)
 
-| Ayar | Varsayılan | Açıklama |
-|------|-----------|----------|
-| Gecikme | 8–22 sn (rastgele) | Her mesaj arası |
-| Parti boyutu / molası | 25 / 60–150 sn | Parti sonrası uzun bekleme |
-| Günlük tavan | 200 | **Hesap bazlı ve kalıcı** — aynı gün tüm gönderimler sayılır (`data/wa-stats.json`) |
-| "Yazıyor..." | açık | Gönderim öncesi presence |
-| WA kontrolü | açık | Numara WhatsApp'ta değilse atlar |
+| Katman | Davranış |
+|---|---|
+| Isınma rampası | Yeni numara 1. gün 20/gün'den başlar, kademeli 200/gün'e çıkar (`WARMUP_RAMP`) |
+| Saatlik tavan | Günlük tavanın ~1/3'ü (taze numarada daha sıkı) — günlük hakkı tek saatte boşaltmaz |
+| Günlük tavan | Kanal başına ayrı sayılır (toplu/hatırlatma/belge/manuel birbirini yemez); saatlik tavan hesap-geneli ortak |
+| Ban devre kesici | Bağlantı 403/401 ile kapanırsa veya kısa sürede çok koparsa (fırtına), hesaba geçici SOĞUMA konur — flaglenen numaraya gönderime devam edip uyarıyı bana çevirmeyi engeller |
+| Gecikme / parti molası | 8–22 sn mesaj arası (rastgele), 25'lik partiler arası 60–150 sn mola |
+| Metin varyasyonu | `{a|b|c}` spintax — herkese birebir aynı metin gitmez |
+| Gönderim penceresi | Otomatik gönderimler yalnız seçili günlerde (varsayılan Pzt–Cmt, Pazar kapalı) ve saat aralığında (varsayılan 10:00–20:00) çalışır; manuel gönderim bu pencereye tabi değil |
+| "Yazıyor..." + WA kontrolü | Gönderim öncesi presence simülasyonu; numara WhatsApp'ta değilse atlanır |
 
 > **Uyarı:** Toplu mesaj WhatsApp ToS'a aykırı olabilir; ban riski vardır. Numarayı ısıtın,
-> onaylı kişilere gönderin.
+> onaylı kişilere gönderin. **Pano** sekmesinden gerçek teslim/okunma/ban durumunu izleyin.
 
 ## Kurulum dosyası + otomatik güncelleme
 
@@ -55,13 +91,17 @@ yeni **ALACAK** girişi (devir 103/104 hariç) bulununca cariye şablon mesaj g�
   deposuna yayınlar. GH token'ı git credential manager'dan otomatik alınır.
 - Kurulu uygulamalar açılışta + 4 saatte bir yeni sürüm denetler (electron-updater),
   indirir; tray balonu/menüsünden hemen veya uygulama kapanışında sessiz kurulur.
+- Sidebar'daki sürüm etiketi kök `package.json`'dan çalışma anında okunur (`/api/check-setup`
+  → `version`) — elle güncellenmez, release'te otomatik doğru gelir.
 - Kaynak kod: [vega-whatsapp](https://github.com/saidbayraqtars/vega-whatsapp) (private).
   `config.json` ve `data/` gitignore'da — asla commit edilmez.
 
 ## Teknik
 
-- Port `3100`; Express sunucu + watcher, Electron main process içinde çalışır.
+- Port `3100`; Express sunucu + watcher/reminders/aiBot/antiban/stats, Electron main process
+  içinde aynı process'te çalışır.
 - Veriler: `%APPDATA%\vega-whatsapp-desktop\` (Electron userData) — `config.json`,
-  `data/baileys-auth`, `data/watcher*.json`, `data/wa-stats.json`. Geliştirmede `server/` altı.
+  `data/baileys-auth`, `data/watcher.json`, `data/antiban.json`, `data/stats.json`,
+  `data/reminders-log.json`, `data/aibot-state.json`. Geliştirmede `server/data/` altı.
 - Telefon normalizasyonu TR odaklı (`server/phone.js`): `0xxx`/`5xxx` → `90...`,
   `905xxxxxxxxx` regex'i geçenler "geçerli" sayılır.
