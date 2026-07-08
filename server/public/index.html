@@ -95,7 +95,7 @@
                 <span class="dot" id="dbDot"></span><span>Ayarlar</span><span class="arrow">›</span>
             </button>
             <span class="pill hidden" id="licPill" title="Lisans durumu"><span class="dot" id="licDot"></span> <span id="licLabel">Lisans</span></span>
-            <div class="sb-ver" id="sbVer">v1.1.7</div>
+            <div class="sb-ver" id="sbVer">v1.1.8</div>
         </div>
     </aside>
 
@@ -481,6 +481,16 @@
                         <label>Özel Uç (OpenAI-uyumlu) <span class="muted">opsiyonel</span></label>
                         <input id="ab_baseUrl" placeholder="https://openrouter.ai/api/v1" />
                         <div class="hint">Boşsa sağlayıcı varsayılan ucu. OpenRouter / DeepSeek / Groq / yerel için sağlayıcıyı <b>OpenAI</b> seçip uç adresini buraya yazın.</div>
+                    </div>
+
+                    <div class="row" style="margin-top:10px">
+                        <div class="field"><label>Tartışma Kapanış Eşiği (cevap)</label><input id="ab_maxThread" type="number" min="0" /></div>
+                        <div class="field"><label>Kapanış Sonrası Sessizlik (saat)</label><input id="ab_closeCooldown" type="number" min="0" /></div>
+                    </div>
+                    <div class="field">
+                        <label>Kapanış Mesajı <span class="muted">boşsa varsayılan</span></label>
+                        <textarea id="ab_closingMsg" rows="2" placeholder="Görüşmemizi burada nazikçe sonlandırıyorum..."></textarea>
+                        <div class="hint">Aynı numaraya kısa sürede bu kadar bot cevabından sonra tartışmayı kapatır (0 = kapalı): bu mesajı gönderir, numarayı belirtilen süre sessize alır → kredi korunur.</div>
                     </div>
                 </details>
 

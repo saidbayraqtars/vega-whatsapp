@@ -39,11 +39,20 @@ const DEFAULT_CONFIG = {
     minGapSec: 30,                 // aynı numaraya iki cevap arası min saniye (döngü koruması)
     onlySmsGonder: false,          // yalnız 'SMS Gönder' izinli carilere cevap
     includeMovements: true,        // borç sebebi için son hareketleri bağlama ekle
+    // ─── Tartışma/kredi koruması ───
+    maxThreadReplies: 4,           // aynı numaraya kısa sürede bu kadar bot cevabından sonra sohbeti kapat (0=kapalı)
+    threadWindowMin: 30,           // "kısa süre" penceresi (dk) — sayaç bu süre sonunda sıfırlanır
+    closeCooldownHours: 6,         // sohbet kapandıktan sonra o numaraya sessiz kalma süresi (saat)
+    closingMessage: '',            // boşsa varsayılan kapanış metni (aşağıda DEFAULT_CLOSING)
 };
+
+// Tartışma uzayınca gönderilecek varsayılan kapanış (config.closingMessage boşsa).
+const DEFAULT_CLOSING = 'Görüşmemizi burada nazikçe sonlandırıyorum. Bakiye veya ödemeyle ilgili net bir sorunuz olduğunda tekrar yazabilir ya da bizi telefonla arayabilirsiniz. İyi günler dilerim.';
 
 let config = { ...DEFAULT_CONFIG };
 // state: günlük sayaç + numara-başı son cevap + işlenmiş mesaj id'leri (dedupe)
-let state = { date: null, sent: 0, lastByPhone: {}, seenIds: [] };
+//        + thread: numara-başı sohbet sayacı/kapanış (tartışma-kredi koruması)
+let state = { date: null, sent: 0, lastByPhone: {}, seenIds: [], thread: {} };
 let log = []; // son ~200 olay (UI canlı kayıt)
 
 const todayKey = () => new Date().toISOString().slice(0, 10);
@@ -98,7 +107,7 @@ function saveLog() {
 // Gün dönünce günlük sayaç + numara-başı geçmiş sıfırlanır.
 function rollDay() {
     const t = todayKey();
-    if (state.date !== t) { state.date = t; state.sent = 0; state.lastByPhone = {}; saveState(); }
+    if (state.date !== t) { state.date = t; state.sent = 0; state.lastByPhone = {}; state.thread = {}; saveState(); }
 }
 
 function addLog(entry) {
@@ -129,6 +138,7 @@ function setConfig(patch) {
         'enabled', 'provider', 'baseUrl', 'model', 'firmaNo', 'donemNo', 'businessName', 'paymentInfo',
         'extraInstructions', 'startHour', 'endHour', 'dailyCap', 'minGapSec',
         'onlySmsGonder', 'includeMovements',
+        'maxThreadReplies', 'threadWindowMin', 'closeCooldownHours', 'closingMessage',
     ];
     for (const k of ALLOWED) if (patch[k] !== undefined) next[k] = patch[k];
     if (patch.provider !== undefined) next.provider = normProvider(patch.provider);
@@ -270,7 +280,9 @@ function buildSystem() {
         `Sana "GÜNCEL BAKİYE: BİLİNMİYOR" verildiyse, bakiye/borç sorulsa bile ASLA rakam söyleme → [SESSIZ] üret.`,
         `Müşteri borcunu soruyor ve bakiye "BORCU YOK" / 0 ise: rakam uydurma; açıkça "Güncel bir borcunuz bulunmamaktadır." de.`,
         ``,
-        `Bunların DIŞINDAKİ her şeyde (şikayet, ürün/fiyat sorusu, pazarlık, itiraz, teknik sorun, sohbet, anlamadığın veya emin olmadığın mesajlar) hiçbir şey yazma, sadece tam olarak şunu üret: [SESSIZ]`,
+        `MÜŞTERİ SİNİRLİ / KABA / HAKARET EDİYORSA: ASLA karşılık verme, hakarete hakaretle cevap verme, tartışmaya girme, savunma yapma. Sakin ve kısa bir tonla, gerekiyorsa özür dileyerek yaz; yardımcı olmak istediğini belirt ve bakiye/ödeme konusuna nazikçe yönlendir. Örnek: "Yaşadığınız olumsuzluk için özür dilerim, size yardımcı olmak isterim; bakiyeniz veya ödemeyle ilgili sorunuzu iletebilirsiniz." En fazla iki cümle, emojisiz, rakam uydurma.`,
+        ``,
+        `Bunların DIŞINDAKİ her şeyde (ürün/fiyat sorusu, pazarlık, teknik sorun, alakasız sohbet, anlamadığın veya emin olmadığın mesajlar) hiçbir şey yazma, sadece tam olarak şunu üret: [SESSIZ]`,
         `Ödeme bilgisi istenmiş ama sana ÖDEME BİLGİSİ verilmemişse yine [SESSIZ] üret.`,
         `Müşteri "neden borcum var / bu borç nereden / hesap dökümü / ekstre / detay" gibi DÖKÜM/EKSTRE isterse: cevabına [EKSTRE] etiketini ekle ve ardından tek cümle kısa açıklama yaz (örn. "[EKSTRE] Hesap ekstreniz ektedir."). Sistem PDF hesap ekstresini otomatik ekleyecek.`,
         ``,
@@ -322,6 +334,36 @@ async function handleIncoming({ phone, text, jid, id }) {
     if (Date.now() - last < Number(config.minGapSec || 0) * 1000) {
         addLog({ phone, kind: 'skip', reason: 'çok sık mesaj (aralık koruması)' }); return;
     }
+
+    // ─── Tartışma / kredi koruması ───
+    // Kısa pencerede numara-başı bot cevabı sayılır. Eşik aşılınca tek kapanış
+    // mesajı gönderilir, o numara bir süre sessize alınır (model çağrılmaz → kredi korunur).
+    const nowMs = Date.now();
+    const windowMs = Math.max(1, Number(config.threadWindowMin) || 30) * 60000;
+    let th = state.thread[phone];
+    if (!th || (nowMs - (th.since || 0)) > windowMs) th = { n: 0, since: nowMs, closedUntil: (th && th.closedUntil) || 0 };
+    if (th.closedUntil && nowMs < th.closedUntil) {
+        state.thread[phone] = th; saveState();
+        addLog({ phone, kind: 'skip', reason: 'sohbet sonlandırıldı (bekleme)' }); return;
+    }
+    const maxThread = Number(config.maxThreadReplies) || 0;
+    if (maxThread > 0 && th.n >= maxThread) {
+        if (deps.waStatus && deps.waStatus().ready) {
+            const closing = (config.closingMessage && config.closingMessage.trim()) || DEFAULT_CLOSING;
+            const r = await deps.waSend(phone, closing, null, { simulateTyping: true, typingMs: 1000, channel: 'aibot' });
+            th.closedUntil = nowMs + Math.max(1, Number(config.closeCooldownHours) || 6) * 3600000;
+            th.n = 0; th.since = nowMs;
+            state.thread[phone] = th;
+            state.lastByPhone[phone] = nowMs;
+            if (r && r.success) { state.sent++; if (deps.recordSent) deps.recordSent(); }
+            saveState();
+            addLog({ phone, name: (state.thread[phone] && state.thread[phone].name), kind: r && r.success ? 'reply' : 'error', reason: 'tartışma uzadı → sohbet kapatıldı', reply: closing.slice(0, 120) });
+        } else {
+            addLog({ phone, kind: 'skip', reason: 'kapanış: WhatsApp bağlı değil' });
+        }
+        return;
+    }
+    state.thread[phone] = th;
 
     // Firma/dönem: config → yoksa watcher/uiContext bağlamı.
     let firmaNo = config.firmaNo, donemNo = config.donemNo;
@@ -403,6 +445,8 @@ async function handleIncoming({ phone, text, jid, id }) {
     if (r && r.success) {
         state.sent++;
         state.lastByPhone[phone] = Date.now();
+        // Tartışma sayacı: bu numaraya verilen bot cevabı (eşiğe yaklaşınca sohbet kapanır).
+        th.n = (th.n || 0) + 1; th.since = th.since || Date.now(); th.name = ctx.name; state.thread[phone] = th;
         saveState();
         if (deps.recordSent) deps.recordSent(); // anti-ban gün/saat sayacı
         addLog({ phone, name: ctx.name, kind: 'reply', incoming: text.slice(0, 80), reply: (media ? '[EKSTRE PDF] ' : '') + outText.slice(0, 200) });

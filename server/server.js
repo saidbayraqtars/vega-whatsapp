@@ -946,6 +946,7 @@ app.post('/api/aibot', (req, res) => {
         'enabled', 'apiKey', 'clearApiKey', 'provider', 'baseUrl', 'model', 'firmaNo', 'donemNo',
         'businessName', 'paymentInfo', 'extraInstructions', 'startHour', 'endHour',
         'dailyCap', 'minGapSec', 'onlySmsGonder', 'includeMovements',
+        'maxThreadReplies', 'threadWindowMin', 'closeCooldownHours', 'closingMessage',
     ];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];

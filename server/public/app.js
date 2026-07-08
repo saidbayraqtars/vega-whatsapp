@@ -1853,6 +1853,9 @@ async function loadAiBotConfig() {
     $('ab_minGap').value = c.minGapSec ?? 30;
     $('ab_onlySms').checked = !!c.onlySmsGonder;
     $('ab_movements').checked = c.includeMovements !== false;
+    $('ab_maxThread').value = c.maxThreadReplies ?? 4;
+    $('ab_closeCooldown').value = c.closeCooldownHours ?? 6;
+    $('ab_closingMsg').value = c.closingMessage || '';
     abStatus(r.status);
 }
 
@@ -1874,6 +1877,9 @@ async function saveAiBot() {
         minGapSec: Number($('ab_minGap').value) || 0,
         onlySmsGonder: $('ab_onlySms').checked,
         includeMovements: $('ab_movements').checked,
+        maxThreadReplies: Number($('ab_maxThread').value) || 0,
+        closeCooldownHours: Number($('ab_closeCooldown').value) || 0,
+        closingMessage: $('ab_closingMsg').value.trim(),
     };
     const key = $('ab_apiKey').value.trim();
     if (key) patch.apiKey = key;
