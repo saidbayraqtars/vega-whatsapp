@@ -943,7 +943,7 @@ app.get('/api/aibot', (req, res) => {
 
 app.post('/api/aibot', (req, res) => {
     const allowed = [
-        'enabled', 'apiKey', 'clearApiKey', 'model', 'firmaNo', 'donemNo',
+        'enabled', 'apiKey', 'clearApiKey', 'provider', 'baseUrl', 'model', 'firmaNo', 'donemNo',
         'businessName', 'paymentInfo', 'extraInstructions', 'startHour', 'endHour',
         'dailyCap', 'minGapSec', 'onlySmsGonder', 'includeMovements',
     ];
@@ -960,7 +960,8 @@ app.get('/api/aibot/log', (req, res) => {
 // Anahtarı sına: gövdede apiKey verilirse onu, yoksa kayıtlıyı dener.
 app.post('/api/aibot/test', async (req, res) => {
     try {
-        const out = await aiBot.testApiKey(req.body && req.body.apiKey);
+        const b = req.body || {};
+        const out = await aiBot.testApiKey(b.apiKey, { provider: b.provider, baseUrl: b.baseUrl, model: b.model });
         res.json({ success: true, ...out });
     } catch (err) {
         res.status(200).json({ success: false, message: err.message });

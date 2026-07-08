@@ -24,7 +24,9 @@ let LOG_PATH = null;
 
 const DEFAULT_CONFIG = {
     enabled: false,
-    apiKeyEnc: null,               // Anthropic anahtarı — ŞİFRELİ (asla düz metin diskte)
+    provider: 'anthropic',         // 'anthropic' | 'openai' | 'gemini' (BYOK — her işletme kendi sağlayıcısı)
+    baseUrl: '',                   // OpenAI-uyumlu özel uç (OpenRouter/DeepSeek/Groq/yerel); boşsa sağlayıcı varsayılanı
+    apiKeyEnc: null,               // Seçili sağlayıcının anahtarı — ŞİFRELİ (asla düz metin diskte)
     model: 'claude-haiku-4-5',
     firmaNo: null,                 // boşsa watcher/uiContext bağlamına düşer
     donemNo: null,
@@ -124,11 +126,12 @@ function getConfig() {
 function setConfig(patch) {
     const next = { ...config };
     const ALLOWED = [
-        'enabled', 'model', 'firmaNo', 'donemNo', 'businessName', 'paymentInfo',
+        'enabled', 'provider', 'baseUrl', 'model', 'firmaNo', 'donemNo', 'businessName', 'paymentInfo',
         'extraInstructions', 'startHour', 'endHour', 'dailyCap', 'minGapSec',
         'onlySmsGonder', 'includeMovements',
     ];
     for (const k of ALLOWED) if (patch[k] !== undefined) next[k] = patch[k];
+    if (patch.provider !== undefined) next.provider = normProvider(patch.provider);
     if (typeof patch.apiKey === 'string' && patch.apiKey.trim() && deps?.encryptSecret) {
         next.apiKeyEnc = deps.encryptSecret(patch.apiKey.trim());
     }
@@ -143,7 +146,7 @@ function getStatus() {
     return {
         enabled: config.enabled,
         hasApiKey: hasApiKey(),
-        model: config.model,
+        provider: config.provider, model: config.model,
         firmaNo: config.firmaNo, donemNo: config.donemNo,
         sentToday: state.sent, dailyCap: config.dailyCap,
         startHour: config.startHour, endHour: config.endHour,
@@ -162,37 +165,43 @@ function withinHours() {
     return h >= s || h < e;                    // gece aşan
 }
 
-// ─── Anthropic (Haiku) çağrısı — https, harici bağımlılık yok ────────────────
-function callAnthropic({ apiKey, model, system, user, maxTokens = 500 }) {
+// ─── LLM sağlayıcıları (BYOK) — https, harici bağımlılık yok ─────────────────
+// Desteklenen: anthropic (Claude), openai (+OpenAI-uyumlu: OpenRouter/DeepSeek/Groq/
+// yerel — baseUrl ile), gemini (Google). Tek aktif sağlayıcı + tek anahtar.
+const PROVIDERS = ['anthropic', 'openai', 'gemini'];
+const DEFAULT_MODEL = {
+    anthropic: 'claude-haiku-4-5',
+    openai: 'gpt-4o-mini',
+    gemini: 'gemini-2.0-flash',
+};
+const DEFAULT_BASE = {
+    anthropic: 'https://api.anthropic.com',
+    openai: 'https://api.openai.com/v1',
+    gemini: 'https://generativelanguage.googleapis.com/v1beta',
+};
+
+function normProvider(p) { return PROVIDERS.includes(p) ? p : 'anthropic'; }
+
+// Ortak HTTPS POST → { statusCode, json }. url mutlak; baseUrl override desteği.
+function postJson(urlStr, headers, bodyObj) {
     return new Promise((resolve, reject) => {
-        const payload = JSON.stringify({
-            model,
-            max_tokens: maxTokens,
-            system,
-            messages: [{ role: 'user', content: user }],
-        });
+        let u;
+        try { u = new URL(urlStr); } catch { return reject(new Error('Geçersiz uç adresi: ' + urlStr)); }
+        const payload = JSON.stringify(bodyObj);
         const req = https.request({
-            hostname: 'api.anthropic.com',
-            path: '/v1/messages',
+            hostname: u.hostname,
+            port: u.port || 443,
+            path: u.pathname + u.search,
             method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'x-api-key': apiKey,
-                'anthropic-version': '2023-06-01',
-                'content-length': Buffer.byteLength(payload),
-            },
+            headers: { 'content-type': 'application/json', ...headers, 'content-length': Buffer.byteLength(payload) },
             timeout: 30000,
         }, (res) => {
             let body = '';
             res.on('data', (c) => { body += c; });
             res.on('end', () => {
                 let j = null;
-                try { j = JSON.parse(body); } catch { return reject(new Error('Yanıt çözümlenemedi.')); }
-                if (res.statusCode !== 200) {
-                    return reject(new Error(j?.error?.message || `HTTP ${res.statusCode}`));
-                }
-                const text = (j.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
-                resolve(text);
+                try { j = JSON.parse(body); } catch { return reject(new Error('Yanıt çözümlenemedi (HTTP ' + res.statusCode + ').')); }
+                resolve({ statusCode: res.statusCode, json: j });
             });
         });
         req.on('error', reject);
@@ -200,6 +209,44 @@ function callAnthropic({ apiKey, model, system, user, maxTokens = 500 }) {
         req.write(payload);
         req.end();
     });
+}
+
+// Sağlayıcıya göre istek kur, tek düz metin cevap döndür.
+async function callLLM({ provider, baseUrl, apiKey, model, system, user, maxTokens = 500 }) {
+    const prov = normProvider(provider);
+    const base = (baseUrl && baseUrl.trim().replace(/\/+$/, '')) || DEFAULT_BASE[prov];
+    const mdl = (model && model.trim()) || DEFAULT_MODEL[prov];
+
+    if (prov === 'anthropic') {
+        const { statusCode, json } = await postJson(`${base}/v1/messages`, {
+            'x-api-key': apiKey, 'anthropic-version': '2023-06-01',
+        }, { model: mdl, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] });
+        if (statusCode !== 200) throw new Error(json?.error?.message || `HTTP ${statusCode}`);
+        return (json.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    }
+
+    if (prov === 'gemini') {
+        // Anahtar query string'te; sistem yönergesi ayrı alanda.
+        const url = `${base}/models/${encodeURIComponent(mdl)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+        const { statusCode, json } = await postJson(url, {}, {
+            systemInstruction: { parts: [{ text: system }] },
+            contents: [{ role: 'user', parts: [{ text: user }] }],
+            generationConfig: { maxOutputTokens: maxTokens },
+        });
+        if (statusCode !== 200) throw new Error(json?.error?.message || `HTTP ${statusCode}`);
+        const parts = json?.candidates?.[0]?.content?.parts || [];
+        return parts.map(p => p.text || '').join('').trim();
+    }
+
+    // openai ve OpenAI-uyumlu (OpenRouter/DeepSeek/Groq/yerel): /chat/completions
+    const { statusCode, json } = await postJson(`${base}/chat/completions`, {
+        'authorization': `Bearer ${apiKey}`,
+    }, {
+        model: mdl, max_tokens: maxTokens,
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+    });
+    if (statusCode !== 200) throw new Error(json?.error?.message || `HTTP ${statusCode}`);
+    return (json?.choices?.[0]?.message?.content || '').trim();
 }
 
 const fmtTR = (n) => (Number(n) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -214,16 +261,20 @@ function buildSystem() {
     return [
         `Sen bir Türk işletmesinin${biz ? ` (${biz})` : ''} muhasebe/tahsilat WhatsApp asistanısın. Müşteri (cari) mesajlarına kısa, kibar, profesyonel Türkçe ile cevap verirsin.`,
         ``,
-        `YALNIZCA şu konularda cevap ver:`,
-        `- Güncel bakiye / borç durumu (sana verilen rakamı kullan; ASLA rakam uydurma).`,
+        `YALNIZCA müşteri AÇIKÇA sorduğunda ve YALNIZCA şu konularda cevap ver:`,
+        `- Güncel bakiye / borç durumu (SADECE sana "GÜNCEL BAKİYE" olarak verilen rakamı kullan; ASLA rakam uydurma, tahmin etme).`,
         `- Ödeme / hesap bilgileri (IBAN vb. — sana verilen "ÖDEME BİLGİSİ" metnini paylaş).`,
         `- Borç sebebi / son işlemler (sana verilen hareket özetini kullan).`,
+        ``,
+        `BAKİYEYİ KENDİLİĞİNDEN SÖYLEME: Müşteri bakiyesini/borcunu açıkça SORMADIYSA rakam veya bakiye yazma. Sadece selam/hatır sorma/teşekkür içeren ("merhaba", "günaydın", "iyi günler", "nasılsınız", "teşekkürler" vb.) mesajlara bakiye EKLEME → tam olarak [SESSIZ] üret (insana bırak).`,
+        `Sana "GÜNCEL BAKİYE: BİLİNMİYOR" verildiyse, bakiye/borç sorulsa bile ASLA rakam söyleme → [SESSIZ] üret.`,
+        `Müşteri borcunu soruyor ve bakiye "BORCU YOK" / 0 ise: rakam uydurma; açıkça "Güncel bir borcunuz bulunmamaktadır." de.`,
         ``,
         `Bunların DIŞINDAKİ her şeyde (şikayet, ürün/fiyat sorusu, pazarlık, itiraz, teknik sorun, sohbet, anlamadığın veya emin olmadığın mesajlar) hiçbir şey yazma, sadece tam olarak şunu üret: [SESSIZ]`,
         `Ödeme bilgisi istenmiş ama sana ÖDEME BİLGİSİ verilmemişse yine [SESSIZ] üret.`,
         `Müşteri "neden borcum var / bu borç nereden / hesap dökümü / ekstre / detay" gibi DÖKÜM/EKSTRE isterse: cevabına [EKSTRE] etiketini ekle ve ardından tek cümle kısa açıklama yaz (örn. "[EKSTRE] Hesap ekstreniz ektedir."). Sistem PDF hesap ekstresini otomatik ekleyecek.`,
         ``,
-        `Kurallar: Verilen bakiye/rakam dışında sayı söyleme. Kısa tut (1-4 cümle). Selamlama + kısa cevap yeter. Emoji kullanma. Yanıtında köşeli parantez [ ] kullanma (yalnız sessiz kalırken [SESSIZ]).`,
+        `Kurallar: Verilen bakiye/rakam dışında sayı söyleme. Kısa tut (1-4 cümle). Emoji kullanma. Yanıtında köşeli parantez [ ] kullanma (yalnız sessiz kalırken [SESSIZ], ekstre gerekince [EKSTRE]).`,
         extra ? `\nEk talimat: ${extra}` : '',
     ].join('\n');
 }
@@ -232,8 +283,12 @@ function buildUser(ctx, incomingText) {
     const lines = [];
     lines.push(`MÜŞTERİ: ${ctx.name || '(bilinmiyor)'}`);
     if (ctx.net != null) {
-        const durum = ctx.net > 0 ? 'BORÇLU (bize borcu var)' : ctx.net < 0 ? 'ALACAKLI (biz borçluyuz)' : 'bakiyesi kapalı';
+        const durum = ctx.net > 0 ? 'BORÇLU (bize borcu var)'
+            : ctx.net < 0 ? 'ALACAKLI (biz borçluyuz)'
+            : 'BORCU YOK (bakiye kapalı — borç/alacak bulunmuyor)';
         lines.push(`GÜNCEL BAKİYE: ${fmtTR(Math.abs(ctx.net))} TL — ${durum}`);
+    } else {
+        lines.push(`GÜNCEL BAKİYE: BİLİNMİYOR — bakiye şu an sorgulanamadı; bakiye/borç sorulsa bile ASLA rakam söyleme, [SESSIZ] üret.`);
     }
     if (config.paymentInfo?.trim()) lines.push(`ÖDEME BİLGİSİ: ${config.paymentInfo.trim()}`);
     if (ctx.movements) lines.push(`SON İŞLEMLER:\n${ctx.movements}`);
@@ -288,11 +343,13 @@ async function handleIncoming({ phone, text, jid, id }) {
     const ctx = { name: cari.name || cari.firma, net: null, movements: null };
     try {
         const pool = deps.getPool && deps.getPool();
-        if (pool && donemNo && deps.fetchNetBalances) {
+        if (pool && pool.connected && donemNo && deps.fetchNetBalances) {
             const m = await deps.fetchNetBalances(pool, firmaNo, donemNo, [cari.ind]);
-            if (m && m.has(cari.ind)) ctx.net = m.get(cari.ind);
+            // Sorgu başarılı: cari hareketi yoksa map'te key olmaz → bakiye GERÇEKTEN 0 (borç yok).
+            // net'i null bırakmak model uydurmasına yol açıyordu; burada 0'a sabitliyoruz.
+            ctx.net = (m && m.has(cari.ind)) ? m.get(cari.ind) : 0;
         }
-        if (ctx.net == null && cari.bakiye != null) ctx.net = cari.bakiye; // TBLCARI.BAKIYE yedek
+        if (ctx.net == null && cari.bakiye != null) ctx.net = cari.bakiye; // DB kapalıysa TBLCARI.BAKIYE yedek
         if (config.includeMovements && donemNo && deps.fetchRecentMovements) {
             const rows = await deps.fetchRecentMovements(firmaNo, donemNo, cari.ind, 5);
             if (rows && rows.length) {
@@ -308,8 +365,8 @@ async function handleIncoming({ phone, text, jid, id }) {
     // Modeli çağır.
     let reply = '';
     try {
-        reply = await callAnthropic({
-            apiKey, model: config.model,
+        reply = await callLLM({
+            provider: config.provider, baseUrl: config.baseUrl, apiKey, model: config.model,
             system: buildSystem(), user: buildUser(ctx, text),
         });
     } catch (e) {
@@ -355,11 +412,15 @@ async function handleIncoming({ phone, text, jid, id }) {
 }
 
 // Anahtar geçerliliğini sınamak için minik çağrı (UI "Anahtarı Sına").
-async function testApiKey(rawKey) {
+async function testApiKey(rawKey, opts = {}) {
     const key = (rawKey && rawKey.trim()) || getApiKey();
     if (!key) throw new Error('Anahtar yok.');
-    const text = await callAnthropic({
-        apiKey: key, model: config.model, maxTokens: 16,
+    // UI'da kaydetmeden sınama: gönderilen provider/baseUrl/model'i kullan, yoksa config.
+    const text = await callLLM({
+        provider: opts.provider || config.provider,
+        baseUrl: opts.baseUrl !== undefined ? opts.baseUrl : config.baseUrl,
+        model: opts.model || config.model,
+        apiKey: key, maxTokens: 16,
         system: 'Kısa cevap ver.', user: 'Merhaba, sadece "TAMAM" yaz.',
     });
     return { ok: true, sample: text };

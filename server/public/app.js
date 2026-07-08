@@ -1784,6 +1784,7 @@ async function initAiBotView() {
         sel.onchange = () => loadAbDonemler();
         $('ab_save').onclick = saveAiBot;
         $('ab_test').onclick = testAiBotKey;
+        $('ab_provider').onchange = () => abApplyProvider(true);
         abLoaded = true;
     }
     await loadAiBotConfig();
@@ -1811,11 +1812,32 @@ async function loadAbDonemler(selectDonem) {
     }
 }
 
+// Sağlayıcı meta: varsayılan model, anahtar placeholder, "anahtar al" linki.
+const AB_PROVIDERS = {
+    anthropic: { model: 'claude-haiku-4-5', keyPh: 'sk-ant-...', link: 'https://console.anthropic.com/settings/keys', linkT: 'console.anthropic.com' },
+    openai:    { model: 'gpt-4o-mini',      keyPh: 'sk-...',     link: 'https://platform.openai.com/api-keys',       linkT: 'platform.openai.com' },
+    gemini:    { model: 'gemini-2.0-flash', keyPh: 'AIza...',    link: 'https://aistudio.google.com/app/apikey',      linkT: 'aistudio.google.com' },
+};
+
+// Sağlayıcı değişince placeholder/link güncelle. resetModel=true → model kutusunu varsayılana çek.
+function abApplyProvider(resetModel) {
+    const p = AB_PROVIDERS[$('ab_provider').value] || AB_PROVIDERS.anthropic;
+    $('ab_model').placeholder = p.model;
+    $('ab_apiKey').placeholder = p.keyPh + ' (değişmeyecekse boş bırak)';
+    const link = $('ab_keyLink');
+    if (link) { link.href = p.link; link.textContent = p.linkT + ' → anahtar al'; }
+    if (resetModel) $('ab_model').value = p.model;
+}
+
 async function loadAiBotConfig() {
     const r = await api('/aibot');
     if (!r.success) return;
     const c = r.config;
     $('ab_enabled').checked = !!c.enabled;
+    $('ab_provider').value = c.provider || 'anthropic';
+    $('ab_model').value = c.model || '';
+    $('ab_baseUrl').value = c.baseUrl || '';
+    abApplyProvider(false);
     $('ab_apiKey').value = '';
     $('ab_keyState').textContent = c.hasApiKey ? '(kayıtlı ✓)' : '(girilmedi)';
     const ctx = (typeof localContext === 'function') ? localContext() : {};
@@ -1838,6 +1860,9 @@ async function saveAiBot() {
     $('ab_err').textContent = '';
     const patch = {
         enabled: $('ab_enabled').checked,
+        provider: $('ab_provider').value,
+        model: $('ab_model').value.trim(),
+        baseUrl: $('ab_baseUrl').value.trim(),
         firmaNo: $('ab_firma').value || null,
         donemNo: $('ab_donem').value || null,
         businessName: $('ab_businessName').value.trim(),
@@ -1868,7 +1893,10 @@ async function testAiBotKey() {
     const el = $('ab_testResult');
     el.style.display = ''; el.textContent = 'Sınanıyor...';
     const key = $('ab_apiKey').value.trim();
-    const r = await api('/aibot/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(key ? { apiKey: key } : {}) });
+    // Kaydetmeden sınamada da seçili sağlayıcı/model/uç kullanılsın.
+    const body = { provider: $('ab_provider').value, model: $('ab_model').value.trim(), baseUrl: $('ab_baseUrl').value.trim() };
+    if (key) body.apiKey = key;
+    const r = await api('/aibot/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     el.textContent = r.success ? `Anahtar geçerli ✓ (${r.sample || 'yanıt alındı'})` : `Hata: ${r.message || 'geçersiz'}`;
     el.style.color = r.success ? 'var(--green, #16a34a)' : 'var(--danger, #dc2626)';
 }
@@ -1877,7 +1905,8 @@ function abStatus(st) {
     if (!st) return;
     const on = st.enabled ? 'AÇIK' : 'kapalı';
     const key = st.hasApiKey ? 'anahtar var' : 'anahtar YOK';
-    $('ab_status').textContent = `Bot: ${on} · ${key} · bugün ${st.sentToday}/${st.dailyCap} cevap · saat ${st.startHour}:00–${st.endHour}:00`;
+    const prov = st.provider ? ` · ${st.provider}` : '';
+    $('ab_status').textContent = `Bot: ${on}${prov} · ${key} · bugün ${st.sentToday}/${st.dailyCap} cevap · saat ${st.startHour}:00–${st.endHour}:00`;
 }
 
 const AB_KIND = {

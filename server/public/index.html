@@ -95,7 +95,7 @@
                 <span class="dot" id="dbDot"></span><span>Ayarlar</span><span class="arrow">›</span>
             </button>
             <span class="pill hidden" id="licPill" title="Lisans durumu"><span class="dot" id="licDot"></span> <span id="licLabel">Lisans</span></span>
-            <div class="sb-ver" id="sbVer">v1.1.6</div>
+            <div class="sb-ver" id="sbVer">v1.1.7</div>
         </div>
     </aside>
 
@@ -424,10 +424,22 @@
 
                 <label class="check" style="margin:0 0 12px"><input type="checkbox" id="ab_enabled" /> <b>Botu aç</b></label>
 
+                <div class="row">
+                    <div class="field">
+                        <label>Sağlayıcı</label>
+                        <select id="ab_provider">
+                            <option value="anthropic">Anthropic (Claude)</option>
+                            <option value="openai">OpenAI (ChatGPT)</option>
+                            <option value="gemini">Google (Gemini)</option>
+                        </select>
+                    </div>
+                    <div class="field"><label>Model</label><input id="ab_model" placeholder="claude-haiku-4-5" /></div>
+                </div>
+
                 <div class="field">
-                    <label>Anthropic API Anahtarı <span class="muted" id="ab_keyState"></span></label>
-                    <input id="ab_apiKey" type="password" placeholder="sk-ant-... (değişmeyecekse boş bırak)" />
-                    <div class="hint">Bu bilgisayarda <b>şifreli</b> saklanır. <a href="https://console.anthropic.com/settings/keys" target="_blank">console.anthropic.com</a>'dan alınır.</div>
+                    <label>API Anahtarı <span class="muted" id="ab_keyState"></span></label>
+                    <input id="ab_apiKey" type="password" placeholder="değişmeyecekse boş bırak" />
+                    <div class="hint">Bu bilgisayarda <b>şifreli</b> saklanır. <a id="ab_keyLink" href="https://console.anthropic.com/settings/keys" target="_blank">anahtar al →</a></div>
                 </div>
                 <div class="toolbar" style="margin:-4px 0 8px">
                     <button class="btn ghost sm" id="ab_test">Anahtarı Sına</button>
@@ -465,6 +477,11 @@
                     </div>
                     <label class="check"><input type="checkbox" id="ab_onlySms" /> Yalnız 'SMS Gönder' izinli carilere cevap ver</label>
                     <label class="check" style="margin-top:6px"><input type="checkbox" id="ab_movements" /> Borç sebebi için son işlemleri bağlama ekle</label>
+                    <div class="field" style="margin-top:10px">
+                        <label>Özel Uç (OpenAI-uyumlu) <span class="muted">opsiyonel</span></label>
+                        <input id="ab_baseUrl" placeholder="https://openrouter.ai/api/v1" />
+                        <div class="hint">Boşsa sağlayıcı varsayılan ucu. OpenRouter / DeepSeek / Groq / yerel için sağlayıcıyı <b>OpenAI</b> seçip uç adresini buraya yazın.</div>
+                    </div>
                 </details>
 
                 <div class="row" style="margin-top:14px">
