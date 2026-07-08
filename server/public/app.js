@@ -1698,8 +1698,16 @@ function renderExtreList() {
         btn.disabled = !row.phone || !row.valid;
         btn.title = btn.disabled ? 'Geçerli telefon yok' : 'PDF ekstreyi gönder';
         btn.onclick = () => sendExtreRow(row, btn);
+        const fb = document.createElement('button');
+        fb.className = 'btn ghost xs';
+        fb.style.marginLeft = '6px';
+        fb.textContent = 'Son Fatura';
+        fb.disabled = !row.phone || !row.valid;
+        fb.title = fb.disabled ? 'Geçerli telefon yok' : 'Son satış faturasının içeriğini metin olarak gönder (AI gerekmez)';
+        fb.onclick = () => sendSonFaturaRow(row, fb);
         cell.appendChild(pv);
         cell.appendChild(btn);
+        cell.appendChild(fb);
         body.appendChild(tr);
     }
     $('ex_info').textContent = `${exRows.length} cari listelendi`;
@@ -1730,6 +1738,22 @@ async function sendExtreRow(row, btn) {
     try {
         const r = await doExtreSend(row.ind);
         exLog(r.success ? `✓ ${row.name} (${row.phone}) — ekstre gönderildi` : `✗ ${row.name} — ${r.message || 'hata'}`);
+    } catch (e) {
+        exLog(`✗ ${row.name} — ${e.message}`);
+    }
+    btn.disabled = false; btn.textContent = old;
+}
+
+// Satırdaki "Son Fatura" — carinin son satış faturası içeriğini metin olarak gönder (AI'sız).
+async function sendSonFaturaRow(row, btn) {
+    if (!row.phone || !row.valid) return;
+    if (!confirm(`${row.name} carisine SON satış faturasının içeriği gönderilsin mi?`)) return;
+    const old = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Gönderiliyor...';
+    try {
+        const firmaNo = $('ex_firma').value, donemNo = $('ex_donem').value;
+        const r = await api('/extre/son-fatura', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ firmaNo, donemNo, ind: row.ind }) });
+        exLog(r.success ? `✓ ${row.name} (${row.phone}) — son fatura gönderildi` : `✗ ${row.name} — ${r.message || 'hata'}`);
     } catch (e) {
         exLog(`✗ ${row.name} — ${e.message}`);
     }

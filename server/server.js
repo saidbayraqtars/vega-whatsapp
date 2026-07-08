@@ -1541,6 +1541,28 @@ async function fetchLastSalesInvoice(firmaNo, donemNo, ind) {
     return { tarih: last.tarih, evrak: last.evrak, tutar: Number(last.borc) || 0, kalemler };
 }
 
+// Son satış faturasını müşteriye gönderilecek düz metne çevir (manuel + AI ortak).
+function formatSalesInvoiceText(inv, c) {
+    const money = (n) => (Number(n) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const qty = (n) => { const x = Number(n) || 0; return Number.isInteger(x) ? String(x) : money(x); };
+    const t = inv.tarih ? new Date(inv.tarih).toLocaleDateString('tr-TR') : '';
+    const meta = [];
+    if (t) meta.push(t);
+    if (inv.evrak) meta.push('No: ' + inv.evrak);
+    const who = (c && (c.firma || c.name)) ? `Sayın ${c.firma || c.name}, ` : '';
+    const out = [`${who}son satış faturanız${meta.length ? ' (' + meta.join(', ') + ')' : ''}:`];
+    const ks = Array.isArray(inv.kalemler) ? inv.kalemler : [];
+    const MAX = 25;
+    for (const k of ks.slice(0, MAX)) {
+        const q = Number(k.miktar) ? `${qty(k.miktar)}${k.birim ? ' ' + k.birim : ''} x ${money(k.fiyat)}` : '';
+        out.push(`- ${k.ad || '(kalem)'}${q ? '  ' + q : ''} = ${money(k.tutar)} TL`);
+    }
+    if (ks.length > MAX) out.push(`... (+${ks.length - MAX} kalem daha)`);
+    const toplam = ks.length ? ks.reduce((s, k) => s + (Number(k.tutar) || 0), 0) : (Number(inv.tutar) || 0);
+    out.push(`Toplam: ${money(toplam)} TL`);
+    return out.join('\n');
+}
+
 // Dönemde bakiyesi (net) sıfır OLMAYAN carileri listele (borçlu + alacaklı).
 app.get('/api/extre/list', async (req, res) => {
     if (!requireDb(req, res)) return;
@@ -1663,6 +1685,40 @@ app.post('/api/extre/send', async (req, res) => {
         const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
         const result = await waSend(c.phone, caption, { kind: 'document', buffer: pdf, mimetype: 'application/pdf', fileName }, { simulateTyping: true, typingMs: 1200, channel: 'extre' });
         if (result.success) { antiban.recordSent(me, 'manual'); return res.json({ success: true, message: 'Ekstre gönderildi.', phone: c.phone, name: c.name }); }
+        res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Tek cariye SON SATIŞ FATURASI içeriğini METİN olarak gönder (manuel, AI'sız).
+// Aynı anti-ban kapısı + WA doğrulaması (ekstre gönderimiyle bire bir).
+app.post('/api/extre/son-fatura', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    const firmaNo = req.body && req.body.firmaNo;
+    const donemNo = req.body && req.body.donemNo;
+    const indNum = parseInt(req.body && req.body.ind, 10);
+    if (!firmaNo || !donemNo || !Number.isFinite(indNum))
+        return res.status(400).json({ success: false, message: 'firma/dönem/cari gerekli.' });
+    if (!waStatus().ready) return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil. Önce QR okutun.' });
+    const me = waStatus().me;
+    const g = antiban.gate(me, DEFAULT_PACING.dailyCap, 'manual');
+    if (!g.ok) return res.status(429).json({ success: false, message: g.reason || 'Anti-ban: gönderim sınırına ulaşıldı.' });
+    try {
+        const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum);
+        if (!c) return res.status(404).json({ success: false, message: 'Cari bulunamadı.' });
+        if (c.pasif) return res.status(400).json({ success: false, message: 'Cari pasif (STATUS=2) — gönderilmez.' });
+        if (!c.phone || !c.valid) return res.status(400).json({ success: false, message: 'Carinin geçerli telefonu yok.' });
+
+        const inv = await fetchLastSalesInvoice(firmaNo, donemNo, indNum);
+        if (!inv) return res.status(404).json({ success: false, message: 'Bu cariye ait satış faturası bulunamadı.' });
+
+        const chk = await checkOnWhatsApp(c.phone);
+        if (!chk.exists) return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
+
+        const msg = (req.body && req.body.message && String(req.body.message).trim()) || formatSalesInvoiceText(inv, c);
+        const result = await waSend(c.phone, msg, null, { simulateTyping: true, typingMs: 1200, channel: 'extre' });
+        if (result.success) { antiban.recordSent(me, 'manual'); return res.json({ success: true, message: 'Son fatura gönderildi.', phone: c.phone, name: c.name }); }
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
