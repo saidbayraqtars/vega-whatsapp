@@ -1528,6 +1528,19 @@ async function fetchHareketRows(firmaNo, donemNo, ind, opts = {}) {
     return { rows, net: run };
 }
 
+// AI bot [FATURA]: carinin SON satış faturası (izahat 21) başlık + kalemleri.
+// Tüm kalemleri çekmemek için önce kalemsiz satırlar alınır, son 21 satırı bulunur,
+// yalnız onun kalemleri getirilir. Yoksa null.
+async function fetchLastSalesInvoice(firmaNo, donemNo, ind) {
+    const { rows } = await fetchHareketRows(firmaNo, donemNo, ind);
+    let last = null;
+    for (const r of rows) if (Number(r.izahat) === 21) last = r; // rows tarih ASC → son eşleşen en yeni
+    if (!last) return null;
+    let kalemler = null;
+    try { kalemler = await fetchBelgeKalemleri(firmaNo, donemNo, 21, last.evrak); } catch { kalemler = null; }
+    return { tarih: last.tarih, evrak: last.evrak, tutar: Number(last.borc) || 0, kalemler };
+}
+
 // Dönemde bakiyesi (net) sıfır OLMAYAN carileri listele (borçlu + alacaklı).
 app.get('/api/extre/list', async (req, res) => {
     if (!requireDb(req, res)) return;
@@ -2127,6 +2140,7 @@ aiBot.configure({
     findCariByPhone,
     fetchNetBalances,
     fetchRecentMovements,
+    fetchLastSalesInvoice,
     waSend,
     waStatus,
     encryptSecret,

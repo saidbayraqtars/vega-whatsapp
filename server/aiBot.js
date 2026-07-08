@@ -260,6 +260,27 @@ async function callLLM({ provider, baseUrl, apiKey, model, system, user, maxToke
 }
 
 const fmtTR = (n) => (Number(n) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtQty = (n) => { const x = Number(n) || 0; return Number.isInteger(x) ? String(x) : fmtTR(x); };
+
+// [FATURA] cevabında müşteriye gönderilecek son satış faturası metni.
+// inv = { tarih, evrak, tutar, kalemler:[{ad,miktar,birim,fiyat,tutar}] }
+function buildInvoiceText(inv) {
+    const t = inv.tarih ? new Date(inv.tarih).toLocaleDateString('tr-TR') : '';
+    const meta = [];
+    if (t) meta.push(t);
+    if (inv.evrak) meta.push('No: ' + inv.evrak);
+    const out = [`Son satış faturanız${meta.length ? ' (' + meta.join(', ') + ')' : ''}:`];
+    const ks = Array.isArray(inv.kalemler) ? inv.kalemler : [];
+    const MAX = 20;
+    for (const k of ks.slice(0, MAX)) {
+        const qty = Number(k.miktar) ? `${fmtQty(k.miktar)}${k.birim ? ' ' + k.birim : ''} x ${fmtTR(k.fiyat)}` : '';
+        out.push(`- ${k.ad || '(kalem)'}${qty ? '  ' + qty : ''} = ${fmtTR(k.tutar)} TL`);
+    }
+    if (ks.length > MAX) out.push(`... (+${ks.length - MAX} kalem daha)`);
+    const toplam = ks.length ? ks.reduce((s, k) => s + (Number(k.tutar) || 0), 0) : (Number(inv.tutar) || 0);
+    out.push(`Toplam: ${fmtTR(toplam)} TL`);
+    return out.join('\n');
+}
 
 // ─── Sistem istemi (Türkçe) ──────────────────────────────────────────────────
 // Modele: yalnız KAPSAM içi (bakiye/ödeme/borç sebebi) sorulara cevap ver, aksi
@@ -285,6 +306,7 @@ function buildSystem() {
         `Bunların DIŞINDAKİ her şeyde (ürün/fiyat sorusu, pazarlık, teknik sorun, alakasız sohbet, anlamadığın veya emin olmadığın mesajlar) hiçbir şey yazma, sadece tam olarak şunu üret: [SESSIZ]`,
         `Ödeme bilgisi istenmiş ama sana ÖDEME BİLGİSİ verilmemişse yine [SESSIZ] üret.`,
         `Müşteri "neden borcum var / bu borç nereden / hesap dökümü / ekstre / detay" gibi DÖKÜM/EKSTRE isterse: cevabına [EKSTRE] etiketini ekle ve ardından tek cümle kısa açıklama yaz (örn. "[EKSTRE] Hesap ekstreniz ektedir."). Sistem PDF hesap ekstresini otomatik ekleyecek.`,
+        `Müşteri "son faturam / son satış faturası / faturamı gönder / fatura içeriği / ne aldım / fatura kalemleri" gibi SON SATIŞ FATURASI içeriğini isterse: cevabına [FATURA] etiketini ekle ve tek cümle kısa açıklama yaz (örn. "[FATURA] Son satış faturanızın içeriği aşağıdadır."). Sistem fatura kalemlerini otomatik ekleyecek; kalem/rakam yazma, uydurma.`,
         ``,
         `Kurallar: Verilen bakiye/rakam dışında sayı söyleme. Kısa tut (1-4 cümle). Emoji kullanma. Yanıtında köşeli parantez [ ] kullanma (yalnız sessiz kalırken [SESSIZ], ekstre gerekince [EKSTRE]).`,
         extra ? `\nEk talimat: ${extra}` : '',
@@ -310,6 +332,8 @@ function buildUser(ctx, incomingText) {
 }
 
 // ─── Gelen mesaj işleyici (whatsapp.js → setIncomingHandler) ─────────────────
+const inFlight = new Set(); // numara-başı eş zamanlı işlem kilidi (çift-cevap yarışı önleme)
+
 async function handleIncoming({ phone, text, jid, id }) {
     if (!config.enabled) return;
     rollDay();
@@ -322,6 +346,19 @@ async function handleIncoming({ phone, text, jid, id }) {
         saveState();
     }
 
+    // Çift-cevap yarışı: LLM/DB beklenirken gelen 2. mesaj, 1. henüz lastByPhone'a
+    // yazmadığı için min-aralık/tavan kontrolünü geçip ikinci cevaba yol açıyordu
+    // (ekranda "Merhabalar" + "Günaydın" → iki ayrı cevap). Numara-başı kilit ile 2. atlanır.
+    if (inFlight.has(phone)) { addLog({ phone, kind: 'skip', reason: 'önceki mesaj işleniyor' }); return; }
+    inFlight.add(phone);
+    try {
+        await handleIncomingInner({ phone, text, jid, id });
+    } finally {
+        inFlight.delete(phone);
+    }
+}
+
+async function handleIncomingInner({ phone, text, jid, id }) {
     const apiKey = getApiKey();
     if (!apiKey) { addLog({ phone, kind: 'skip', reason: 'API anahtarı yok' }); return; }
 
@@ -427,14 +464,24 @@ async function handleIncoming({ phone, text, jid, id }) {
     }
 
     // [EKSTRE] → PDF hesap ekstresi ekle (borç sebebi/döküm sorusu).
+    // [FATURA] → son satış faturasının içeriğini metin olarak ekle.
     const wantsExtre = /\[EKSTRE\]/i.test(reply);
-    const caption = reply.replace(/\[SESSIZ\]|\[EKSTRE\]/ig, '').trim();
+    const wantsFatura = /\[FATURA\]/i.test(reply);
+    let caption = reply.replace(/\[SESSIZ\]|\[EKSTRE\]|\[FATURA\]/ig, '').trim();
     let media = null;
     if (wantsExtre && deps.buildCariExtre && donemNo) {
         try {
             const ex = await deps.buildCariExtre(firmaNo, donemNo, cari.ind);
             if (ex && ex.buffer) media = { kind: 'document', buffer: ex.buffer, mimetype: 'application/pdf', fileName: ex.fileName || 'Hesap-Ekstresi.pdf' };
         } catch (e) { console.error('[AIBot] ekstre üretilemedi:', e.message); addLog({ phone, name: ctx.name, kind: 'error', reason: 'ekstre üretilemedi: ' + e.message }); }
+    }
+    // Son satış faturası içeriği (isteğe bağlı) → caption altına metin olarak eklenir.
+    if (wantsFatura && deps.fetchLastSalesInvoice && donemNo) {
+        try {
+            const inv = await deps.fetchLastSalesInvoice(firmaNo, donemNo, cari.ind);
+            const invText = inv ? buildInvoiceText(inv) : 'Adınıza kayıtlı bir satış faturası bulunamadı.';
+            caption = caption ? `${caption}\n\n${invText}` : invText;
+        } catch (e) { console.error('[AIBot] fatura getirilemedi:', e.message); addLog({ phone, name: ctx.name, kind: 'error', reason: 'fatura getirilemedi: ' + e.message }); }
     }
 
     // Ekstre istendi ama üretilemediyse: en azından metin varsa onu gönder, yoksa sessiz.
