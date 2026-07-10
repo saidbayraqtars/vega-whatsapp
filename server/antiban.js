@@ -29,6 +29,14 @@ const WARMUP_RAMP = [20, 40, 60, 90, 130, 170, 200];
 // warm-up günlük tavanına oranla küçültülür (bkz. effectiveHourlyCap).
 const HOURLY_CAP = 40;
 
+// ─── Kullanıcı ayarlı sınırlar (kalıcı) ───────────────────────────────────────
+// userDailyCap: warm-up rampına EK üst sınır (kullanıcı 200'ü fazla bulursa 150'ye
+//   çeker). null = yalnız ramp geçerli. Ramp ile küçüğü uygulanır.
+// warnAt: SOFT uyarı eşiği — hesabın bugünkü TOPLAM gönderimi bu katı aşınca gate()
+//   'warn' döner; UI onay ister. Eski/olgun numaralarda da geçerli (warm-up'tan bağımsız).
+//   0 = uyarı kapalı. Onaylanınca bir sonraki kata kadar sürer.
+const DEFAULT_LIMITS = { userDailyCap: null, warnAt: 120 };
+
 // ─── Ban-şüphesi devre kesici (soğuma) ───────────────────────────────────────
 // Bağlantı ban-şüpheli kapanınca (403 forbidden / 401 loggedOut) veya kısa sürede
 // çok kopunca (ağ fırtınası), hesaba SOĞUMA konur → gate() o süre gönderime izin
@@ -61,6 +69,19 @@ const daysBetween = (fromKey, toKey) =>
 // warm-up'ı sıfırlamak istemeyiz, o yüzden numara kısmını anahtar yaparız.
 const normAccount = (id) => String(id || 'unknown').split(':')[0].split('@')[0] || 'unknown';
 
+// Bağlantı kapanışları oturum AÇILMADAN da gelir (connect sırasında 403) — o an
+// waStatus().me boştur. Son bilinen numarayı kalıcı tut ki kapanış gerçek hesaba
+// yazılsın, 'unknown' adında hiç okunmayan bir kovaya değil.
+const rememberAccount = (id) => {
+    const k = normAccount(id);
+    if (k !== 'unknown' && state.lastAccountId !== k) { state.lastAccountId = k; save(); }
+    return k;
+};
+const resolveAccount = (id) => {
+    const k = normAccount(id);
+    return k === 'unknown' && state.lastAccountId ? state.lastAccountId : k;
+};
+
 function configure(baseDir) {
     const dataDir = path.join(baseDir, 'data');
     try { if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true }); } catch { /* yok say */ }
@@ -73,10 +94,39 @@ function load() {
         const raw = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
         if (raw && raw.accounts) state = raw;
     } catch { /* ilk çalıştırma */ }
+    // 'unknown' kovası: kimlik bilinmeden (henüz açılmamış oturumda) gelen kapanışlar
+    // buraya yazılıyordu. gate() daima gerçek numarayla çağrıldığı için hiç okunmuyor,
+    // sadece çöp. lastAccountId ile artık üretilmiyor; eskisini temizle.
+    if (state.accounts && state.accounts.unknown) { delete state.accounts.unknown; save(); }
 }
 function save() {
     try { if (STATE_PATH) fs.writeFileSync(STATE_PATH, JSON.stringify(state)); }
     catch { /* sayaç yazılamazsa gönderim engellenmesin */ }
+}
+
+// ─── Kullanıcı sınırları (günlük cap + soft uyarı eşiği) ──────────────────────
+function getLimits() {
+    const l = state.limits || {};
+    const cap = Number(l.userDailyCap);
+    let warn;
+    if (l.warnAt === 0 || l.warnAt === '0') warn = 0;                       // açıkça kapatılmış
+    else warn = Number(l.warnAt) > 0 ? Math.floor(Number(l.warnAt)) : DEFAULT_LIMITS.warnAt;
+    return { userDailyCap: cap > 0 ? Math.floor(cap) : null, warnAt: warn };
+}
+function setLimits(patch = {}) {
+    const cur = getLimits();
+    const next = { ...cur };
+    if (patch.userDailyCap !== undefined) {
+        const v = Number(patch.userDailyCap);
+        next.userDailyCap = v > 0 ? Math.floor(v) : null;
+    }
+    if (patch.warnAt !== undefined) {
+        const v = Number(patch.warnAt);
+        next.warnAt = v >= 0 ? Math.floor(v) : cur.warnAt;                  // 0 = kapalı
+    }
+    state.limits = next;
+    save();
+    return getLimits();
 }
 
 // Hesap + kanal kaydını al/oluştur ve gün/saat dönüşünde sayaçları sıfırla.
@@ -124,10 +174,15 @@ function effectiveHourlyCap(dailyCap) {
 // Döner: { ok, reason, dailyCap, daySent, hourCap, hourSent, dayIndex, capType, channel }
 function gate(accountId, userDailyCap, channel = 'default') {
     if (!STATE_PATH) return { ok: true, dailyCap: null, daySent: 0, hourCap: HOURLY_CAP, hourSent: 0, dayIndex: 0, channel };
-    const { acc, ch } = touch(accountId, channel);
+    rememberAccount(accountId);
+    const { acc, ch } = touch(resolveAccount(accountId), channel);
     const dayIndex = daysBetween(acc.firstActiveDate, dayKey());
     const rampCap = rampDailyCap(acc);
-    const dailyCap = (Number(userDailyCap) > 0) ? Math.min(rampCap, Number(userDailyCap)) : rampCap;
+    const lim = getLimits();
+    const caps = [rampCap];
+    if (Number(userDailyCap) > 0) caps.push(Number(userDailyCap));
+    if (lim.userDailyCap) caps.push(lim.userDailyCap);                       // kullanıcı üst sınırı
+    const dailyCap = Math.min(...caps);
     const hourCap = effectiveHourlyCap(dailyCap);
 
     // Ban-şüphesi soğuması aktifse hiç gönderme — flaglenen numarayı dövme.
@@ -137,6 +192,25 @@ function gate(accountId, userDailyCap, channel = 'default') {
         return { ok: false, capType: 'cooldown', channel,
             reason: `Ban koruması: gönderim ${mins} dk durduruldu (${acc.cooldownReason || 'anormal kopma'})`,
             dailyCap, daySent: ch.count, hourCap, hourSent: acc.hour.count, dayIndex, cooldownUntil: acc.cooldownUntil };
+    }
+
+    // Soft ban-uyarı eşiği (TÜM numaralar, eski/olgun dahil): hesabın bugün TÜM
+    // kanallardaki TOPLAM gönderimi warnAt katını aşınca kullanıcı onayı gerekir.
+    // Onaylanmadıkça gönderim DURUR (kuyruğa alınır); gün dönünce sayaç sıfır →
+    // kendiliğinden sürer. acknowledgeWarn() o günkü kata onay verir.
+    if (lim.warnAt > 0) {
+        const today = dayKey();
+        if (acc.warnDay !== today) { acc.warnDay = today; acc.warnAckLevel = 0; }
+        const total = totalDaySent(acc);
+        const level = Math.floor(total / lim.warnAt);
+        if (level >= 1 && level > (acc.warnAckLevel || 0)) {
+            return {
+                ok: false, capType: 'warn', needsConfirm: true, channel,
+                reason: `Ban uyarısı: bugün toplam ${total} mesaj gönderildi. Devam etmek ban riskini artırır — onayınız gerekiyor.`,
+                dailyCap, daySent: ch.count, total, warnAt: lim.warnAt, warnLevel: level,
+                hourCap, hourSent: acc.hour.count, dayIndex,
+            };
+        }
     }
 
     if (ch.count >= dailyCap) {
@@ -153,10 +227,25 @@ function gate(accountId, userDailyCap, channel = 'default') {
 // Gönderim BAŞARILI olunca çağır: kanal-günlük + ortak-saatlik sayacı artır, diske yaz.
 function recordSent(accountId, channel = 'default') {
     if (!STATE_PATH) return;
-    const { acc, ch } = touch(accountId, channel);
+    rememberAccount(accountId);
+    const { acc, ch } = touch(resolveAccount(accountId), channel);
     ch.count++;
     acc.hour.count++;
     save();
+}
+
+// Kullanıcı "devam" onayı verince: o günkü uyarı katını onayla → sonraki kata (warnAt
+// katı) kadar tekrar sormaz. Gün dönünce sıfırlanır (yeniden uyarılır).
+function acknowledgeWarn(accountId) {
+    if (!STATE_PATH) return { ok: true };
+    const { acc } = touch(accountId);
+    const lim = getLimits();
+    const today = dayKey();
+    if (acc.warnDay !== today) acc.warnDay = today;
+    const total = totalDaySent(acc);
+    acc.warnAckLevel = lim.warnAt > 0 ? Math.floor(total / lim.warnAt) : 0;
+    save();
+    return { ok: true, warnAckLevel: acc.warnAckLevel, total };
 }
 
 // Bağlantı kapanışını anti-ban açısından değerlendir (whatsapp.js close olayından
@@ -164,14 +253,24 @@ function recordSent(accountId, channel = 'default') {
 // çok kopmada (ağ fırtınası) hesaba SOĞUMA koy → gate() o süre gönderime izin vermez.
 // 403/401'de warm-up da sıfırlanır: kick yiyen numara sıfırdan yavaş ısınmalı.
 // NOT: 440 (connectionReplaced = WA Web başka yerde açıldı) iyi huyludur; tek başına
-// soğuma tetiklemez, yalnız fırtına sayımına girer.
-function noteDisconnect(accountId, statusCode) {
+// soğuma tetiklemez, yalnız fırtına sayımına girer. Bazı Baileys sürümleri aynı
+// çakışmayı 401 + "Stream Errored (conflict)" olarak bildirir — mesajdan ayıklarız,
+// yoksa WA Web'i açan kullanıcı hesabı 2 saat kilitliyor ve warm-up'ı sıfırlıyor.
+const isConflict = (code, errMsg) =>
+    code === 440 || /conflict|replaced/i.test(String(errMsg || ''));
+
+function noteDisconnect(accountId, statusCode, errMsg) {
     if (!STATE_PATH) return null;
-    const { acc } = touch(accountId);
+    const { acc } = touch(resolveAccount(accountId));
     const now = Date.now();
     const code = Number(statusCode);
     let ms = 0, reason = null, resetWarmup = false;
 
+    if (isConflict(code, errMsg)) {
+        // İyi huylu: oturum başka yerde açıldı. Soğuma yok, warm-up sıfırlaması yok.
+        save();
+        return null;
+    }
     if (code === 403) { ms = COOLDOWN_FORBIDDEN_MS; reason = 'hesap kısıtlı (403)'; resetWarmup = true; }
     else if (code === 401) { ms = COOLDOWN_LOGGEDOUT_MS; reason = 'oturum düşürüldü (401)'; resetWarmup = true; }
     else if (acc.cooldownUntil && acc.cooldownUntil > now) {
@@ -187,9 +286,33 @@ function noteDisconnect(accountId, statusCode) {
 
     acc.cooldownUntil = Math.max(acc.cooldownUntil || 0, now + ms);
     acc.cooldownReason = reason;
-    if (resetWarmup) acc.firstActiveDate = dayKey(); // yeniden ısınma
+    // Warm-up'ı sıfırla ama eskisini sakla: kapanış yanlış alarmsa (aşağıda noteOpen)
+    // geri alınır. Aksi halde her geçici 403'te numara gün-0 tavanına (20/gün) düşer.
+    if (resetWarmup) {
+        if (!acc.prevFirstActiveDate) acc.prevFirstActiveDate = acc.firstActiveDate;
+        acc.firstActiveDate = dayKey();
+    }
     save();
     return { cooldownMs: ms, reason };
+}
+
+// Oturum BAŞARIYLA açıldı (kimlik doğrulandı). Gerçekten kısıtlı/çıkış yaptırılmış bir
+// numara buraya gelemez — WhatsApp connect'i 403/401 ile keser, 'open' hiç olmaz.
+// Dolayısıyla açılış, önceki kapanışın yanlış alarm olduğunun kanıtıdır: soğumayı
+// kaldır ve warm-up gününü geri ver. (Canlı vaka: connect sırasında 64 adet geçici
+// 403 → 24 saat kilit + warm-up sıfırlanması; oysa numara sağlamdı, mesaj iletiliyordu.)
+function noteOpen(accountId) {
+    if (!STATE_PATH) return null;
+    const key = rememberAccount(accountId);
+    if (key === 'unknown') return null;
+    const { acc } = touch(key);
+    const cleared = acc.cooldownUntil && acc.cooldownUntil > Date.now() ? acc.cooldownReason : null;
+    delete acc.cooldownUntil;
+    delete acc.cooldownReason;
+    acc.closes = [];
+    if (acc.prevFirstActiveDate) { acc.firstActiveDate = acc.prevFirstActiveDate; delete acc.prevFirstActiveDate; }
+    save();
+    return cleared ? { cleared } : null;
 }
 
 // ─── Gönderim saati + günü penceresi (gece/haftasonu gönderme koruması) ───────
@@ -267,17 +390,29 @@ function applySpintax(text) {
 
 // UI / teşhis için anlık durum (gönderime etkisi yok). daySent = TÜM kanal toplamı.
 function snapshot(accountId, userDailyCap) {
-    if (!STATE_PATH) return { dayIndex: 0, warmup: false, dailyCap: null, daySent: 0, hourCap: HOURLY_CAP, hourSent: 0 };
-    const { acc } = touch(accountId, 'default');
+    if (!STATE_PATH) return { dayIndex: 0, warmup: false, dailyCap: null, daySent: 0, hourCap: HOURLY_CAP, hourSent: 0, warnAt: 0, warnPending: false, warnLevel: 0 };
+    const { acc } = touch(resolveAccount(accountId), 'default');
     const dayIndex = daysBetween(acc.firstActiveDate, dayKey());
     const rampCap = rampDailyCap(acc);
-    const dailyCap = (Number(userDailyCap) > 0) ? Math.min(rampCap, Number(userDailyCap)) : rampCap;
+    const lim = getLimits();
+    const caps = [rampCap];
+    if (Number(userDailyCap) > 0) caps.push(Number(userDailyCap));
+    if (lim.userDailyCap) caps.push(lim.userDailyCap);
+    const dailyCap = Math.min(...caps);
+    const total = totalDaySent(acc);
+    let warnPending = false, warnLevel = 0;
+    if (lim.warnAt > 0) {
+        const ackLevel = (acc.warnDay === dayKey()) ? (acc.warnAckLevel || 0) : 0;
+        warnLevel = Math.floor(total / lim.warnAt);
+        warnPending = warnLevel >= 1 && warnLevel > ackLevel;
+    }
     return {
         dayIndex, warmup: dayIndex < WARMUP_RAMP.length - 1,
-        dailyCap, daySent: totalDaySent(acc), hourCap: effectiveHourlyCap(dailyCap), hourSent: acc.hour.count,
+        dailyCap, daySent: total, hourCap: effectiveHourlyCap(dailyCap), hourSent: acc.hour.count,
         cooldownUntil: (acc.cooldownUntil && acc.cooldownUntil > Date.now()) ? acc.cooldownUntil : null,
         cooldownReason: (acc.cooldownUntil && acc.cooldownUntil > Date.now()) ? acc.cooldownReason : null,
+        warnAt: lim.warnAt, warnPending, warnLevel,
     };
 }
 
-module.exports = { configure, gate, recordSent, noteDisconnect, snapshot, applySpintax, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };
+module.exports = { configure, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };

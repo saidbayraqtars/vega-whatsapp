@@ -455,15 +455,23 @@ async function _runReminder(rem, opts = {}) {
             pushLog({ ...logBase, status: 'noPhone', error: 'Geçerli telefon yok' });
             continue;
         }
+        // Dönüş-budama (anti-ban): üst üste yanıt vermeyen numaraya gönderme. FİLTRE'dir
+        // (yapılandırma/etkileşim değişebilir) → "tried" işaretleme; sessiz atla, sonraki
+        // turda yeniden değerlendir (müşteri cevap verirse streak sıfırlanır → tekrar gönderilir).
+        if (typeof deps.isSuspended === 'function' && deps.isSuspended(contact.phone)) { skipped++; continue; }
 
         const vadeStr = ag && ag.enEskiVade ? new Date(ag.enEskiVade).toLocaleDateString('tr-TR') : '';
         const vadeNot = vadeStr ? `Son ödeme tarihi ${vadeStr}. ` : '';
-        const text = renderTemplate(rem.template, {
+        let text = renderTemplate(rem.template, {
             ad: contact.name, firma: contact.firma || contact.name, kod: contact.kod,
             bakiye: bakStr, kalan: bakStr, tutar: bakStr, durum,
             gecikmeGun: ag ? String(ag.gecikmeGun) : '',
             enEskiVade: vadeStr, vade: vadeStr, vadeNot,
         });
+        // İlk temasta "numaramızı kaydedin" ricası (kaydet-opt-in açıksa).
+        if (deps.saveContactText && typeof deps.shouldAskSave === 'function' && deps.shouldAskSave(contact.phone)) {
+            text += '\n\n' + deps.saveContactText;
+        }
 
         if (rem.verifyOnWhatsApp !== false) {
             const chk = await deps.checkOnWhatsApp(contact.phone);

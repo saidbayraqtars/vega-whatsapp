@@ -45,6 +45,10 @@ const setIncomingHandler = (fn) => { incomingHandler = fn; };
 // kalsın diye doğrudan antiban require etmez — server.js bağlar.
 let disconnectHandler = null;
 const setDisconnectHandler = (fn) => { disconnectHandler = fn; };
+// Başarılı (kimlik doğrulanmış) açılışı üst katmana bildir: kısıtlı numara 'open'
+// olamaz, dolayısıyla açılış önceki ban şüphesini çürütür.
+let openHandler = null;
+const setOpenHandler = (fn) => { openHandler = fn; };
 
 // Baileys mesaj gövdesinden düz metni çıkar (farklı sarmalayıcı tipleri).
 const extractText = (msg) => {
@@ -343,6 +347,8 @@ const initializeWhatsApp = async () => {
                 clearQrTimer();
                 console.log('[WhatsApp] Bağlantı kuruldu!', meId || '');
                 waEvent(`open ${meId || ''}`);
+                // Anti-ban: açılış = önceki 403/401 yanlış alarmdı → soğumayı kaldır.
+                try { openHandler && openHandler(meId); } catch { /* yok say */ }
                 notifyReady();
             }
 
@@ -354,8 +360,23 @@ const initializeWhatsApp = async () => {
                 waEvent(`close code=${statusCode} msg=${errMsg || ''}`);
                 isReady = false;
                 cleanupSocket();
-                // Anti-ban: ban-şüpheli kapanış / fırtına → gönderim soğuması.
-                try { disconnectHandler && disconnectHandler(statusCode); } catch { /* yok say */ }
+                // Anti-ban: ban-şüpheli kapanış / fırtına → gönderim soğuması. meId
+                // kapanışta korunur; oturum hiç açılmadıysa (connect'te 403) null gider
+                // ve anti-ban son bilinen numaraya yazar.
+                try { disconnectHandler && disconnectHandler(statusCode, meId, errMsg); } catch { /* yok say */ }
+
+                // Aynı oturum başka yerde açıldı (WhatsApp Web / ikinci kopya). Baileys
+                // bunu 440 connectionReplaced ile bildirir; bazı sürümlerde 401 +
+                // "Stream Errored (conflict)" olarak gelir. İkincisi 401 sanılıp oturum
+                // SİLİNİYORDU → her WA Web açılışında QR fırtınası. Çakışma oturumu
+                // geçersiz kılmaz: silme, sadece daha uzun bekle.
+                const conflict =
+                    statusCode === DisconnectReason.connectionReplaced ||
+                    statusCode === 440 ||
+                    /conflict|replaced/i.test(String(errMsg || ''));
+                if (conflict) {
+                    lastError = 'Bu WhatsApp oturumu başka bir yerde açıldı (WhatsApp Web / ikinci kopya). Diğer oturumu kapatın.';
+                }
 
                 // badSession (500) çoğu zaman geçici senkron hatası; ilk gelişte
                 // oturumu SİLMEDEN diskten yeniden bağlan, ÜST ÜSTE 2. kez gelirse
@@ -363,19 +384,10 @@ const initializeWhatsApp = async () => {
                 const isBadSession = statusCode === DisconnectReason.badSession;
                 if (isBadSession) badSessionFails++;
                 else badSessionFails = 0; // araya başka kod girerse "üst üste" sıfırlanır
-                const shouldWipe =
+                const shouldWipe = !conflict && (
                     statusCode === DisconnectReason.loggedOut ||
                     statusCode === 401 ||
-                    (isBadSession && badSessionFails >= 2);
-
-                // 440: aynı oturum başka yerde açıldı (WhatsApp Web/ikinci kopya).
-                // Hemen geri bağlanmak karşı tarafı düşürür, o da bizi düşürür →
-                // sonsuz düşürme savaşı. Daha uzun bekle ve sebebi kullanıcıya söyle.
-                const conflict =
-                    statusCode === DisconnectReason.connectionReplaced || statusCode === 440;
-                if (conflict) {
-                    lastError = 'Bu WhatsApp oturumu başka bir yerde açıldı (WhatsApp Web / ikinci kopya). Diğer oturumu kapatın.';
-                }
+                    (isBadSession && badSessionFails >= 2));
 
                 if (shouldWipe) {
                     wipeAuth();
@@ -574,6 +586,7 @@ module.exports = {
     waitForReady,
     setIncomingHandler,
     setDisconnectHandler,
+    setOpenHandler,
     toJid,
     get client() { return sock; },
 };

@@ -42,7 +42,7 @@ async function boot() {
             await api('/connect', { method: 'POST' });
             st = await api('/status');
         }
-        if (st.dbConnected) { await enterApp(); return; }
+        if (st.dbConnected) { await enterApp(); maybeShowNotice(r.version); return; }
         if (st.needsReauth || r.needsReauth) {
             show('setupScreen');
             $('su_err').textContent = 'Sürüm güncellendi. Lütfen DB parolasını bir kez yeniden girin.';
@@ -55,6 +55,30 @@ async function boot() {
 function show(screen) {
     ['setupScreen', 'app'].forEach(s => $(s).classList.add('hidden'));
     $(screen).classList.remove('hidden');
+}
+
+// Güncelleme sonrası (sürüm değişince) bir kez ban-riski bilgilendirme ekranı.
+const NOTICE_HTML = `
+<p><b>Bu sürümde WhatsApp ban riskinizi en aza indirmek için yeni araçlar var. Lütfen uygulayın:</b></p>
+<ul style="margin:8px 0 8px 18px; padding:0">
+<li>📉 <b>Günde 100-150 mesajı aşmayın.</b> ⚙ Ayarlar → <b>Ban Koruması</b>'ndan günlük üst sınır + uyarı eşiği belirleyin. Eşiğe gelince "devam edeyim mi?" diye sorar.</li>
+<li>💬 <b>Cevap vermeyene ısrar etmeyin.</b> <b>Dönüş-budama</b>'yı açın: üst üste yanıt alınmayan numaraya otomatik gönderim durur (şikayet/ban sinyalini keser).</li>
+<li>📇 <b>Müşteri sizi rehbere kaydetsin.</b> <b>"İlk mesaja kaydet ricası"</b> seçeneğini açın — rehbere kayıtsız numaraya toplu mesaj en büyük ban sebebidir.</li>
+<li>🕐 <b>Güne yayın.</b> Gönderim saatlerini genişletin; tek saatte patlama yapmayın.</li>
+<li>🖼️ <b>Numara profilini doldurun</b> (firma adı + profil fotoğrafı) — şikayet ihtimalini düşürür.</li>
+</ul>
+<p class="muted">Tüm bu ayarlar: sağ üst <b>⚙ Ayarlar → Ban Koruması</b> bölümünde.</p>`;
+function maybeShowNotice(version) {
+    try {
+        const key = version || 'unknown';
+        if (localStorage.getItem('vega.noticeVer') === key) return; // bu sürüm görüldü
+        $('noticeBody').innerHTML = NOTICE_HTML;
+        $('noticeModal').classList.remove('hidden');
+        $('noticeOk').onclick = () => {
+            try { localStorage.setItem('vega.noticeVer', key); } catch { /* yok say */ }
+            $('noticeModal').classList.add('hidden');
+        };
+    } catch { /* yok say */ }
 }
 
 // ─── Kurulum ───
@@ -308,8 +332,34 @@ async function pollWa() {
 
         // QR modal açıksa içeriği güncelle
         if (!$('waModal').classList.contains('hidden')) renderWaModal(r);
+        // Ban uyarı eşiği aşıldıysa devam-onayı popup'ı.
+        handleWarn(r.antiban);
     } catch { /* yok say */ }
 }
+
+// ─── Ban uyarısı (devam onayı) ────────────────────────────────────────────────
+// Hesabın günlük toplamı uyarı eşiğini aşınca (antiban.warnPending) popup çıkar.
+// Evet → sunucuya onay (o kata) → gönderim sürer. Hayır → 30 dk ertele (otomatik
+// gönderim zaten duraklı kalır; gün dönünce ya da onayla sürer).
+let warnSnoozeUntil = 0;
+function handleWarn(ab) {
+    if (!ab || !ab.warnPending) return;
+    if (Date.now() < warnSnoozeUntil) return;
+    const modal = $('warnModal');
+    if (!modal.classList.contains('hidden')) return;
+    $('warnMsg').textContent = `Bu numaradan bugün ${ab.daySent ?? '?'} mesaj gönderildi (uyarı eşiği ${ab.warnAt}). Göndermeye devam edilsin mi?`;
+    modal.classList.remove('hidden');
+}
+$('warnGo').onclick = async () => {
+    $('warnModal').classList.add('hidden');
+    warnSnoozeUntil = 0;
+    try { await api('/antiban/ack', { method: 'POST' }); } catch { /* yok say */ }
+    pollWa();
+};
+$('warnStop').onclick = () => {
+    $('warnModal').classList.add('hidden');
+    warnSnoozeUntil = Date.now() + 30 * 60 * 1000; // 30 dk tekrar sorma
+};
 
 function renderWaModal(r) {
     const c = $('waContent');
@@ -361,9 +411,50 @@ async function openSettings() {
             [0, 1, 2, 3, 4, 5, 6].forEach(d => { const el = $('sw_day_' + d); if (el) el.checked = days.includes(d); });
         }
     } catch { /* yok say */ }
+    try {
+        const ab = await api('/antiban');
+        if (ab.success) {
+            $('ab_dailyCap').value = ab.limits.userDailyCap || '';
+            $('ab_warnAt').value = (ab.limits.warnAt != null) ? ab.limits.warnAt : 120;
+            $('ab_guardEnabled').checked = !!(ab.guard && ab.guard.enabled);
+            $('ab_noReplyLimit').value = (ab.guard && ab.guard.noReplyLimit) || 6;
+            $('ab_askSave').checked = !!(ab.guard && ab.guard.askSaveContact);
+            const eng = ab.engage || {};
+            $('ab_engInfo').textContent = `İzlenen ${eng.tracked || 0} numara · susturulan ${eng.suspendedCount || 0}`;
+        }
+    } catch { /* yok say */ }
     await loadSettingsFirmalar();
     $('settingsModal').classList.remove('hidden');
 }
+
+// Ban Koruması ayarlarını kaydet (günlük cap + uyarı eşiği + dönüş-budama + kaydet-opt-in).
+$('ab_save').onclick = async () => {
+    const box = $('ab_result');
+    box.style.display = ''; box.className = 'hint'; box.textContent = 'Kaydediliyor...';
+    try {
+        const capVal = $('ab_dailyCap').value.trim();
+        const warnVal = $('ab_warnAt').value.trim();
+        const lr = await api('/antiban/limits', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userDailyCap: capVal === '' ? 0 : Number(capVal), warnAt: warnVal === '' ? 120 : Number(warnVal) }),
+        });
+        const gr = await api('/antiban/guard', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: $('ab_guardEnabled').checked, noReplyLimit: Number($('ab_noReplyLimit').value) || 6, askSaveContact: $('ab_askSave').checked }),
+        });
+        if (lr.success && gr.success) {
+            box.className = 'hint ok';
+            box.textContent = `✓ Kaydedildi (üst sınır ${lr.limits.userDailyCap || 'otomatik'}, uyarı ${lr.limits.warnAt || 'kapalı'}, budama ${gr.guard.enabled ? 'açık/' + gr.guard.noReplyLimit : 'kapalı'})`;
+        } else { box.className = 'err'; box.textContent = 'Kaydedilemedi.'; }
+    } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
+};
+$('ab_engReset').onclick = async () => {
+    if (!confirm('Susturulan tüm numaralar yeniden gönderime açılsın mı?')) return;
+    try {
+        const r = await api('/antiban/engage/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        if (r.success) $('ab_engInfo').textContent = `Sıfırlandı (${r.reset} numara açıldı)`;
+    } catch (e) { /* yok say */ }
+};
 
 $('sw_save').onclick = async () => {
     const box = $('sw_result');
@@ -895,6 +986,7 @@ function createRuleCard(rule) {
             <div class="chips rc_chips">${WC_VARS.map(v => `<span class="chip" data-v="${v}">${v}</span>`).join('')}</div>
             <div class="hint">{firma}=cari adı, {tutar}=bu belgenin tutarı, {bakiye}=güncel kalan bakiye, {durum}=Borç/Alacak, {belge}=tür adı, {firmaadi}=kendi firma adın (Firma Bilgileri'nden).</div>
         </div>
+        <label class="check rc_contentRow" style="display:none"><input type="checkbox" class="rc_includeContent" /> Belge içeriğini de gönder <span class="muted">(kesilen faturanın/belgenin kalemleri mesaja eklenir)</span></label>
         <div class="field">
             <label>Görsel / Video (opsiyonel)</label>
             <input type="file" class="rc_media" accept="image/*,video/*" />
@@ -903,6 +995,9 @@ function createRuleCard(rule) {
     card.querySelector('.rc_dir').value = dir;
     card.querySelector('.rc_docType').value = docType;
     card.querySelector('.rc_excludeFatura').checked = (rule.excludeFatura !== undefined) ? !!rule.excludeFatura : (dir === 'alacak');
+    card.querySelector('.rc_includeContent').checked = rule.includeContent === true;
+    // Kalemli (içeriği olan) belge tipleri — "Belge içeriğini de gönder" yalnız bunlarda görünür.
+    const CONTENT_DOCTYPES = new Set(['satisFaturasi', 'alisFaturasi', 'satisIrsaliyesi', 'alisIrsaliyesi', 'stokCikis', 'stokGiris']);
     // Hazır tip → gelişmiş alanlar (yön/kod/fatura) otomatik, gizli; özel → göster.
     const DOC_HINTS = {
         satisFaturasi: 'Satış faturası kesildiğinde (müşteri borçlanır) gönderilir.',
@@ -920,6 +1015,7 @@ function createRuleCard(rule) {
         card.querySelector('.rc_advanced').style.display = custom ? '' : 'none';
         card.querySelector('.rc_minSimple').style.display = custom ? 'none' : '';
         card.querySelector('.rc_docHint').textContent = DOC_HINTS[dt] || '';
+        card.querySelector('.rc_contentRow').style.display = CONTENT_DOCTYPES.has(dt) ? '' : 'none';
     };
     applyDocTypeUI();
     card.querySelector('.rc_docType').onchange = applyDocTypeUI;
@@ -995,6 +1091,7 @@ function collectRules() {
             minAmount,
             izahatCodes: card.querySelector('.rc_codes').value.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n)),
             excludeFatura: card.querySelector('.rc_excludeFatura').checked,
+            includeContent: card.querySelector('.rc_includeContent').checked,
             template: card.querySelector('.rc_template').value,
         };
     });
@@ -1698,16 +1795,8 @@ function renderExtreList() {
         btn.disabled = !row.phone || !row.valid;
         btn.title = btn.disabled ? 'Geçerli telefon yok' : 'PDF ekstreyi gönder';
         btn.onclick = () => sendExtreRow(row, btn);
-        const fb = document.createElement('button');
-        fb.className = 'btn ghost xs';
-        fb.style.marginLeft = '6px';
-        fb.textContent = 'Son Fatura';
-        fb.disabled = !row.phone || !row.valid;
-        fb.title = fb.disabled ? 'Geçerli telefon yok' : 'Son satış faturasının içeriğini metin olarak gönder (AI gerekmez)';
-        fb.onclick = () => sendSonFaturaRow(row, fb);
         cell.appendChild(pv);
         cell.appendChild(btn);
-        cell.appendChild(fb);
         body.appendChild(tr);
     }
     $('ex_info').textContent = `${exRows.length} cari listelendi`;
@@ -1738,22 +1827,6 @@ async function sendExtreRow(row, btn) {
     try {
         const r = await doExtreSend(row.ind);
         exLog(r.success ? `✓ ${row.name} (${row.phone}) — ekstre gönderildi` : `✗ ${row.name} — ${r.message || 'hata'}`);
-    } catch (e) {
-        exLog(`✗ ${row.name} — ${e.message}`);
-    }
-    btn.disabled = false; btn.textContent = old;
-}
-
-// Satırdaki "Son Fatura" — carinin son satış faturası içeriğini metin olarak gönder (AI'sız).
-async function sendSonFaturaRow(row, btn) {
-    if (!row.phone || !row.valid) return;
-    if (!confirm(`${row.name} carisine SON satış faturasının içeriği gönderilsin mi?`)) return;
-    const old = btn.textContent;
-    btn.disabled = true; btn.textContent = 'Gönderiliyor...';
-    try {
-        const firmaNo = $('ex_firma').value, donemNo = $('ex_donem').value;
-        const r = await api('/extre/son-fatura', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ firmaNo, donemNo, ind: row.ind }) });
-        exLog(r.success ? `✓ ${row.name} (${row.phone}) — son fatura gönderildi` : `✗ ${row.name} — ${r.message || 'hata'}`);
     } catch (e) {
         exLog(`✗ ${row.name} — ${e.message}`);
     }

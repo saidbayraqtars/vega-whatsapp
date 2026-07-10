@@ -144,10 +144,12 @@ let config = { ...DEFAULT_CONFIG };
 let state = { lastSeenInd: {} };
 let log = [];
 let pending = [];
-// Gönderilen belge defteri: { [tbl]: { [docType::EVRAKNO]: entry } }. Düzenleme/silme
-// algısı için; yalnız watchEdits||watchDeletes açıkken doldurulur. 7 günle sınırlı.
+// Gönderilen belge defteri: { [tbl]: { [docType::cari::tarih::EVRAKNO]: entry } }.
+// Düzenleme/silme algısı için; yalnız watchEdits||watchDeletes açıkken doldurulur.
+// 7 günle sınırlı.
 let docs = {};
 let lastEditScanAt = 0;
+let rescanDone = false;
 
 const MAX_VERIFY_ATTEMPTS = 3;
 const MAX_SEND_ATTEMPTS = 8;
@@ -228,6 +230,9 @@ function normalizeRule(r, prev) {
         direction,
         minAmount: Math.max(0, Number(r.minAmount) || 0),
         excludeFatura,
+        // Belge içeriğini (kesilen faturanın kalemlerini) mesaja da ekle. Varsayılan kapalı.
+        // Yalnız kalemli belge tiplerinde (fatura/irsaliye/stok) çalışır; ödeme/özel'de yok sayılır.
+        includeContent: r.includeContent === true,
         template,
         media: media || null,
     };
@@ -365,11 +370,42 @@ function pushLog(entry) {
 
 // ─── Gönderilen belge defteri (düzenleme/silme izleme) ──────────────────────────
 const watchActive = () => config.watchEdits === true || config.watchDeletes === true;
-const docKeyOf = (docType, evrak) => `${docType}::${evrak}`;
+
+// EVRAKNO Vega'da GLOBAL TEKİL DEĞİL: her kasa/banka fiş serisi kendi sayacını tutar,
+// numaralar cariler ve tarihler arasında tekrar eder (canlı: A0000272 → 8 Tem cari 176,
+// 10 Tem cari 123). Defter anahtarı sadece docType::EVRAKNO iken bir carinin belgesi
+// başka carinin aynı numaralı belgesini susturuyordu (94/99 yanlış "zaten bildirildi").
+// Kimlik = belge tipi + cari + belge tarihi + evrak.
+const dayOf = (t) => {
+    if (!t) return '';
+    const d = t instanceof Date ? t : new Date(t);
+    return Number.isFinite(d.getTime()) ? d.toISOString().slice(0, 10) : '';
+};
+const docKeyOf = (docType, cariInd, tarih, evrak) => `${docType}::${cariInd}::${dayOf(tarih)}::${evrak}`;
+
+// Eski defterler docType::EVRAKNO ile yazılmıştı. Anahtarları kayıt alanlarından
+// yeniden üret — yoksa yeni anahtar hiçbir eski kayda değmez ve zaten mesaj almış
+// carilere mükerrer gider.
+function migrateDocKeys() {
+    let changed = false;
+    for (const t of Object.keys(docs)) {
+        const bucket = docs[t];
+        const fixed = {};
+        for (const [k, e] of Object.entries(bucket)) {
+            if (!e || !e.evrak || !e.docType) continue;         // bozuk kayıt: düş
+            const nk = docKeyOf(e.docType, e.cariInd, e.tarih, e.evrak);
+            if (nk !== k) changed = true;
+            fixed[nk] = e;
+        }
+        docs[t] = fixed;
+    }
+    if (changed) saveDocs();
+}
 
 function loadDocs() {
     try { if (fs.existsSync(DOCS_PATH)) { const d = JSON.parse(fs.readFileSync(DOCS_PATH, 'utf8')); if (d && typeof d === 'object') docs = d; } }
     catch (e) { console.error('[Watcher] belge defteri okunamadı:', e.message); }
+    migrateDocKeys();
 }
 function saveDocs() {
     try { fs.writeFileSync(DOCS_PATH, JSON.stringify(docs), 'utf8'); }
@@ -395,7 +431,7 @@ function pruneDocs() {
 function recordSentDoc(tbl, base, phone, id) {
     if (!watchActive() || !tbl || !base || !base.evrak || !base.docType) return;
     docs[tbl] = docs[tbl] || {};
-    const key = docKeyOf(base.docType, base.evrak);
+    const key = docKeyOf(base.docType, base.cariInd, base.tarihISO, base.evrak);
     const e = docs[tbl][key] || {
         evrak: base.evrak, cariInd: base.cariInd, docType: base.docType,
         ruleId: base.ruleId, ruleName: base.ruleName,
@@ -668,20 +704,23 @@ async function scanEditsDeletes(pool, tbl) {
     const params = evraks.map((ev, i) => { req.input(`e${i}`, deps.sql.NVarChar, String(ev)); return `@e${i}`; });
     const cur = new Map();
     try {
+        // Gruplama defter anahtarıyla aynı kimliği kullanmalı: cari + belge tarihi +
+        // evrak. Sadece cari+evrak ile gruplayınca aynı carinin farklı tarihli, aynı
+        // numaralı iki fişi tek satırda toplanır → uydurma "tutar değişti" mesajı.
         const rows = (await req.query(`
-            SELECT EVRAKNO, FIRMANO,
+            SELECT EVRAKNO, FIRMANO, CONVERT(date, TARIH) AS D,
                    CAST(SUM(BORC) AS DECIMAL(18,2)) AS B,
                    CAST(SUM(ALACAK) AS DECIMAL(18,2)) AS A,
                    COUNT(*) AS N
             FROM [${tbl}]
             WHERE FIRMANO IN (${inds.join(',')}) AND EVRAKNO IN (${params.join(',')})
-            GROUP BY EVRAKNO, FIRMANO
+            GROUP BY EVRAKNO, FIRMANO, CONVERT(date, TARIH)
         `)).recordset;
-        rows.forEach(r => cur.set(`${r.FIRMANO}::${r.EVRAKNO}`, { B: Number(r.B) || 0, A: Number(r.A) || 0, N: Number(r.N) || 0 }));
+        rows.forEach(r => cur.set(`${r.FIRMANO}::${dayOf(r.D)}::${r.EVRAKNO}`, { B: Number(r.B) || 0, A: Number(r.A) || 0, N: Number(r.N) || 0 }));
     } catch (e) { console.error('[Watcher] düzenleme/silme sorgusu:', e.message); return; }
 
     for (const [key, e] of entries) {
-        const c = cur.get(`${e.cariInd}::${e.evrak}`);
+        const c = cur.get(`${e.cariInd}::${dayOf(e.tarih)}::${e.evrak}`);
         if (!c || c.N === 0) {
             if (config.watchDeletes) await handleDeleted(tbl, key, e);
             else { delete bucket[key]; saveDocs(); }    // izlenmiyorsa defteri temizle
@@ -775,6 +814,39 @@ async function handleEdited(pool, tbl, key, e, curAmount) {
     }
 }
 
+// ─── Tek seferlik kurtarma: son 24 saati yeniden tara ──────────────────────────
+// docKeyOf cari+tarih içermediği sürece yeni belgeler "zaten bildirildi" denip
+// atlanıyordu (canlı: 94/99 yanlış atlama). Watermark'ı dün 00:00'a çek ki kaçan
+// belgeler bir kez daha değerlendirilsin. Defter (migrateDocKeys ile taşındı) zaten
+// mesaj almış olanları tutar, mükerrer gitmez. Marker dosyası: sadece bir kez.
+const RESCAN_MARKER = () => path.join(MEDIA_DIR, '.rescan-24h-v1');
+
+function markRescanDone() {
+    rescanDone = true;
+    try { fs.writeFileSync(RESCAN_MARKER(), new Date().toISOString(), 'utf8'); }
+    catch (e) { console.error('[Watcher] yeniden tarama işareti yazılamadı:', e.message); }
+}
+
+async function rescanLast24h(pool, tbl) {
+    if (rescanDone) return;
+    if (fs.existsSync(RESCAN_MARKER())) { rescanDone = true; return; }
+    try {
+        // TARIH belge tarihidir (saat 00:00). "Son 24 saat" = dün 00:00'dan itibaren.
+        const mn = Number((await pool.request().query(`
+            SELECT ISNULL(MIN(IND), 0) AS mn FROM [${tbl}]
+            WHERE TARIH >= DATEADD(day, -1, CONVERT(date, GETDATE()))
+        `)).recordset[0].mn) || 0;
+        const prev = state.lastSeenInd[tbl];
+        if (mn > 0 && prev != null && mn - 1 < prev) {
+            state.lastSeenInd[tbl] = mn - 1;
+            saveState();
+            pushLog({ status: 'info', error: `Belge kimliği düzeltildi — son 24 saat yeniden taranıyor (IND ${mn} sonrası)` });
+            console.log(`[Watcher] 24s yeniden tarama: watermark ${prev} → ${mn - 1}`);
+        }
+        markRescanDone();   // yalnız sorgu başarılıysa işaretle; hata olursa sonraki turda dene
+    } catch (e) { console.error('[Watcher] 24s yeniden tarama:', e.message); }
+}
+
 // ─── Çekirdek: tek tarama ──────────────────────────────────────────────────────
 async function pollOnce() {
     if (polling) return;
@@ -806,10 +878,12 @@ async function pollOnce() {
             const mx = (await pool.request().query(`SELECT ISNULL(MAX(IND),0) AS mx FROM [${tbl}]`)).recordset[0].mx;
             state.lastSeenInd[tbl] = mx;
             saveState();
+            markRescanDone();   // yeni kurulum: geçmişi kurtarma yok
             lastResult = { sent: 0, skipped: 0, found: 0, note: `İzleme başladı (watermark IND=${mx})` };
             return;
         }
 
+        await rescanLast24h(pool, tbl);
         const lastSeen = state.lastSeenInd[tbl];
 
         // Watermark tavanı (kural eşleşmese de ilerleyebilsin).
@@ -873,7 +947,8 @@ async function pollOnce() {
         for (const { row, rule, amount } of matched) {
             // INSERT-guard: bu belge zaten bildirilmişse (sil+ekle ile gelen düzenleme)
             // yeni mesaj ATMA — düzenleme/silme taraması tutar farkını/kaybı yakalar.
-            if (watchActive() && docs[tbl] && docs[tbl][docKeyOf(rule.docType, row.EVRAKNO || '')]) {
+            // Kimlik cari+tarih içerir: EVRAKNO tek başına tekil değil (bkz. docKeyOf).
+            if (watchActive() && docs[tbl] && docs[tbl][docKeyOf(rule.docType, row.FIRMANO, row.TARIH, row.EVRAKNO || '')]) {
                 skipped++;
                 pushLog({ ind: row.IND, cariInd: row.FIRMANO, name: String(row.FIRMANO), evrak: row.EVRAKNO || '', ruleName: rule.name, status: 'info', error: 'Belge zaten bildirildi — düzenleme olarak izleniyor' });
                 continue;
@@ -909,13 +984,28 @@ async function pollOnce() {
             if (!c.phone || !c.valid) {
                 skipped++; pushLog({ ...base, status: 'noPhone', error: 'Geçerli telefon yok' }); continue;
             }
+            // Dönüş-budama (anti-ban): üst üste yanıt vermeyen numaraya gönderimi durdur.
+            if (typeof deps.isSuspended === 'function' && deps.isSuspended(c.phone)) {
+                skipped++; pushLog({ ...base, status: 'noReply', error: 'Üst üste yanıt yok — dönüş-budama ile atlandı (Anti-ban)' }); continue;
+            }
 
-            const text = renderTemplate(rule.template, {
+            let text = renderTemplate(rule.template, {
                 ad: c.name, firma: c.firma, tutar: fmtAmount(amount), kod: c.kod, evrak: row.EVRAKNO || '',
                 belge: rule.name, firmaadi: bizFirma,
                 tarih: row.TARIH ? new Date(row.TARIH).toLocaleDateString('tr-TR') : '',
                 bakiye: bakiyeStr, durum,
             });
+            // Seçenek açıksa O AN kesilen belgenin (EVRAKNO) kalemlerini mesaja ekle.
+            if (rule.includeContent && typeof deps.buildDocContentText === 'function') {
+                try {
+                    const content = await deps.buildDocContentText(config.firmaNo, config.donemNo, rule.docType, row.EVRAKNO);
+                    if (content) text += '\n\n' + content;
+                } catch (e) { console.error('[Watcher] belge içeriği eklenemedi:', e.message); }
+            }
+            // İlk temasta "numaramızı kaydedin" ricası (kaydet-opt-in açıksa).
+            if (deps.saveContactText && typeof deps.shouldAskSave === 'function' && deps.shouldAskSave(c.phone)) {
+                text += '\n\n' + deps.saveContactText;
+            }
             const media = loadMediaFromDescriptor(rule.media);
 
             const targets = (config.sendAllPhones && Array.isArray(c.phones) && c.phones.length) ? c.phones : [c.phone];
@@ -1013,6 +1103,7 @@ function getStatus() {
         rules: (config.rules || []).map(r => ({
             id: r.id, docType: r.docType, name: r.name, enabled: r.enabled, izahatCodes: r.izahatCodes,
             direction: r.direction, minAmount: r.minAmount, excludeFatura: r.excludeFatura,
+            includeContent: r.includeContent === true,
             template: r.template, media: r.media ? { name: r.media.name, kind: r.media.kind } : null,
         })),
         lastPollAt, lastError, lastResult,

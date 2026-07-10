@@ -28,7 +28,7 @@ const multer = require('multer');
 const {
     initializeWhatsApp, refreshWhatsApp, logoutWhatsApp,
     getStatus: waStatus, sendMessage: waSend, deleteMessage: waDelete, checkOnWhatsApp, getDailySent,
-    waitForReady: waWaitForReady, setIncomingHandler, setDisconnectHandler,
+    waitForReady: waWaitForReady, setIncomingHandler, setDisconnectHandler, setOpenHandler,
 } = require('./whatsapp');
 const { normalizePhone, isLikelyValid } = require('./phone');
 const watcher = require('./watcher');
@@ -1176,6 +1176,42 @@ app.post('/api/send-window', (req, res) => {
     res.json({ success: true, window: antiban.setSendWindow(req.body || {}) });
 });
 
+// İlk (otomatik) temasta eklenen "numaramızı kaydedin" ricası — soğuk gönderimi
+// (rehbere kayıtsız numaraya toplu mesaj) sıcağa çevirir → ban/şikayet riskini düşürür.
+const SAVE_CONTACT_LINE = 'Bildirimlerimizin size düzenli ulaşabilmesi için lütfen numaramızı telefon rehberinize kaydediniz.';
+
+// ─── Anti-ban ayarları: günlük cap + soft uyarı eşiği + dönüş-budama (guard) ──
+app.get('/api/antiban', (req, res) => {
+    try {
+        const st = waStatus();
+        const ab = st.ready ? antiban.snapshot(st.me, DEFAULT_PACING.dailyCap) : null;
+        res.json({ success: true, limits: antiban.getLimits(), guard: stats.guardConfig(), engage: stats.engageSummary(), antiban: ab });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+app.post('/api/antiban/limits', (req, res) => {
+    try { res.json({ success: true, limits: antiban.setLimits(req.body || {}) }); }
+    catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+app.post('/api/antiban/guard', (req, res) => {
+    try { res.json({ success: true, guard: stats.setGuard(req.body || {}) }); }
+    catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+// Kullanıcı "devam" onayı: o günkü uyarı katını onayla → sonraki kata kadar sormaz.
+app.post('/api/antiban/ack', (req, res) => {
+    try {
+        const st = waStatus();
+        if (!st.ready || !st.me) return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil.' });
+        res.json({ success: true, ...antiban.acknowledgeWarn(st.me) });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+// Susturulan numarayı elle yeniden aç (dönüş-budama). phone boşsa hepsini.
+app.post('/api/antiban/engage/reset', (req, res) => {
+    try {
+        const phone = req.body && req.body.phone;
+        res.json({ success: true, reset: stats.resetEngage(phone || null) });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  AKTİF CARİ → "BAKİYEYİ GÖNDER" (Arctos yüzen butonu)
 //  Arctos'ta o an açık cari plan cache'ten tespit edilir (activeCari.js).
@@ -1541,26 +1577,38 @@ async function fetchLastSalesInvoice(firmaNo, donemNo, ind) {
     return { tarih: last.tarih, evrak: last.evrak, tutar: Number(last.borc) || 0, kalemler };
 }
 
-// Son satış faturasını müşteriye gönderilecek düz metne çevir (manuel + AI ortak).
-function formatSalesInvoiceText(inv, c) {
+// Belge kalemlerini (fatura/irsaliye/stok İÇERİĞİ) düz metne çevir. Belge-tipi
+// watcher mesajına "içeriği de ekle" seçeneği açıkken eklenir. Kalem yoksa null.
+// Ara toplam KDV HARİÇ'tir (GERCEKTOPLAM=matrah); şablondaki {tutar} KDV dahil
+// olabildiğinden karışmasın diye açıkça "KDV hariç" etiketlenir.
+function formatDocContentText(kalemler) {
+    const ks = Array.isArray(kalemler) ? kalemler : [];
+    if (!ks.length) return null;
     const money = (n) => (Number(n) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const qty = (n) => { const x = Number(n) || 0; return Number.isInteger(x) ? String(x) : money(x); };
-    const t = inv.tarih ? new Date(inv.tarih).toLocaleDateString('tr-TR') : '';
-    const meta = [];
-    if (t) meta.push(t);
-    if (inv.evrak) meta.push('No: ' + inv.evrak);
-    const who = (c && (c.firma || c.name)) ? `Sayın ${c.firma || c.name}, ` : '';
-    const out = [`${who}son satış faturanız${meta.length ? ' (' + meta.join(', ') + ')' : ''}:`];
-    const ks = Array.isArray(inv.kalemler) ? inv.kalemler : [];
+    const out = ['Belge içeriği:'];
     const MAX = 25;
     for (const k of ks.slice(0, MAX)) {
         const q = Number(k.miktar) ? `${qty(k.miktar)}${k.birim ? ' ' + k.birim : ''} x ${money(k.fiyat)}` : '';
         out.push(`- ${k.ad || '(kalem)'}${q ? '  ' + q : ''} = ${money(k.tutar)} TL`);
     }
     if (ks.length > MAX) out.push(`... (+${ks.length - MAX} kalem daha)`);
-    const toplam = ks.length ? ks.reduce((s, k) => s + (Number(k.tutar) || 0), 0) : (Number(inv.tutar) || 0);
-    out.push(`Toplam: ${money(toplam)} TL`);
+    const ara = ks.reduce((s, k) => s + (Number(k.tutar) || 0), 0);
+    out.push(`Ara toplam (KDV hariç): ${money(ara)} TL`);
     return out.join('\n');
+}
+
+// docType (watcher) → izahat kodu (DOC_LINE_MAP kalem tablosu eşlemesi için).
+const DOCTYPE_IZAHAT = { satisFaturasi: 21, alisFaturasi: 20, satisIrsaliyesi: 22, alisIrsaliyesi: 23, stokCikis: 33, stokGiris: 32 };
+
+// Watcher "belge içeriğini de ekle" seçeneği: O AN kesilen belgenin (EVRAKNO)
+// kalemlerini düz metne çevirir. Desteklenmeyen tip / kalem yok → null.
+async function buildDocContentText(firmaNo, donemNo, docType, evrak) {
+    const izahat = DOCTYPE_IZAHAT[docType];
+    if (!izahat || evrak == null || evrak === '') return null;
+    let kalemler = null;
+    try { kalemler = await fetchBelgeKalemleri(firmaNo, donemNo, izahat, evrak); } catch { kalemler = null; }
+    return formatDocContentText(kalemler);
 }
 
 // Dönemde bakiyesi (net) sıfır OLMAYAN carileri listele (borçlu + alacaklı).
@@ -1693,38 +1741,6 @@ app.post('/api/extre/send', async (req, res) => {
 
 // Tek cariye SON SATIŞ FATURASI içeriğini METİN olarak gönder (manuel, AI'sız).
 // Aynı anti-ban kapısı + WA doğrulaması (ekstre gönderimiyle bire bir).
-app.post('/api/extre/son-fatura', async (req, res) => {
-    if (!requireDb(req, res)) return;
-    const firmaNo = req.body && req.body.firmaNo;
-    const donemNo = req.body && req.body.donemNo;
-    const indNum = parseInt(req.body && req.body.ind, 10);
-    if (!firmaNo || !donemNo || !Number.isFinite(indNum))
-        return res.status(400).json({ success: false, message: 'firma/dönem/cari gerekli.' });
-    if (!waStatus().ready) return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil. Önce QR okutun.' });
-    const me = waStatus().me;
-    const g = antiban.gate(me, DEFAULT_PACING.dailyCap, 'manual');
-    if (!g.ok) return res.status(429).json({ success: false, message: g.reason || 'Anti-ban: gönderim sınırına ulaşıldı.' });
-    try {
-        const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum);
-        if (!c) return res.status(404).json({ success: false, message: 'Cari bulunamadı.' });
-        if (c.pasif) return res.status(400).json({ success: false, message: 'Cari pasif (STATUS=2) — gönderilmez.' });
-        if (!c.phone || !c.valid) return res.status(400).json({ success: false, message: 'Carinin geçerli telefonu yok.' });
-
-        const inv = await fetchLastSalesInvoice(firmaNo, donemNo, indNum);
-        if (!inv) return res.status(404).json({ success: false, message: 'Bu cariye ait satış faturası bulunamadı.' });
-
-        const chk = await checkOnWhatsApp(c.phone);
-        if (!chk.exists) return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
-
-        const msg = (req.body && req.body.message && String(req.body.message).trim()) || formatSalesInvoiceText(inv, c);
-        const result = await waSend(c.phone, msg, null, { simulateTyping: true, typingMs: 1200, channel: 'extre' });
-        if (result.success) { antiban.recordSent(me, 'manual'); return res.json({ success: true, message: 'Son fatura gönderildi.', phone: c.phone, name: c.name }); }
-        res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
-
 // ── GEÇİCİ TEŞHİS: cari hareket IZAHAT kod dağılımı + son satırlar. "Havale girişi
 // mesaj gitmiyor" arızası için: havale satırının işlem kodunu tespit etmek. Tarayıcıda:
 //   http://localhost:3100/api/extre/_izahat?firmaNo=0101&donemNo=0014
@@ -2155,7 +2171,16 @@ license.configure({ baseDir });
 antiban.configure(baseDir);
 // Ban-şüpheli bağlantı kapanışını anti-ban'a bildir: 403/401 veya reconnect
 // fırtınasında gate() gönderimi soğutur (flaglenen numarayı dövmeyi keser).
-setDisconnectHandler((code) => { try { antiban.noteDisconnect(waStatus().me, code); } catch { /* yok say */ } });
+setDisconnectHandler((code, accountId, errMsg) => {
+    try { antiban.noteDisconnect(accountId || waStatus().me, code, errMsg); } catch { /* yok say */ }
+});
+// Kimlik doğrulanmış açılış = numara kısıtlı değil → yanlış alarm soğumasını kaldır.
+setOpenHandler((accountId) => {
+    try {
+        const r = antiban.noteOpen(accountId);
+        if (r && r.cleared) console.log(`[Antiban] Bağlantı kuruldu — soğuma kaldırıldı (${r.cleared})`);
+    } catch { /* yok say */ }
+});
 
 // Watcher'ı bağımlılıklarıyla yapılandır (config/state data/ altına yazılır).
 watcher.configure({
@@ -2169,6 +2194,12 @@ watcher.configure({
     baseDir,
     // {firmaadi} imzası: Firma Bilgileri (TBLFIRMA + kullanıcı override) adı.
     getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
+    // "Belge içeriğini de ekle" seçeneği için: kesilen belgenin kalemlerini metne çevir.
+    buildDocContentText,
+    // Anti-ban dönüş-budama: üst üste yanıt vermeyen numaraya gönderme + ilk temasta kaydet-ricası.
+    isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
+    shouldAskSave: (phone) => { try { return stats.shouldAskSave(phone); } catch { return false; } },
+    saveContactText: SAVE_CONTACT_LINE,
 });
 
 // Periyodik bakiye/borç hatırlatma zamanlayıcısı.
@@ -2183,6 +2214,9 @@ reminders.configure({
     checkOnWhatsApp,
     waStatus,
     baseDir,
+    isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
+    shouldAskSave: (phone) => { try { return stats.shouldAskSave(phone); } catch { return false; } },
+    saveContactText: SAVE_CONTACT_LINE,
 });
 
 // Arctos'ta o an açık cariyi plan cache'ten tespit eden izleyici (yüzen buton için).
