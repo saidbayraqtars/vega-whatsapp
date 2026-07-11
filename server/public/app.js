@@ -1,6 +1,12 @@
 // ─── Vega Toplu WhatsApp — Frontend ─────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
-const api = (path, opts) => fetch('/api' + path, opts).then(r => r.json());
+// Lisans/deneme geçersizse sunucu TÜM /api/* uçlarına 403 LICENSE_REQUIRED döner.
+// Nerede olursak olalım lisans kapısına düş (deneme uygulama açıkken de dolabilir).
+const api = (path, opts) => fetch('/api' + path, opts).then(async (r) => {
+    const j = await r.json();
+    if (r.status === 403 && j && j.error === 'LICENSE_REQUIRED') showLicenseGate(j.license);
+    return j;
+});
 
 // Electron masaüstü köprüsü (varsa). PIN'i DPAPI ile saklayıp PC açılışında
 // otomatik bağlanmayı sağlar; tarayıcıda çalışınca yok sayılır.
@@ -32,6 +38,13 @@ function localContext() { try { return JSON.parse(localStorage.getItem('vega.ctx
 //  Açılış akışı
 // ═══════════════════════════════════════════════════════════════════════════
 async function boot() {
+    // Lisans önce: geçersizse (deneme doldu / lisans yok) hiçbir /api ucu açılmaz,
+    // kurulum ekranını göstermenin de anlamı yok — doğrudan lisans kapısı.
+    const lr = await api('/license');
+    if (lr.version) { const v = $('sbVer'); if (v) v.textContent = 'v' + lr.version; }
+    if (!lr.license || !lr.license.valid) { showLicenseGate(lr.license); return; }
+    renderLicense(lr.license);
+
     const r = await api('/check-setup');
     if (r.version) { const v = $('sbVer'); if (v) v.textContent = 'v' + r.version; }
     if (!r.isSetup) { show('setupScreen'); return; }
@@ -53,7 +66,7 @@ async function boot() {
 }
 
 function show(screen) {
-    ['setupScreen', 'app'].forEach(s => $(s).classList.add('hidden'));
+    ['setupScreen', 'app', 'licenseScreen'].forEach(s => $(s).classList.add('hidden'));
     $(screen).classList.remove('hidden');
 }
 
@@ -1622,50 +1635,136 @@ $('rm_log').onclick = async (e) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Lisans (çevrimiçi lisans altyapısı — scaffold; şu an kısıtlamaz)
+//  Lisans (çevrimdışı — imzalı .lic dosyası + 15 gün deneme)
+//  Geçersizken sunucu tüm /api/* uçlarını kapatır; burası kapı ekranı + rozet.
 // ═══════════════════════════════════════════════════════════════════════════
-const LIC_LABELS = {
-    valid: 'Lisanslı', offline: 'Çevrimdışı', unlicensed: 'Lisanssız',
-    invalid: 'Geçersiz', expired: 'Süresi doldu', error: 'Hata',
+const LIC_REASONS = {
+    TRIAL_EXPIRED: 'Deneme Süresi Doldu',
+    LICENSE_EXPIRED: 'Lisans Süresi Doldu',
+    LICENSE_HARDWARE_MISMATCH: 'Lisans Bu Bilgisayara Ait Değil',
+    LICENSE_INVALID: 'Geçersiz Lisans',
+    LICENSE_WRONG_PRODUCT: 'Yanlış Ürün Lisansı',
+    LICENSE_CORRUPT: 'Bozuk Lisans Dosyası',
+    LICENSE_NOT_YET_VALID: 'Lisans Henüz Geçerli Değil',
+    CLOCK_TAMPERED: 'Sistem Saati Hatalı',
 };
+
+// Seçilen .lic dosyasını metne çevir.
+function readLicFile(input) {
+    const f = input.files && input.files[0];
+    if (!f) return Promise.resolve(null);
+    return f.text();
+}
+
+// Uygulamayı kilitle: tam ekran lisans kapısı.
+function showLicenseGate(L) {
+    show('licenseScreen');
+    if (!L) return;
+    $('lg_title').textContent = LIC_REASONS[L.reason] || 'Lisans Gerekli';
+    $('lg_msg').textContent = L.detail
+        || (L.reason === 'TRIAL_EXPIRED'
+            ? `${L.trialDays} günlük ücretsiz deneme sona erdi. Kullanmaya devam etmek için lisans dosyanızı yükleyin.`
+            : 'Devam etmek için lisans dosyanızı yükleyin.');
+    $('lg_hwid').value = L.hardwareId || '';
+}
+
+// Sidebar rozeti: deneme sayacı / lisans durumu.
+function renderLicense(L) {
+    if (!L) return;
+    const pill = $('licPill');
+    if (pill) pill.classList.remove('hidden');
+
+    let label, on;
+    if (!L.valid) { label = LIC_REASONS[L.reason] || 'Lisanssız'; on = false; }
+    else if (L.trial) { label = `Deneme — ${L.daysLeft} gün`; on = L.daysLeft > 3; }
+    else if (L.daysLeft === null) { label = 'Lisanslı (süresiz)'; on = true; }
+    else { label = `Lisanslı — ${L.daysLeft} gün`; on = L.daysLeft > 15; }
+
+    $('licLabel').textContent = label;
+    $('licDot').className = 'dot ' + (on ? 'on' : 'wait');
+
+    // Lisans modalı (rozete tıklayınca açılır).
+    $('lic_machine').value = L.hardwareId || '';
+    const bits = [];
+    if (L.valid && L.trial) bits.push(`Deneme sürümü — ${L.daysLeft} gün kaldı`);
+    else if (L.valid) bits.push(`Lisanslı: ${L.customerName || '—'}`);
+    else bits.push(LIC_REASONS[L.reason] || 'Lisanssız');
+    if (L.expiresAt) bits.push(`Bitiş: ${new Date(L.expiresAt * 1000).toLocaleDateString('tr-TR')}`);
+    else if (L.valid && !L.trial) bits.push('Süresiz');
+    if (L.detail) bits.push(L.detail);
+    $('lic_state').textContent = bits.join('  ·  ');
+}
 
 async function loadLicense() {
     try { const r = await api('/license'); if (r.success) renderLicense(r.license); }
     catch { /* yok say */ }
 }
 
-function renderLicense(L) {
-    if (!L) return;
-    $('licLabel').textContent = LIC_LABELS[L.status] || 'Lisans';
-    $('licDot').className = 'dot ' + (L.status === 'valid' ? 'on' : 'wait');
-    $('lic_machine').value = L.machineId || '';
-    $('lic_key').value = L.key || '';
-    const mode = L.enforced ? 'Zorunlu mod' : 'Altyapı hazır (kısıtlama yok)';
-    const bits = [`${mode}`, `Durum: ${LIC_LABELS[L.status] || L.status}`];
-    if (L.plan) bits.push(`Plan: ${L.plan}`);
-    if (L.validUntil) bits.push(`Bitiş: ${new Date(L.validUntil).toLocaleDateString('tr-TR')}`);
-    if (L.message) bits.push(L.message);
-    $('lic_state').textContent = bits.join('  ·  ');
+// Lisans dosyasını sunucuya gönder. Geçerliyse uygulamaya gir.
+// errEl / btnEl: kapı ekranı ile modal aynı mantığı paylaşır.
+async function activateLicense(content, errEl, btnEl) {
+    if (!content) { $(errEl).textContent = 'Önce bir .lic dosyası seçin.'; return false; }
+    $(errEl).textContent = '';
+    $(btnEl).disabled = true;
+    try {
+        const r = await fetch('/api/license/activate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content }),
+        }).then(x => x.json());
+
+        if (!r.success) { $(errEl).textContent = r.message || 'Etkinleştirilemedi.'; return false; }
+        renderLicense(r.license);
+        return true;
+    } catch (e) {
+        $(errEl).textContent = 'Hata: ' + e.message;
+        return false;
+    } finally {
+        $(btnEl).disabled = false;
+    }
 }
 
-$('licBtn').onclick = async () => { await loadLicense(); $('licModal').classList.remove('hidden'); };
-$('lic_close').onclick = () => $('licModal').classList.add('hidden');
-$('lic_activate').onclick = async () => {
-    $('lic_err').textContent = '';
-    const key = $('lic_key').value.trim();
-    if (!key) { $('lic_err').textContent = 'Anahtar girin.'; return; }
-    $('lic_activate').disabled = true;
+async function copyHwid(inputId, btnId) {
     try {
-        const r = await api('/license/activate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) });
-        renderLicense(r.license);
-        if (!r.success) $('lic_err').textContent = r.message || 'Etkinleştirilemedi.';
-    } catch (e) { $('lic_err').textContent = 'Hata: ' + e.message; }
-    $('lic_activate').disabled = false;
+        await navigator.clipboard.writeText($(inputId).value);
+        const b = $(btnId), old = b.textContent;
+        b.textContent = '✓ Kopyalandı';
+        setTimeout(() => { b.textContent = old; }, 1600);
+    } catch { /* pano yoksa kullanıcı elle seçer */ }
+}
+
+// ─── Kapı ekranı ───
+$('lg_copy').onclick = () => copyHwid('lg_hwid', 'lg_copy');
+$('lg_activate').onclick = async () => {
+    const content = await readLicFile($('lg_file'));
+    if (await activateLicense(content, 'lg_err', 'lg_activate')) {
+        await boot();   // lisans geldi → normal açılış akışı (kurulum ya da uygulama)
+    }
+};
+$('lg_recheck').onclick = async () => {
+    $('lg_err').textContent = '';
+    const r = await fetch('/api/license/recheck', { method: 'POST' }).then(x => x.json());
+    if (r.license && r.license.valid) await boot();
+    else showLicenseGate(r.license);
+};
+
+// ─── Modal (uygulama içi lisans bilgisi) ───
+$('licBtn').onclick = async () => { await loadLicense(); $('licModal').classList.remove('hidden'); };
+$('licPill').onclick = async () => { await loadLicense(); $('licModal').classList.remove('hidden'); };
+$('lic_close').onclick = () => $('licModal').classList.add('hidden');
+$('lic_copy').onclick = () => copyHwid('lic_machine', 'lic_copy');
+$('lic_activate').onclick = async () => {
+    const content = await readLicFile($('lic_file'));
+    if (await activateLicense(content, 'lic_err', 'lic_activate')) {
+        $('lic_err').textContent = '';
+        $('lic_hint').textContent = '✓ Lisans etkinleştirildi.';
+    }
 };
 $('lic_recheck').onclick = async () => {
     $('lic_err').textContent = '';
-    try { const r = await api('/license/recheck', { method: 'POST' }); renderLicense(r.license); }
-    catch (e) { $('lic_err').textContent = 'Hata: ' + e.message; }
+    const r = await fetch('/api/license/recheck', { method: 'POST' }).then(x => x.json());
+    if (r.license && !r.license.valid) showLicenseGate(r.license);
+    else renderLicense(r.license);
 };
 
 // ─── Gece / gündüz modu ───

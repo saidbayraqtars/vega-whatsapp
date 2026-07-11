@@ -257,6 +257,22 @@ h2 { font-size: 15px; margin: 0 0 14px; display: flex; align-items: center; gap:
     font-size: 12px; font-weight: 600; padding: 5px 11px; border-radius: 999px;
     background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
 }
+/* Sidebar lisans rozeti: tıklanınca lisans penceresi açılır. */
+#licPill { cursor: pointer; width: 100%; justify-content: center; margin-top: 6px; }
+#licPill:hover { border-color: var(--muted-2); color: var(--text); }
+
+/* Lisans iletişim kutusu (kapı ekranı + lisans penceresi) */
+.contact {
+    margin-top: 16px; padding: 14px; border-radius: 10px; text-align: center;
+    background: var(--surface-2); border: 1px solid var(--border);
+}
+.contact-t { font-size: 12.5px; color: var(--muted); font-weight: 600; }
+.contact-n {
+    display: inline-block; margin: 4px 0 2px; font-size: 22px; font-weight: 700;
+    color: var(--primary); text-decoration: none; letter-spacing: .5px;
+}
+.contact-n:hover { text-decoration: underline; }
+.contact-s { font-size: 12px; color: var(--muted); line-height: 1.5; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: #475569; flex: none; transition: background .2s; }
 .dot.on { background: #22c55e; box-shadow: 0 0 8px rgba(34, 197, 94, .55); }
 .dot.off { background: #f87171; box-shadow: 0 0 8px rgba(248, 113, 113, .45); }

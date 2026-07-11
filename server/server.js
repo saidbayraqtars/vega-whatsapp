@@ -56,6 +56,27 @@ const APP_VERSION = (() => {
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
+// ─── Lisans kapısı ───────────────────────────────────────────────────────────
+// Lisans (ya da 15 günlük deneme) geçerli değilse TÜM /api/* uçları 403 döner.
+// Statik dosyalar açık kalır → tarayıcı lisans ekranını yükleyebilir; o ekranın
+// ihtiyaç duyduğu uçlar aşağıdaki muafiyet listesindedir.
+// NOT: routes'lardan ÖNCE kayıtlı olmalı (Express sırayla çalıştırır).
+const LICENSE_OPEN_PATHS = new Set([
+    '/api/license',
+    '/api/license/activate',
+    '/api/license/recheck',
+]);
+app.use((req, res, next) => {
+    if (!req.path.startsWith('/api/')) return next();
+    if (LICENSE_OPEN_PATHS.has(req.path)) return next();
+    if (license.isAllowed()) return next();
+    return res.status(403).json({
+        success: false,
+        error: 'LICENSE_REQUIRED',
+        license: license.getStatus(),
+    });
+});
+
 const isPkg = typeof process.pkg !== 'undefined';
 // Electron sarmalayıcı VEGA_BASE_DIR ile config/data konumunu verir (userData).
 // pkg exe'de exe dizini; geliştirmede server klasörü.
@@ -1851,25 +1872,40 @@ app.get('/api/extre/_havale', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  LİSANS (çevrimiçi lisans altyapısı — scaffold, şu an kısıtlamaz)
+//  LİSANS (çevrimdışı — imzalı lisans dosyası + 15 gün deneme)
+//  Bu uçlar lisans kapısının DIŞINDADIR (LICENSE_OPEN_PATHS): lisanssız kullanıcı
+//  donanım kimliğini görebilsin ve lisans yükleyebilsin diye.
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/license', (req, res) => {
-    res.json({ success: true, license: license.getStatus() });
+    res.json({ success: true, license: license.getStatus(), version: APP_VERSION });
 });
 
+// Lisans dosyası (.lic) içeriğini doğrula + kaydet. Geçerliyse otomasyonu başlat.
 app.post('/api/license/activate', async (req, res) => {
     try {
-        const st = await license.activate(req.body && req.body.key);
-        res.json({ success: st.status !== 'invalid' && st.status !== 'error', license: st, message: st.message });
+        const r = license.activate(req.body && req.body.content);
+        if (!r.ok) {
+            return res.status(400).json({
+                success: false, message: r.error, reason: r.reason,
+                license: license.getStatus(),
+            });
+        }
+        // Lisans geldi → kilitliyken atlanan otomatik bağlantıyı şimdi kur.
+        try { await autoConnectFromConfig(); } catch (e) { console.error('lisans sonrası oto-bağlantı:', e.message); }
+        res.json({ success: true, license: r.license });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
+// Yeniden denetle (ör. saat düzeltildi, süre doldu).
 app.post('/api/license/recheck', async (req, res) => {
     try {
-        const st = await license.recheck();
-        res.json({ success: true, license: st, message: st.message });
+        license.invalidateCache();
+        const st = license.getStatus();
+        if (st.valid) { try { await autoConnectFromConfig(); } catch { /* yok say */ } }
+        else stopAutomation('lisans geçersiz');
+        res.json({ success: true, license: st });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -2196,8 +2232,26 @@ app.get('*', (req, res) => {
     res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
-// Lisans altyapısını başlat (data/license.json + machine-id; scaffold = kısıtlamaz).
+// Çevrimdışı lisans: data/ altındaki şifreli lisans deposu + deneme sayacı.
 license.configure({ baseDir });
+
+// Lisans geçersizken çalışan her şeyi durdur. API kapısı manuel gönderimi zaten
+// keser; bu, ARKA PLAN otomasyonunu (watcher/hatırlatma/aktif cari) susturur —
+// aksi halde deneme dolduktan sonra da mesaj atmayı sürdürürdü.
+function stopAutomation(sebep) {
+    try { watcher.stop(); } catch { /* yok say */ }
+    try { reminders.stop(); } catch { /* yok say */ }
+    try { activeCari.stop(); } catch { /* yok say */ }
+    console.warn(`[Lisans] Otomasyon durduruldu — ${sebep}`);
+}
+
+// Deneme süresi uygulama AÇIKKEN dolabilir (günlerce açık kalıyor). Saatte bir
+// denetle; dolduğu an otomasyonu kes. Kapı zaten her istekte denetler (1 dk cache).
+setInterval(() => {
+    license.invalidateCache();
+    const st = license.getStatus();
+    if (!st.valid) stopAutomation(st.reason || 'geçersiz');
+}, 60 * 60 * 1000).unref?.();
 
 // Anti-ban katmanı: warm-up rampı + saatlik/günlük tavan (hesap-başı sayaç).
 antiban.configure(baseDir);
@@ -2296,12 +2350,28 @@ setIncomingHandler(aiBot.handleIncoming);
 app.listen(PORT, async () => {
     const url = `http://localhost:${PORT}`;
     console.log(`\n  Vega Toplu WhatsApp çalışıyor → ${url}\n`);
-    // Giriş PIN'i kaldırıldı: kayıtlı config varsa açılışta otomatik bağlan
-    // (watcher + reminders kendiliğinden başlar).
-    try {
-        const ok = await autoConnectFromConfig();
-        if (ok) console.log('  Otomatik bağlanıldı (kayıtlı ayarlar).');
-    } catch (e) { console.error('boot oto-bağlantı:', e.message); }
+
+    // Lisans/deneme durumu — geçersizse DB'ye bile bağlanma, otomasyonu başlatma.
+    // UI lisans ekranını gösterir (statik dosyalar ve /api/license açık).
+    const lic = license.getStatus();
+    if (!lic.valid) {
+        console.warn(`  ⚠ LİSANS GEÇERSİZ (${lic.reason}) — uygulama kilitli.`);
+        console.warn(`    ${lic.detail || ''}`);
+        console.warn(`    Donanım Kimliği: ${lic.hardwareId}`);
+        console.warn('    Lisans dosyasını arayüzden yükleyin.\n');
+    } else {
+        if (lic.trial) console.log(`  Deneme sürümü — ${lic.daysLeft} gün kaldı.\n`);
+        else console.log(`  Lisanslı: ${lic.customerName}${lic.daysLeft !== null ? ` (${lic.daysLeft} gün)` : ' (süresiz)'}\n`);
+
+        // Giriş PIN'i kaldırıldı: kayıtlı config varsa açılışta otomatik bağlan
+        // (watcher + reminders kendiliğinden başlar).
+        try {
+            const ok = await autoConnectFromConfig();
+            if (ok) console.log('  Otomatik bağlanıldı (kayıtlı ayarlar).');
+        } catch (e) { console.error('boot oto-bağlantı:', e.message); }
+    }
+
+    // Lisanssız da olsa arayüzü aç — kullanıcı lisans ekranını görsün.
     if (isPkg) {
         const startCmd = process.platform === 'win32' ? 'start ""' : (process.platform === 'darwin' ? 'open' : 'xdg-open');
         try { require('child_process').exec(`${startCmd} ${url}`); } catch { /* yok say */ }

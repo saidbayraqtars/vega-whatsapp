@@ -701,23 +701,73 @@
 
 <!-- ─── LİSANS MODAL ─── -->
 <div id="licModal" class="overlay hidden">
-    <div class="modal" style="max-width:440px">
+    <div class="modal" style="max-width:460px">
         <h2>Lisans</h2>
         <p class="sub" id="lic_state">Durum yükleniyor...</p>
         <div class="field">
-            <label>Cihaz Kimliği</label>
-            <input id="lic_machine" readonly style="font-family:monospace; font-size:12px" />
+            <label>Donanım Kimliği (bu bilgisayar)</label>
+            <div style="display:flex; gap:8px">
+                <input id="lic_machine" readonly style="font-family:monospace; font-size:13px; letter-spacing:1px" />
+                <button class="btn ghost sm" id="lic_copy" style="white-space:nowrap">Kopyala</button>
+            </div>
+            <div class="hint">Lisans almak için bu kimliği tedarikçinize iletin. Lisans yalnızca bu bilgisayarda çalışır.</div>
         </div>
         <div class="field">
-            <label>Lisans Anahtarı</label>
-            <input id="lic_key" placeholder="VEGA-XXXX-XXXX-XXXX-XXXX" />
-            <div class="hint" id="lic_hint">Anahtarı girip etkinleştirin.</div>
+            <label>Lisans Dosyası (.lic)</label>
+            <input type="file" id="lic_file" accept=".lic,.json,application/json,text/plain" />
+            <div class="hint" id="lic_hint">Tedarikçinizden gelen .lic dosyasını seçip Etkinleştir'e basın.</div>
+        </div>
+        <div class="contact">
+            <div class="contact-t">Lisans için iletişime geçin</div>
+            <a class="contact-n" href="https://wa.me/905461914055" target="_blank" rel="noopener">0546 191 40 55</a>
+            <div class="contact-s">Donanım Kimliği'ni bu numaraya iletin.</div>
         </div>
         <div class="err" id="lic_err"></div>
         <div class="actions">
             <button class="btn ghost" id="lic_recheck">Yeniden Denetle</button>
             <button class="btn green" id="lic_activate">Etkinleştir</button>
             <button class="btn" id="lic_close">Kapat</button>
+        </div>
+    </div>
+</div>
+
+<!-- ─── LİSANS KAPISI (deneme doldu / lisans geçersiz → uygulama kilitli) ─── -->
+<div id="licenseScreen" class="center hidden">
+    <div class="brand big">
+        <div class="logo">EB</div>
+        <div>
+            <div class="name">Expert <span>Bilişim</span></div>
+            <div class="team">WhatsApp Tahsilat</div>
+        </div>
+    </div>
+    <div class="card narrow" style="max-width:520px">
+        <h1 id="lg_title">Lisans Gerekli</h1>
+        <p class="sub" id="lg_msg">Devam etmek için lisans dosyanızı yükleyin.</p>
+
+        <div class="field">
+            <label>Donanım Kimliği (bu bilgisayar)</label>
+            <div style="display:flex; gap:8px">
+                <input id="lg_hwid" readonly style="font-family:monospace; font-size:14px; letter-spacing:1px" />
+                <button class="btn ghost sm" id="lg_copy" style="white-space:nowrap">Kopyala</button>
+            </div>
+            <div class="hint">Bu kimliği tedarikçinize gönderin; size özel bir lisans dosyası üretilecek. Lisans başka bilgisayarda çalışmaz.</div>
+        </div>
+
+        <div class="contact">
+            <div class="contact-t">Lisans için iletişime geçin</div>
+            <a class="contact-n" href="https://wa.me/905461914055" target="_blank" rel="noopener">0546 191 40 55</a>
+            <div class="contact-s">Yukarıdaki <b>Donanım Kimliği</b>'ni bu numaraya iletin; size özel lisans dosyanız gönderilecek.</div>
+        </div>
+
+        <div class="field">
+            <label>Lisans Dosyası (.lic)</label>
+            <input type="file" id="lg_file" accept=".lic,.json,application/json,text/plain" />
+        </div>
+
+        <div class="err" id="lg_err"></div>
+        <div class="row">
+            <button class="btn ghost" id="lg_recheck" style="flex:.6">Yeniden Denetle</button>
+            <button class="btn green" id="lg_activate" style="flex:1">Etkinleştir</button>
         </div>
     </div>
 </div>

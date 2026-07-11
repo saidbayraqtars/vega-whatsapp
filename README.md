@@ -62,10 +62,32 @@ API anahtarı yerel makinede şifreli saklanır. Giriş şifresiyle kilitlidir.
 ### Firma Bilgileri
 Firma adı, logo ve yasal şart metni — Hesap Extresi PDF'inin başlık/logo/altbilgisinde kullanılır.
 
+## Lisanslama (çevrimdışı)
+
+Kurulumdan sonra **15 gün ücretsiz deneme**. Sonrasında lisans gerekir. İnternet gerekmez.
+
+| Konu | Davranış |
+|---|---|
+| Deneme | İlk açılışta başlar, **15 gün**. Başlangıç hem gizli dosyada (`data/ti`) hem `HKCU\Software\ExpertBilisim\VegaWA`'da tutulur; **en eskisi** geçerlidir → AppData'yı silmek, yeniden kurmak veya güncellemek denemeyi **sıfırlamaz** |
+| Lisans | RSA-2048 imzalı `.lic` dosyası. İmza gömülü public key ile doğrulanır → sahte lisans üretilemez |
+| Donanım bağlama | Lisans `hardwareId` içerir (anakart seri + sistem UUID → SHA-256). Başka bilgisayara kopyalanan lisans **çalışmaz** |
+| Saklama | `data/.vglic` — AES-256-GCM, anahtar donanımdan türetilir, dosya gizli (+h) |
+| Saat geri-alma | "Son görülen zaman" sentinel'i (dosya + registry, `max()`). Saati geri almak `CLOCK_TAMPERED` ile reddedilir |
+| Geçersizken | **Tüm `/api/*` uçları 403**, arka plan otomasyonu (watcher/hatırlatma/aktif cari) durur. UI lisans ekranını gösterir |
+
+Doğrulama kodu: [server/license.js](server/license.js) — `TRIAL_DAYS`, `PRODUCT`, `PUBLIC_KEY` sabitleri.
+
+**Lisans üretimi (satıcı):** ayrı, taşınabilir araç → `../vega-lisans-yonetici/`
+Müşteri lisans ekranındaki **Donanım Kimliği**'ni gönderir → araçta kimlik + süre girilir → `.lic` dosyası üretilir → müşteri "Lisans Dosyası Seç" ile yükler.
+
+> `vega-lisans-yonetici/lisans/private.key` bu depoda **değildir** ve olmamalıdır. Sızarsa herkes kendine sınırsız lisans üretir.
+
 ## Erişim kilidi
 
 **AI Oto-Yanıt** ve **Hesap Extresi** sekmeleri tek bir giriş şifresiyle korunur (client-side);
 **Firma Bilgileri** açıktır. Diğer sekmelerin normal kullanımını etkilemez.
+
+Bu kilit lisanstan **bağımsızdır**: lisans uygulamanın tamamını, erişim kilidi yalnızca bu iki sekmeyi kapsar.
 
 ## Bot koruması (anti-ban)
 
