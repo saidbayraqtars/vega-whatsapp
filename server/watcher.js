@@ -998,7 +998,9 @@ async function pollOnce() {
             // Seçenek açıksa O AN kesilen belgenin (EVRAKNO) kalemlerini mesaja ekle.
             if (rule.includeContent && typeof deps.buildDocContentText === 'function') {
                 try {
-                    const content = await deps.buildDocContentText(config.firmaNo, config.donemNo, rule.docType, row.EVRAKNO);
+                    // amount = BORC/ALACAK = belgenin KDV DAHİL genel toplamı → içerik
+                    // bloğundaki "Toplam" bununla yazılsın (kalem toplamı iskontoda sapar).
+                    const content = await deps.buildDocContentText(config.firmaNo, config.donemNo, rule.docType, row.EVRAKNO, amount);
                     if (content) text += '\n\n' + content;
                 } catch (e) { console.error('[Watcher] belge içeriği eklenemedi:', e.message); }
             }

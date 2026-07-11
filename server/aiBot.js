@@ -264,6 +264,10 @@ const fmtQty = (n) => { const x = Number(n) || 0; return Number.isInteger(x) ? S
 
 // [FATURA] cevabında müşteriye gönderilecek son satış faturası metni.
 // inv = { tarih, evrak, tutar, kalemler:[{ad,miktar,birim,fiyat,tutar}] }
+// Kalem fiyat/tutarları KDV DAHİL gelir (fetchBelgeKalemleri çeviriyor). Genel toplam
+// inv.tutar'dan yazılır = cari hareketteki BORC = faturanın KDV dahil genel toplamı;
+// kalem toplamı iskonto/masraflı faturalarda bundan sapar, müşteriye giden rakam ise
+// borcuna yazılanla birebir aynı olmalı.
 function buildInvoiceText(inv) {
     const t = inv.tarih ? new Date(inv.tarih).toLocaleDateString('tr-TR') : '';
     const meta = [];
@@ -277,8 +281,10 @@ function buildInvoiceText(inv) {
         out.push(`- ${k.ad || '(kalem)'}${qty ? '  ' + qty : ''} = ${fmtTR(k.tutar)} TL`);
     }
     if (ks.length > MAX) out.push(`... (+${ks.length - MAX} kalem daha)`);
-    const toplam = ks.length ? ks.reduce((s, k) => s + (Number(k.tutar) || 0), 0) : (Number(inv.tutar) || 0);
-    out.push(`Toplam: ${fmtTR(toplam)} TL`);
+    const toplam = Number(inv.tutar) > 0
+        ? Number(inv.tutar)
+        : ks.reduce((s, k) => s + (Number(k.tutar) || 0), 0);
+    out.push(`Toplam (KDV dahil): ${fmtTR(toplam)} TL`);
     return out.join('\n');
 }
 

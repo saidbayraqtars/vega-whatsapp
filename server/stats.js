@@ -55,7 +55,10 @@ const ENGAGE_TTL_MS = 45 * 24 * 60 * 60 * 1000;
 // geldi → tek yönlü/karşılıksız gönderim spam profili çizdi, numara WhatsApp hesap
 // incelemesine düştü. Bu koruma tam bunun içindi; kapalı varsayılan onu işlevsiz
 // bırakıyordu. Kullanıcı Pano'dan kapatabilir.
-const DEFAULT_GUARD = { enabled: true, noReplyLimit: 6, askSaveContact: false };
+// askSaveContact da VARSAYILAN AÇIK: ilk otomatik temasta "numaramızı kaydedin" ricası
+// eklenir. Rehbere kayıtlı olmayan numaradan gelen toplu mesaj spam sinyalidir; kayıt
+// olması hem teslimi hem güveni artırır (aynı vakada ban'e giden etkenlerden biri).
+const DEFAULT_GUARD = { enabled: true, noReplyLimit: 6, askSaveContact: true };
 
 const dayKey = (d = new Date()) => d.toISOString().slice(0, 10);
 const normPhone = (p) => String(p || '').split('@')[0].split(':')[0].replace(/\D/g, '');
@@ -279,7 +282,7 @@ function guardConfig() {
         // kapatınca state'e false yazılır ve bu dal onu korur.
         enabled: g.enabled === undefined ? DEFAULT_GUARD.enabled : g.enabled === true,
         noReplyLimit: Math.max(1, Number(g.noReplyLimit) || DEFAULT_GUARD.noReplyLimit),
-        askSaveContact: g.askSaveContact === true,
+        askSaveContact: g.askSaveContact === undefined ? DEFAULT_GUARD.askSaveContact : g.askSaveContact === true,
     };
 }
 function setGuard(patch = {}) {

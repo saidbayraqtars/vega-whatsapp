@@ -1497,6 +1497,16 @@ async function tableExistsCached(name) {
 }
 
 // Bir belgenin KALEMLERİ (belge içeriği): ürün/miktar/birim/fiyat/tutar. Yoksa null.
+//
+// TUTARLAR KDV DAHİL döner. VegaDB'de satır alanları KDV HARİÇ tutulur (FIYATI = birim
+// matrah, GERCEKTOPLAM = satır matrahı, KDV = oran %); cari hareketteki BORC ise KDV
+// DAHİL genel toplamdır (F0103 ile doğrulandı: ARATOPLAM × (1+KDV/100) = TUTAR = BORC).
+// Müşteriye giden mesajda kalemler KDV hariç, bakiye/tutar KDV dahil olunca rakamlar
+// tutmuyordu → kalemleri de KDV dahile çeviriyoruz.
+//
+// GERCEKTOPLAM bazı satırlarda 0 yazılıyor (F0103D0012'de 907/26547) ama MIKTAR ve
+// FIYATI dolu → o satırlar mesajda "0,00 TL" görünüyordu. Boşsa MIKTAR × FIYATI'ndan
+// hesapla.
 async function fetchBelgeKalemleri(firmaNo, donemNo, izahat, evrakno) {
     const suffixes = DOC_LINE_MAP[Number(izahat)];
     const ev = evrakno == null ? '' : String(evrakno).trim();
@@ -1512,11 +1522,26 @@ async function fetchBelgeKalemleri(firmaNo, donemNo, izahat, evrakno) {
             SELECT MALINCINSI, STOKKODU, MIKTAR, BIRIM, FIYATI, GERCEKTOPLAM, KDV
             FROM [${hTbl}] WHERE EVRAKNO=${Number(b.IND)} ORDER BY SATIRNO
         `)).recordset;
-        if (lines.length) return lines.map(l => ({
-            ad: (l.MALINCINSI != null && String(l.MALINCINSI).trim()) || (l.STOKKODU != null && String(l.STOKKODU).trim()) || '',
-            miktar: Number(l.MIKTAR) || 0, birim: (l.BIRIM == null ? '' : String(l.BIRIM)).trim(),
-            fiyat: Number(l.FIYATI) || 0, tutar: Number(l.GERCEKTOPLAM) || 0, kdv: Number(l.KDV) || 0,
-        }));
+        const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+        if (lines.length) return lines.map(l => {
+            const miktar = Number(l.MIKTAR) || 0;
+            const fiyatHaric = Number(l.FIYATI) || 0;
+            const oran = Number(l.KDV) || 0;              // KDV oranı (%), 0 olabilir
+            const k = 1 + oran / 100;
+            const satirHaric = Number(l.GERCEKTOPLAM) || 0;
+            // Birim fiyatı önce yuvarla, satır tutarını ONDAN türet — yoksa mesajda
+            // "10 ADET x 11.250,00 = 112.500,02" gibi çarpımı tutmayan satır çıkar
+            // (FIYATI zaten yuvarlanmış matrahtır: 9.533,90 ≈ 11.250 / 1,18).
+            // GERCEKTOPLAM doluysa o esastır (iskonto/kampanya satırda uygulanmış olur).
+            const fiyat = round2(fiyatHaric * k);
+            const tutar = satirHaric > 0 ? round2(satirHaric * k) : round2(miktar * fiyat);
+            return {
+                ad: (l.MALINCINSI != null && String(l.MALINCINSI).trim()) || (l.STOKKODU != null && String(l.STOKKODU).trim()) || '',
+                miktar, birim: (l.BIRIM == null ? '' : String(l.BIRIM)).trim(),
+                fiyat, tutar, kdv: oran,
+                fiyatHaric, tutarHaric: satirHaric || round2(miktar * fiyatHaric),
+            };
+        });
     }
     return null;
 }
@@ -1579,9 +1604,13 @@ async function fetchLastSalesInvoice(firmaNo, donemNo, ind) {
 
 // Belge kalemlerini (fatura/irsaliye/stok İÇERİĞİ) düz metne çevir. Belge-tipi
 // watcher mesajına "içeriği de ekle" seçeneği açıkken eklenir. Kalem yoksa null.
-// Ara toplam KDV HARİÇ'tir (GERCEKTOPLAM=matrah); şablondaki {tutar} KDV dahil
-// olabildiğinden karışmasın diye açıkça "KDV hariç" etiketlenir.
-function formatDocContentText(kalemler) {
+// Kalemler KDV DAHİL'dir (fetchBelgeKalemleri çeviriyor).
+//
+// belgeTutari verilirse (cari hareketteki BORC/ALACAK = belgenin KDV dahil genel
+// toplamı) genel toplam ONDAN yazılır — kalem toplamından DEĞİL. İskonto/masraf içeren
+// faturalarda kalem toplamı başlıktan sapıyor (F0103D0012: 10.735 faturanın 48'i);
+// müşteriye giden toplam, borcuna yazılan tutarla birebir aynı olmalı.
+function formatDocContentText(kalemler, belgeTutari) {
     const ks = Array.isArray(kalemler) ? kalemler : [];
     if (!ks.length) return null;
     const money = (n) => (Number(n) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -1593,8 +1622,10 @@ function formatDocContentText(kalemler) {
         out.push(`- ${k.ad || '(kalem)'}${q ? '  ' + q : ''} = ${money(k.tutar)} TL`);
     }
     if (ks.length > MAX) out.push(`... (+${ks.length - MAX} kalem daha)`);
-    const ara = ks.reduce((s, k) => s + (Number(k.tutar) || 0), 0);
-    out.push(`Ara toplam (KDV hariç): ${money(ara)} TL`);
+    const toplam = Number(belgeTutari) > 0
+        ? Number(belgeTutari)
+        : ks.reduce((s, k) => s + (Number(k.tutar) || 0), 0);
+    out.push(`Toplam (KDV dahil): ${money(toplam)} TL`);
     return out.join('\n');
 }
 
@@ -1603,12 +1634,13 @@ const DOCTYPE_IZAHAT = { satisFaturasi: 21, alisFaturasi: 20, satisIrsaliyesi: 2
 
 // Watcher "belge içeriğini de ekle" seçeneği: O AN kesilen belgenin (EVRAKNO)
 // kalemlerini düz metne çevirir. Desteklenmeyen tip / kalem yok → null.
-async function buildDocContentText(firmaNo, donemNo, docType, evrak) {
+// belgeTutari: watcher'ın o satır için hesapladığı tutar (BORC/ALACAK = KDV dahil).
+async function buildDocContentText(firmaNo, donemNo, docType, evrak, belgeTutari) {
     const izahat = DOCTYPE_IZAHAT[docType];
     if (!izahat || evrak == null || evrak === '') return null;
     let kalemler = null;
     try { kalemler = await fetchBelgeKalemleri(firmaNo, donemNo, izahat, evrak); } catch { kalemler = null; }
-    return formatDocContentText(kalemler);
+    return formatDocContentText(kalemler, belgeTutari);
 }
 
 // Dönemde bakiyesi (net) sıfır OLMAYAN carileri listele (borçlu + alacaklı).
