@@ -51,7 +51,11 @@ const KEEP_DAYS = 60;
 const AUTO_CHANNELS = new Set(['belge', 'reminder']);
 const MAX_ENGAGE = 6000;
 const ENGAGE_TTL_MS = 45 * 24 * 60 * 60 * 1000;
-const DEFAULT_GUARD = { enabled: false, noReplyLimit: 6, askSaveContact: false };
+// VARSAYILAN AÇIK (11 Tem 2026): kapalıyken canlı bir kurulumda 31 mesaj gidip 0 yanıt
+// geldi → tek yönlü/karşılıksız gönderim spam profili çizdi, numara WhatsApp hesap
+// incelemesine düştü. Bu koruma tam bunun içindi; kapalı varsayılan onu işlevsiz
+// bırakıyordu. Kullanıcı Pano'dan kapatabilir.
+const DEFAULT_GUARD = { enabled: true, noReplyLimit: 6, askSaveContact: false };
 
 const dayKey = (d = new Date()) => d.toISOString().slice(0, 10);
 const normPhone = (p) => String(p || '').split('@')[0].split(':')[0].replace(/\D/g, '');
@@ -270,7 +274,10 @@ function pruneEngage() {
 function guardConfig() {
     const g = state.guard || {};
     return {
-        enabled: g.enabled === true,
+        // enabled hiç yazılmamışsa VARSAYILANA düş (açık). `g.enabled === true` demek,
+        // varsayılanı true yapsak bile yeni kurulumda kapalı bırakırdı. Kullanıcı Pano'dan
+        // kapatınca state'e false yazılır ve bu dal onu korur.
+        enabled: g.enabled === undefined ? DEFAULT_GUARD.enabled : g.enabled === true,
         noReplyLimit: Math.max(1, Number(g.noReplyLimit) || DEFAULT_GUARD.noReplyLimit),
         askSaveContact: g.askSaveContact === true,
     };

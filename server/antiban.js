@@ -264,19 +264,25 @@ function noteDisconnect(accountId, statusCode, errMsg) {
     const { acc } = touch(resolveAccount(accountId));
     const now = Date.now();
     const code = Number(statusCode);
-    let ms = 0, reason = null, resetWarmup = false;
+    let ms = 0, reason = null, resetWarmup = false, sticky = false;
 
     if (isConflict(code, errMsg)) {
         // İyi huylu: oturum başka yerde açıldı. Soğuma yok, warm-up sıfırlaması yok.
         save();
         return null;
     }
-    if (code === 403) { ms = COOLDOWN_FORBIDDEN_MS; reason = 'hesap kısıtlı (403)'; resetWarmup = true; }
-    else if (code === 401) { ms = COOLDOWN_LOGGEDOUT_MS; reason = 'oturum düşürüldü (401)'; resetWarmup = true; }
+    // 403 = KESİN ban sinyali; SOĞUMA KALICIDIR, sonradan 'open' olsa bile kalkmaz.
+    // (Canlı vaka 9–11 Tem 2026: 15:03:04 mesaj gitti → 15:03:15 403 fırtınası → numara
+    // 'open' olmaya ve mesaj iletmeye devam etti → 11 Tem'de "Hesap gözden geçiriliyor".
+    // Yani flaglenen numara bağlanabiliyor: 'open' sağlamlık kanıtı DEĞİL. Bunu bir kez
+    // yanlış varsayıp soğumayı open'da kaldırmıştık; koruma o sırada devre dışı kalıyordu.)
+    if (code === 403) { ms = COOLDOWN_FORBIDDEN_MS; reason = 'hesap kısıtlı (403)'; resetWarmup = true; sticky = true; }
+    else if (code === 401) { ms = COOLDOWN_LOGGEDOUT_MS; reason = 'oturum düşürüldü (401)'; resetWarmup = true; sticky = true; }
     else if (acc.cooldownUntil && acc.cooldownUntil > now) {
         return null; // zaten soğumada — fırtına sayımıyla disk churn yapma
     } else {
-        // Fırtına: son STORM_WINDOW_MS içindeki kopmaları say.
+        // Fırtına: son STORM_WINDOW_MS içindeki kopmaları say. Ağ kaynaklı olabilir →
+        // ban sinyali değil, sticky değil: başarılı açılış bunu kaldırabilir.
         acc.closes = (acc.closes || []).filter(t => now - t < STORM_WINDOW_MS);
         acc.closes.push(now);
         if (acc.closes.length >= STORM_MAX_CLOSES) {
@@ -286,33 +292,33 @@ function noteDisconnect(accountId, statusCode, errMsg) {
 
     acc.cooldownUntil = Math.max(acc.cooldownUntil || 0, now + ms);
     acc.cooldownReason = reason;
-    // Warm-up'ı sıfırla ama eskisini sakla: kapanış yanlış alarmsa (aşağıda noteOpen)
-    // geri alınır. Aksi halde her geçici 403'te numara gün-0 tavanına (20/gün) düşer.
-    if (resetWarmup) {
-        if (!acc.prevFirstActiveDate) acc.prevFirstActiveDate = acc.firstActiveDate;
-        acc.firstActiveDate = dayKey();
-    }
+    acc.cooldownSticky = sticky;      // true → noteOpen kaldıramaz
+    // Ban sinyalinde warm-up sıfırla: kick yiyen numara sıfırdan yavaş ısınmalı.
+    if (resetWarmup) acc.firstActiveDate = dayKey();
     save();
     return { cooldownMs: ms, reason };
 }
 
-// Oturum BAŞARIYLA açıldı (kimlik doğrulandı). Gerçekten kısıtlı/çıkış yaptırılmış bir
-// numara buraya gelemez — WhatsApp connect'i 403/401 ile keser, 'open' hiç olmaz.
-// Dolayısıyla açılış, önceki kapanışın yanlış alarm olduğunun kanıtıdır: soğumayı
-// kaldır ve warm-up gününü geri ver. (Canlı vaka: connect sırasında 64 adet geçici
-// 403 → 24 saat kilit + warm-up sıfırlanması; oysa numara sağlamdı, mesaj iletiliyordu.)
+// Oturum BAŞARIYLA açıldı. DİKKAT: bu, numaranın sağlam olduğunun kanıtı DEĞİLDİR —
+// WhatsApp flaglediği numarayı bağlamaya ve mesaj iletmeye devam ederken arka planda
+// hesabı incelemeye alabiliyor (canlı vaka için yukarıdaki nota bak). O yüzden burada
+// YALNIZ ağ fırtınası soğuması kalkar; 403/401 soğuması (sticky) süresini doldurur.
 function noteOpen(accountId) {
     if (!STATE_PATH) return null;
     const key = rememberAccount(accountId);
     if (key === 'unknown') return null;
     const { acc } = touch(key);
-    const cleared = acc.cooldownUntil && acc.cooldownUntil > Date.now() ? acc.cooldownReason : null;
-    delete acc.cooldownUntil;
-    delete acc.cooldownReason;
     acc.closes = [];
-    if (acc.prevFirstActiveDate) { acc.firstActiveDate = acc.prevFirstActiveDate; delete acc.prevFirstActiveDate; }
+    if (acc.cooldownUntil && acc.cooldownUntil > Date.now() && !acc.cooldownSticky) {
+        const cleared = acc.cooldownReason;
+        delete acc.cooldownUntil;
+        delete acc.cooldownReason;
+        delete acc.cooldownSticky;
+        save();
+        return { cleared };
+    }
     save();
-    return cleared ? { cleared } : null;
+    return null;
 }
 
 // ─── Gönderim saati + günü penceresi (gece/haftasonu gönderme koruması) ───────
