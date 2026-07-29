@@ -54,7 +54,7 @@ const APP_VERSION = (() => {
 })();
 
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '16mb' })); // relay-send ekstre PDF'i base64 taşır → yüksek
 
 // ─── Lisans kapısı ───────────────────────────────────────────────────────────
 // Lisans (ya da 15 günlük deneme) geçerli değilse TÜM /api/* uçları 403 döner.
@@ -160,6 +160,7 @@ function persistConfig({ server, database, username, port, password, uiContext }
         password: (password != null && password !== '') ? encryptSecret(password) : existing.password,
         uiContext: uiContext !== undefined ? uiContext : (existing.uiContext || null),
     };
+    if (existing.wa) saved.wa = existing.wa;   // WA modu (relay) ayarını DB kaydında koru
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(saved, null, 2), 'utf8');
     return saved;
 }
@@ -190,6 +191,107 @@ function readStoredConfig() {
     return { exists: true, config: c, password, needsReauth, legacy, rekey };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  WHATSAPP MODU: yerel | relay  (iki-PC aynı-numara conflict çözümü)
+// ═══════════════════════════════════════════════════════════════════════════
+// İki bilgisayar aynı WhatsApp numarasını kullanınca İKİSİ de Baileys oturumu
+// açarsa WhatsApp bunu "conflict" (connectionReplaced/401) sayar: biri diğerini
+// düşürür, o yeniden bağlanır, karşıyı düşürür → sonsuz düşürme savaşı + cihaz
+// fırtınası (linked-device sayacı şişer → hesap işaretlenir).
+//
+// Çözüm: YALNIZ ana PC (PC1) tek Baileys oturumu tutar. İkinci PC (PC2, yalnız
+// ekstre) kendi oturumunu AÇMAZ; göndereceği işi LAN üzerinden PC1'e yollar
+// (POST /api/relay-send), PC1 kendi oturumundan gönderir. WhatsApp'a bağlı tek
+// cihaz kalır → conflict imkânsız, anti-ban sayacı tek yerde birleşir.
+//
+//   config.json → "wa": { "mode":"relay", "relayTarget":"http://PC1-IP:3100", "relayToken":"ORTAK-SIR" }
+//   mode yoksa "local" (PC1 varsayılanı). PC2'de mode=relay.
+let waCfg = (loadConfigFile() || {}).wa || { mode: 'local' };
+const isRelay = () => !!waCfg && waCfg.mode === 'relay' && !!waCfg.relayTarget;
+const relayUrl = (p) => String(waCfg.relayTarget || '').replace(/\/+$/, '') + p;
+const relayHeaders = () => ({ 'x-relay-token': waCfg.relayToken || '' });
+
+// Küçük JSON HTTP istemcisi — pkg/exe altında global fetch garanti değil → http/https.
+function httpJson(urlStr, { method = 'POST', headers = {}, body, timeoutMs = 30000 } = {}) {
+    return new Promise((resolve, reject) => {
+        let u;
+        try { u = new URL(urlStr); } catch { return reject(new Error('geçersiz adres: ' + urlStr)); }
+        const lib = u.protocol === 'https:' ? require('https') : require('http');
+        const data = body != null ? Buffer.from(JSON.stringify(body)) : null;
+        const req = lib.request({
+            hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
+            path: u.pathname + u.search, method,
+            headers: { 'Content-Type': 'application/json', ...(data ? { 'Content-Length': data.length } : {}), ...headers },
+        }, (res) => {
+            let buf = '';
+            res.on('data', (d) => { buf += d; });
+            res.on('end', () => {
+                let json = null;
+                try { json = buf ? JSON.parse(buf) : null; } catch { /* json değil */ }
+                resolve({ status: res.statusCode, json, raw: buf });
+            });
+        });
+        req.on('error', reject);
+        req.setTimeout(timeoutMs, () => req.destroy(new Error('ana PC yanıt vermedi (zaman aşımı)')));
+        if (data) req.write(data);
+        req.end();
+    });
+}
+
+// Relay modunda PC1'in bağlantı durumunu önbellekte tut (waStatusX senkron okusun).
+let relayStatus = { ready: false, me: null, error: 'Ana PC ile bağlantı bekleniyor…', ts: 0 };
+async function pollRelayStatus() {
+    if (!isRelay()) return;
+    try {
+        const r = await httpJson(relayUrl('/api/relay-status'), { method: 'GET', headers: relayHeaders(), timeoutMs: 8000 });
+        if (r.status === 200 && r.json) relayStatus = { ready: !!r.json.ready, me: r.json.me || null, error: r.json.error || null, ts: Date.now() };
+        else if (r.status === 401) relayStatus = { ready: false, me: null, error: 'Relay parolası (token) ana PC ile eşleşmiyor.', ts: Date.now() };
+        else relayStatus = { ready: false, me: null, error: `Ana PC yanıtı: ${r.status}`, ts: Date.now() };
+    } catch (e) {
+        relayStatus = { ready: false, me: null, error: 'Ana PC erişilemiyor: ' + e.message, ts: Date.now() };
+    }
+}
+
+// ─── Mod-duyarlı WA sarmalayıcıları ──────────────────────────────────────────
+// Yerel modda gerçek Baileys fonksiyonları; relay modda PC1'e HTTP vekil.
+const waStatusX = () => isRelay()
+    ? { ready: relayStatus.ready, initializing: false, hasQr: false, qr: null, error: relayStatus.error, me: relayStatus.me }
+    : waStatus();
+
+const waCheckX = async (phone) => {
+    if (!isRelay()) return checkOnWhatsApp(phone);
+    try {
+        const r = await httpJson(relayUrl('/api/relay-check'), { body: { phone }, headers: relayHeaders() });
+        if (r.status === 200 && r.json) return r.json;
+        return { exists: false, transient: true, error: `Ana PC: ${r.status}` };
+    } catch (e) { return { exists: false, transient: true, error: 'Ana PC erişilemiyor: ' + e.message }; }
+};
+
+const waSendX = async (phone, text, media = null, opts = {}) => {
+    if (!isRelay()) return waSend(phone, text, media, opts);
+    let m = null;
+    if (media && media.buffer) m = { kind: media.kind, mimetype: media.mimetype, fileName: media.fileName, b64: Buffer.from(media.buffer).toString('base64') };
+    try {
+        const r = await httpJson(relayUrl('/api/relay-send'), { body: { phone, text, media: m, opts }, headers: relayHeaders() });
+        if (r.json) return r.json;
+        return { success: false, error: `Ana PC: ${r.status}` };
+    } catch (e) { return { success: false, error: 'Ana PC erişilemiyor: ' + e.message }; }
+};
+
+// Anti-ban tek hesap = tek yer (PC1). Relay modda PC2 yerel gate/record YAPMAZ;
+// PC1'in /api/relay-send'i gate+record uygular (çift sayım olmasın).
+const gateX = (me, cap, ch) => isRelay() ? { ok: true } : antiban.gate(me, cap, ch);
+const recordSentX = (me, ch) => { if (!isRelay()) { try { antiban.recordSent(me, ch); } catch { /* yok say */ } } };
+
+// Relay modda otomasyonu (watcher/hatırlatma/aktif-cari) BAŞLATMA — belge bildirimi
+// + hatırlatma ana PC'nin işi; ikinci PC'de de çalışırsa çift mesaj gider.
+function startAutomationUnlessRelay() {
+    if (isRelay()) { console.log('[Relay] İkinci PC (ekstre) modu — watcher/hatırlatma/aktif-cari BAŞLATILMADI (ana PC yürütür).'); return; }
+    watcher.autoStart();
+    try { reminders.autoStart(); } catch { /* Faz 6 */ }
+    try { activeCari.autoStart(); } catch { /* yok say */ }
+}
+
 // Kayıtlı config varsa PIN'siz otomatik bağlan (boot + /api/connect).
 async function autoConnectFromConfig() {
     if (pool && pool.connected) return true;
@@ -206,9 +308,7 @@ async function autoConnectFromConfig() {
             try { persistConfig({ server: c.server, database: c.database, username: c.username, port: c.port, password: st.password }); }
             catch (e) { console.error('parola yeniden anahtarlama hatası:', e.message); }
         }
-        watcher.autoStart();
-        try { reminders.autoStart(); } catch { /* Faz 6 */ }
-        try { activeCari.autoStart(); } catch { /* yok say */ }
+        startAutomationUnlessRelay();
         return true;
     } catch (e) { console.error('oto-bağlantı hata:', e.message); return false; }
 }
@@ -272,9 +372,7 @@ app.post('/api/setup', async (req, res) => {
         await pool.request().query('SELECT TOP 1 IND FROM TBLFIRMA');
 
         persistConfig({ server, database, username, port: port || '1433', password });
-        watcher.autoStart();
-        try { reminders.autoStart(); } catch { /* yok say */ }
-        try { activeCari.autoStart(); } catch { /* yok say */ }
+        startAutomationUnlessRelay();
         res.json({ success: true, message: 'Kurulum tamamlandı.' });
     } catch (err) {
         console.error('setup hatası:', err.message);
@@ -315,9 +413,7 @@ app.post('/api/login', async (req, res) => {
         pool = await createPool(config);
         currentConfig = config;
         if (st.legacy) persistConfig({ server: c.server, database: c.database, username: c.username, port: c.port, password }); // v2'ye yükselt
-        watcher.autoStart();
-        try { reminders.autoStart(); } catch { /* Faz 6 */ }
-        try { activeCari.autoStart(); } catch { /* yok say */ }
+        startAutomationUnlessRelay();
         res.json({ success: true, message: 'Bağlandı.' });
     } catch (err) {
         console.error('login hatası:', err.message);
@@ -427,6 +523,43 @@ app.post('/api/settings/context', (req, res) => {
     const ctx = { firmaNo: (req.body && req.body.firmaNo) || null, donemNo: (req.body && req.body.donemNo) || null };
     persistConfig({ server: c.server, database: c.database, username: c.username, port: c.port, uiContext: ctx });
     res.json({ success: true, context: ctx });
+});
+
+// ─── WhatsApp Modu (yerel / relay) ───────────────────────────────────────────
+// Relay: bu PC kendi WhatsApp'ını açmaz; gönderimi ana PC'ye (relayTarget) yollar.
+// Token asla geri gönderilmez (yalnız var/yok bilgisi).
+app.get('/api/settings/wa', (req, res) => {
+    res.json({
+        success: true,
+        mode: (waCfg && waCfg.mode) || 'local',
+        relayTarget: (waCfg && waCfg.relayTarget) || '',
+        hasToken: !!(waCfg && waCfg.relayToken),
+        relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null,
+    });
+});
+app.post('/api/settings/wa', async (req, res) => {
+    const b = req.body || {};
+    const mode = b.mode === 'relay' ? 'relay' : 'local';
+    const relayTarget = String(b.relayTarget || '').trim();
+    // Parola boş bırakılırsa mevcut korunur (yeniden yazmaya gerek kalmasın).
+    const relayToken = (b.relayToken != null && b.relayToken !== '') ? String(b.relayToken) : (waCfg && waCfg.relayToken) || '';
+    if (mode === 'relay') {
+        if (!relayTarget) return res.status(400).json({ success: false, message: 'Ana PC adresi gerekli (ör. http://192.168.1.10:3100).' });
+        if (!relayToken) return res.status(400).json({ success: false, message: 'Relay parolası (token) gerekli — ana PC ile aynı olmalı.' });
+        try { new URL(relayTarget); } catch { return res.status(400).json({ success: false, message: 'Ana PC adresi geçersiz.' }); }
+    }
+    const next = { mode, relayTarget, relayToken };
+    try {
+        const existing = loadConfigFile() || {};
+        existing.wa = next;
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(existing, null, 2), 'utf8');
+        waCfg = next;
+    } catch (e) {
+        return res.status(500).json({ success: false, message: 'Ayar kaydedilemedi: ' + e.message });
+    }
+    // Relay'e geçildiyse hemen durum çek + otomasyon zaten relay guard'ıyla susar.
+    if (isRelay()) { try { await pollRelayStatus(); } catch { /* yok say */ } }
+    res.json({ success: true, mode, relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1759,9 +1892,9 @@ app.post('/api/extre/send', async (req, res) => {
     const indNum = parseInt(req.body && req.body.ind, 10);
     if (!firmaNo || !donemNo || !Number.isFinite(indNum))
         return res.status(400).json({ success: false, message: 'firma/dönem/cari gerekli.' });
-    if (!waStatus().ready) return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil. Önce QR okutun.' });
-    const me = waStatus().me;
-    const g = antiban.gate(me, DEFAULT_PACING.dailyCap, 'manual');
+    if (!waStatusX().ready) return res.status(400).json({ success: false, message: isRelay() ? 'Ana PC WhatsApp bağlı değil (relay).' : 'WhatsApp bağlı değil. Önce QR okutun.' });
+    const me = waStatusX().me;
+    const g = gateX(me, DEFAULT_PACING.dailyCap, 'manual');
     if (!g.ok) return res.status(429).json({ success: false, message: g.reason || 'Anti-ban: gönderim sınırına ulaşıldı.' });
     try {
         const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum);
@@ -1777,15 +1910,15 @@ app.post('/api/extre/send', async (req, res) => {
             donem: donemNo, rows, net, generatedAt: new Date(),
         });
 
-        const chk = await checkOnWhatsApp(c.phone);
+        const chk = await waCheckX(c.phone);
         if (!chk.exists) return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
 
         const caption = (req.body && req.body.message && String(req.body.message).trim())
             ? String(req.body.message)
             : `Sayın ${c.firma || c.name}, hesap ekstreniz ektedir.`;
         const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
-        const result = await waSend(c.phone, caption, { kind: 'document', buffer: pdf, mimetype: 'application/pdf', fileName }, { simulateTyping: true, typingMs: 1200, channel: 'extre' });
-        if (result.success) { antiban.recordSent(me, 'manual'); return res.json({ success: true, message: 'Ekstre gönderildi.', phone: c.phone, name: c.name }); }
+        const result = await waSendX(c.phone, caption, { kind: 'document', buffer: pdf, mimetype: 'application/pdf', fileName }, { simulateTyping: true, typingMs: 1200, channel: 'extre' });
+        if (result.success) { recordSentX(me, 'manual'); return res.json({ success: true, message: 'Ekstre gönderildi.', phone: c.phone, name: c.name }); }
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -1916,6 +2049,13 @@ app.post('/api/license/recheck', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/wa/status', async (req, res) => {
     try {
+        // Relay modu: bu PC kendi Baileys'ini AÇMAZ (conflict olmasın). Durumu ana
+        // PC'den (relayTarget) çek; QR yok. UI "ana PC üzerinden bağlı" gösterir.
+        if (isRelay()) {
+            await pollRelayStatus();
+            const s = waStatusX();
+            return res.json({ success: true, ready: s.ready, initializing: false, hasQr: false, qrImage: null, me: s.me, error: s.error, antiban: null, relay: true, relayTarget: waCfg.relayTarget });
+        }
         const s = waStatus();
         if (!s.initializing && !s.ready && !s.hasQr) {
             await initializeWhatsApp();
@@ -1939,6 +2079,59 @@ app.post('/api/wa/refresh', async (req, res) => {
 app.post('/api/wa/logout', async (req, res) => {
     try { await logoutWhatsApp(); res.json({ success: true }); }
     catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RELAY SUNUCU TARAFI (ANA PC / PC1)
+// ═══════════════════════════════════════════════════════════════════════════
+// İkinci PC (relay modunda) buraya iş yollar; tek WA oturumu burada olduğundan
+// conflict olmaz. Token config.json → wa.relayToken ile eşleşmeli. NOT: ana PC'nin
+// KENDİSİ relay moduna geçmemeli (mode=local); bu uçlar mode'dan bağımsız açık —
+// yalnız token korur. LAN dışına açmayın (güvenlik duvarı: yalnız yerel ağ).
+function relayAuthed(req, res) {
+    const need = (waCfg && waCfg.relayToken) || ((loadConfigFile() || {}).wa || {}).relayToken || '';
+    const got = req.get('x-relay-token') || '';
+    if (!need) { res.status(503).json({ success: false, error: 'Ana PC relay parolası (token) tanımlı değil.' }); return false; }
+    if (got !== need) { res.status(401).json({ success: false, error: 'relay parolası (token) geçersiz' }); return false; }
+    return true;
+}
+
+// İkinci PC durum sorgusu: ana PC'nin WhatsApp'ı bağlı mı?
+app.get('/api/relay-status', (req, res) => {
+    if (!relayAuthed(req, res)) return;
+    const s = waStatus();
+    res.json({ ready: s.ready, me: s.me, error: s.error });
+});
+
+// İkinci PC: numara WhatsApp kullanıcısı mı? (ana PC'nin oturumuyla sorgula)
+app.post('/api/relay-check', async (req, res) => {
+    if (!relayAuthed(req, res)) return;
+    try { res.json(await checkOnWhatsApp((req.body || {}).phone)); }
+    catch (e) { res.json({ exists: false, transient: true, error: e.message }); }
+});
+
+// İkinci PC: gönderilecek işi al → anti-ban kapısı + ana PC oturumuyla gönder.
+// media.b64 varsa buffer'a çevrilir (ekstre PDF). Anti-ban sayacı BURADA işler
+// (tek hesap = tek sayaç). channel korunur (istatistik/kanal ayrımı için).
+app.post('/api/relay-send', async (req, res) => {
+    if (!relayAuthed(req, res)) return;
+    const { phone, text, media, opts } = req.body || {};
+    if (!phone) return res.status(400).json({ success: false, error: 'telefon gerekli' });
+    if (!waStatus().ready) return res.status(503).json({ success: false, error: 'Ana PC WhatsApp bağlı değil.' });
+    const me = waStatus().me;
+    const ch = (opts && opts.channel) || 'relay';
+    const gateCh = ch === 'bulk' ? 'bulk' : 'manual';
+    const g = antiban.gate(me, DEFAULT_PACING.dailyCap, gateCh);
+    if (!g.ok) return res.status(429).json({ success: false, error: g.reason || 'Anti-ban: gönderim sınırına ulaşıldı.' });
+    let m = null;
+    if (media && media.b64) m = { kind: media.kind, mimetype: media.mimetype, fileName: media.fileName, buffer: Buffer.from(media.b64, 'base64') };
+    try {
+        const result = await waSend(phone, text || '', m, opts || {});
+        if (result.success) { try { antiban.recordSent(me, gateCh); } catch { /* yok say */ } }
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 // ─── Güven paneli (Pano) ─────────────────────────────────────────────────────
@@ -2346,6 +2539,13 @@ aiBot.configure({
 });
 // Baileys gelen-mesaj dinleyicisini bota bağla (her yeniden bağlanışta yeniden kurulur).
 setIncomingHandler(aiBot.handleIncoming);
+
+// Relay modunda ana PC durumunu düzenli yokla (UI + gönderim öncesi hazır-mı kararı).
+if (isRelay()) {
+    console.log(`[Relay] İkinci PC (ekstre) modu — gönderim ana PC'ye vekil edilecek: ${waCfg.relayTarget}`);
+    pollRelayStatus();
+    setInterval(pollRelayStatus, 15000).unref?.();
+}
 
 app.listen(PORT, async () => {
     const url = `http://localhost:${PORT}`;

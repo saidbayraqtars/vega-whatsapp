@@ -246,7 +246,14 @@ function writeStampRegistry(valueName, sec) {
     } catch { /* best-effort */ }
 }
 
-const isSaneStamp = (v) => Number.isInteger(v) && v > 100_000_000;
+// Damga makul aralık denetimi. Bozuk/sıfırlanmış bir damga (ör. ani kapanma
+// sonrası dosyanın sıfır dolması) XOR maskesiyle çözülünce XOR_KEY'in kendisine
+// (2115617955 ≈ 2037) dönüşür ve "gelecekten gelen son görülen zaman" gibi
+// görünüp sahte CLOCK_TAMPERED üretirdi. Meşru bir damga bu aralığın dışına
+// çıkamaz; çıkanlar yok sayılır ve self-heal ile düzeltilir.
+const MIN_STAMP = 1_700_000_000;   // ~2023-11
+const MAX_STAMP = 2_000_000_000;   // ~2033-05
+const isSaneStamp = (v) => Number.isInteger(v) && v >= MIN_STAMP && v <= MAX_STAMP;
 
 // ─── Saat geri-alma sentinel'i ──────────────────────────────────────────────
 // Dosya + registry'nin EN BÜYÜĞÜ güvenilir "son görülen zaman"dır. Tek kaynağı
@@ -256,6 +263,13 @@ const isSaneStamp = (v) => Number.isInteger(v) && v > 100_000_000;
 function trustedLastSeen() {
     const f = readStampFile(sentinelPath());
     const r = readStampRegistry(REG_VAL_SENTINEL);
+
+    // Bozuk damga varsa (okundu ama aralık dışı) şimdiyle tazele — aksi halde
+    // kullanıcı kalıcı olarak CLOCK_TAMPERED'a kilitlenir ve lisans giremez.
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (f !== null && !isSaneStamp(f)) writeStampFile(sentinelPath(), nowSec);
+    if (r !== null && !isSaneStamp(r)) writeStampRegistry(REG_VAL_SENTINEL, nowSec);
+
     const vals = [f, r].filter(isSaneStamp);
     return vals.length ? Math.max(...vals) : null;
 }

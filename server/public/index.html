@@ -629,6 +629,26 @@
         <div class="hint" id="ab_result" style="display:none"></div>
 
         <div style="border-top:1px solid var(--border); margin:12px 0 12px"></div>
+        <div class="muted" style="font-weight:600; margin-bottom:8px">WhatsApp Gönderim Modu</div>
+        <div class="hint" style="margin-bottom:8px">İki bilgisayar aynı WhatsApp numarasını kullanıyorsa: ana PC <b>Yerel</b> kalır; ikinci PC (yalnız ekstre) <b>Relay</b> seçer — kendi WhatsApp'ını açmaz, gönderimi ana PC'ye yollar. Böylece "başka yerde açıldı" çakışması olmaz.</div>
+        <div class="field">
+            <label>Mod</label>
+            <select id="set_waMode">
+                <option value="local">Yerel — bu PC WhatsApp oturumu tutar (ana PC)</option>
+                <option value="relay">Relay — gönderimi ana PC'ye yolla (ikinci PC)</option>
+            </select>
+        </div>
+        <div class="field"><label>Relay parolası (token)</label><input id="set_relayToken" type="password" placeholder="(değişmeyecekse boş bırak)" /></div>
+        <div class="hint">İki PC'de de <b>AYNI</b> token olmalı. Ana PC (Yerel) bu token'la gelen relay isteklerini kabul eder; ikinci PC (Relay) bu token'la bağlanır.</div>
+        <div id="set_relayFields" style="display:none">
+            <div class="field"><label>Ana PC adresi</label><input id="set_relayTarget" placeholder="http://192.168.1.10:3100" /></div>
+        </div>
+        <div class="row">
+            <button class="btn green sm" id="set_saveWa" style="flex:1">WhatsApp Modunu Kaydet</button>
+        </div>
+        <div class="hint" id="set_waResult" style="display:none"></div>
+
+        <div style="border-top:1px solid var(--border); margin:12px 0 12px"></div>
         <div class="muted" style="font-weight:600; margin-bottom:8px">SQL Bağlantısı</div>
         <div class="row">
             <div class="field"><label>Sunucu</label><input id="set_server" /></div>

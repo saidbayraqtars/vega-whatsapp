@@ -339,7 +339,8 @@ async function pollWa() {
         state.waReady = r.ready;
         const dot = $('waDot');
         const label = $('waLabel');
-        if (r.ready) { dot.className = 'dot on'; label.textContent = 'WhatsApp bağlı'; }
+        if (r.ready) { dot.className = 'dot on'; label.textContent = r.relay ? 'Ana PC üzerinden bağlı' : 'WhatsApp bağlı'; }
+        else if (r.relay) { dot.className = 'dot wait'; label.textContent = 'Ana PC bekleniyor'; }
         else if (r.hasQr) { dot.className = 'dot wait'; label.textContent = 'QR bekliyor'; }
         else { dot.className = 'dot wait'; label.textContent = 'Bağlanıyor...'; }
 
@@ -376,6 +377,13 @@ $('warnStop').onclick = () => {
 
 function renderWaModal(r) {
     const c = $('waContent');
+    if (r.relay) {
+        // Relay modu: bu PC kendi WhatsApp'ını açmaz; durum ana PC'den gelir. QR yok.
+        c.innerHTML = r.ready
+            ? `<p style="color:var(--primary); font-weight:600">✓ Ana PC üzerinden bağlı</p><p class="muted">${r.me ? r.me.split(':')[0].split('@')[0] : ''}</p><p class="muted" style="margin-top:8px">Bu bilgisayar Relay modunda — gönderim ana PC'ye yollanır.</p>`
+            : `<p class="nophone">${esc(r.error || 'Ana PC bekleniyor')}</p><p class="muted" style="margin-top:8px">Ana PC açık ve WhatsApp bağlı olmalı. Adres/token için Ayarlar → WhatsApp Gönderim Modu.</p>`;
+        return;
+    }
     if (r.ready) {
         c.innerHTML = `<p style="color:var(--primary); font-weight:600">✓ WhatsApp bağlı</p><p class="muted">${r.me ? r.me.split(':')[0] : ''}</p>`;
     } else if (r.qrImage) {
@@ -436,9 +444,59 @@ async function openSettings() {
             $('ab_engInfo').textContent = `İzlenen ${eng.tracked || 0} numara · susturulan ${eng.suspendedCount || 0}`;
         }
     } catch { /* yok say */ }
+    try {
+        const w = await api('/settings/wa');
+        if (w.success) {
+            $('set_waMode').value = w.mode || 'local';
+            $('set_relayTarget').value = w.relayTarget || '';
+            $('set_relayToken').value = '';
+            $('set_relayToken').placeholder = w.hasToken ? '(kayıtlı — değişmeyecekse boş bırak)' : 'ortak gizli parola';
+            toggleRelayFields();
+            const wr = $('set_waResult');
+            if (w.relay) {
+                wr.style.display = ''; wr.className = w.relay.ready ? 'hint ok' : 'hint';
+                wr.textContent = w.relay.ready
+                    ? `✓ Ana PC bağlı (${(w.relay.me || '').split(':')[0].split('@')[0]})`
+                    : ('Ana PC: ' + (w.relay.error || 'bekleniyor'));
+            } else { wr.style.display = 'none'; }
+        }
+    } catch { /* yok say */ }
     await loadSettingsFirmalar();
     $('settingsModal').classList.remove('hidden');
 }
+
+// WhatsApp Modu: relay seçilince ana PC adresi alanını göster.
+function toggleRelayFields() {
+    const el = $('set_relayFields');
+    if (el) el.style.display = ($('set_waMode').value === 'relay') ? '' : 'none';
+}
+$('set_waMode').onchange = toggleRelayFields;
+$('set_saveWa').onclick = async () => {
+    const box = $('set_waResult');
+    box.style.display = ''; box.className = 'hint'; box.textContent = 'Kaydediliyor...';
+    try {
+        const body = {
+            mode: $('set_waMode').value,
+            relayTarget: $('set_relayTarget').value.trim(),
+            relayToken: $('set_relayToken').value,
+        };
+        const r = await api('/settings/wa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        if (r.success) {
+            box.className = 'hint ok';
+            if (r.mode === 'relay') {
+                box.textContent = (r.relay && r.relay.ready)
+                    ? '✓ Relay kaydedildi — ana PC bağlı.'
+                    : `✓ Relay kaydedildi. Ana PC durumu: ${(r.relay && r.relay.error) || 'bekleniyor'}`;
+            } else {
+                box.textContent = '✓ Yerel mod kaydedildi (bu PC WhatsApp oturumu tutar).';
+            }
+            $('set_relayToken').value = '';
+            try { pollWa(); } catch { /* yok say */ }
+        } else {
+            box.className = 'err'; box.textContent = r.message || 'Kaydedilemedi.';
+        }
+    } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
+};
 
 // Ban Koruması ayarlarını kaydet (günlük cap + uyarı eşiği + dönüş-budama + kaydet-opt-in).
 $('ab_save').onclick = async () => {
