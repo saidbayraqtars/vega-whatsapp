@@ -55,9 +55,28 @@ Bakiyeli carileri listeler → seçilen cariye PDF hesap ekstresi üretilip (uyg
 Giriş şifresiyle kilitlidir (bkz. Erişim kilidi).
 
 ### AI Oto-Yanıt
-Gelen mesajlara Claude Haiku ile seçmeli otomatik yanıt. Kullanıcı serbest metin yazdığında
-model `[SESSIZ]` (yanıt verme) veya `[EKSTRE]` (bakiye ekstresi gönder) kararı da verebilir.
-API anahtarı yerel makinede şifreli saklanır. Giriş şifresiyle kilitlidir.
+Gelen mesajlara yapay zekâ ile otomatik yanıt. Giriş şifresiyle kilitlidir.
+
+**Kapsam — Sohbet modu (varsayılan AÇIK):** selamlaşmadan bakiye/ödeme sorularına, işletme
+hakkındaki genel sorulardan şikâyetlere kadar hemen her mesaja cevap verir. Kapatılırsa eski
+dar davranışa döner (yalnız bakiye/ödeme/borç sebebi, gerisi sessiz). Her iki modda da
+değişmeyen sert kurallar: **rakam uydurma yok**, **taahhüt yasağı** (fiyat/iskonto/vade/teslimat
+sözü verilmez → "yetkilimiz dönüş yapacaktır"), hakarete karşılık verilmez. Hukuki tehdit,
+ciddi şikâyet ve anlaşılmaz mesajlarda `[SESSIZ]` → insana bırakılır.
+Model ayrıca `[EKSTRE]` (PDF hesap ekstresi) ve `[FATURA]` (son satış faturası kalemleri)
+kararı verebilir. Sohbet hafızası gün içinde numara bazında tutulur, gece sıfırlanır.
+
+**Ücretlendirme — iki mod:**
+
+| Mod | Anahtar | Ücret |
+|---|---|---|
+| **Vega Kontör** (varsayılan) | Yok — anahtar bizde, kontör sunucusunda | **Gönderilen mesaj başına kontör.** Sessiz kalınan / gönderilemeyen cevaptan **düşmez** |
+| BYOK (Anthropic / OpenAI / Gemini) | Müşterinin kendi anahtarı, bu makinede şifreli | Kontör harcanmaz; token parasını müşteri kendi öder |
+
+Kontör bakiyesi **sunucuda** tutulur (bu bilgisayarda kurcalanamaz) ve **uzaktan** yüklenir:
+müşteri hiçbir şey girmez, dosya yüklemez — yükleme birkaç dakika içinde ekranında görünür.
+Kontörlü mod **lisans gerektirir** (imzalı lisans kimlik kanıtıdır); deneme sürümünde kapalıdır.
+Kontör sunucusu: [`../vega-kontor/`](../vega-kontor/) (Cloudflare Worker + D1).
 
 ### Firma Bilgileri
 Firma adı, logo ve yasal şart metni — Hesap Extresi PDF'inin başlık/logo/altbilgisinde kullanılır.
@@ -81,6 +100,24 @@ Doğrulama kodu: [server/license.js](server/license.js) — `TRIAL_DAYS`, `PRODU
 Müşteri lisans ekranındaki **Donanım Kimliği**'ni gönderir → araçta kimlik + süre girilir → `.lic` dosyası üretilir → müşteri "Lisans Dosyası Seç" ile yükler.
 
 > `vega-lisans-yonetici/lisans/private.key` bu depoda **değildir** ve olmamalıdır. Sızarsa herkes kendine sınırsız lisans üretir.
+
+## Kontör (kontörlü AI)
+
+AI oto-yanıtın kontörlü modu, model çağrılarını **bizim** Anthropic anahtarımızla karşılayan
+bir Cloudflare Worker'a gider: [`../vega-kontor/`](../vega-kontor/). Anahtar müşteriye hiç gitmez.
+
+| Konu | Davranış |
+|---|---|
+| Kimlik | Ayrı parola/jeton yok — müşterinin **RSA imzalı lisansı** kanıt olarak gönderilir (`license.getLicenseProof`). İmza Worker'da doğrulanır; `payload.hardwareId` hesap anahtarıdır |
+| Bakiye | **Sunucuda** tutulur. Yereldeki `data/credits.json` yalnız gösterim önbelleğidir; silinse/değiştirilse kontör kazanılmaz |
+| Düşme | `chat` → rezervasyon (düşmez) → WhatsApp gönderimi başarılı → `commit` (**düşer**). Sessiz kalındı / gönderilemedi → `release` (**düşmez**) |
+| Bedel | `claude-haiku-4-5` = 1 kontör, `claude-sonnet-5` = 3 kontör (Worker'daki `MODELS` tablosu). Listede olmayan model reddedilir |
+| Sömürü freni | Sessiz çağrıların token maliyeti bizde → hesap başına **günlük çağrı tavanı** (varsayılan 300) |
+| Kontör bitince | Bot **sessiz kalır** (model bile çağrılmaz), arayüzde uyarı çıkar. Otomasyonun geri kalanı etkilenmez |
+| Uzaktan yükleme | `vega-lisans-yonetici` → **Kontör** sekmesi → `POST /admin/topup`. Admin jetonu yalnız satıcı makinesinde durur |
+
+İstemci kodu: [server/credits.js](server/credits.js) — `BUILTIN_ENDPOINT` sabiti Worker
+yayınlandıktan sonra güncellenir (kullanıcı UI'dan da girebilir).
 
 ## Erişim kilidi
 

@@ -1,14 +1,29 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  AI Oto-Yanıt Botu — gelen WhatsApp mesaplarına Claude Haiku ile cevap
+//  AI Oto-Yanıt Botu — gelen WhatsApp mesajlarına yapay zekâ ile cevap
 //
-//  Karar: SEÇMELİ oto-cevap. Bot yalnız belirli konulara (bakiye/borç durumu,
-//  ödeme/hesap bilgileri, borç sebebi) cevap verir; diğer her şeyde SESSİZ kalır
-//  (mesaj göndermez → insana bırakılır). Karar modele bırakılır: kapsam dışıysa
-//  [SESSIZ] üretir.
+//  Kapsam (chatMode): AÇIK'ken bot GENİŞ konuşur — selamlaşma, genel sorular,
+//  çalışma saati, sipariş/teslimat durumu sorularına da insan gibi cevap verir.
+//  KAPALI'yken eski dar davranış: yalnız bakiye/ödeme/borç sebebi, gerisine
+//  [SESSIZ]. Geniş modda da değişmeyen sert kurallar:
+//    • rakam uydurma yok (yalnız verilen bakiye/hareket),
+//    • TAAHHÜT YASAĞI: fiyat/iskonto/vade/tarih/sipariş sözü verilmez →
+//      "yetkilimiz dönüş yapacaktır",
+//    • hakarete karşılık verilmez (sakin, kısa, gerekirse özür),
+//    • hukuki tehdit / ciddi şikâyet / anlaşılmaz mesaj → [SESSIZ] (insana bırak).
 //
-//  Güvenlik/KVKK: yalnız cari kartında EŞLEŞEN numaralara borç bilgisi verilir;
-//  tanınmayan numaraya cevap yok. Anahtar (Anthropic) config'te ŞİFRELİ tutulur
-//  (server.js encrypt/decrypt — makine anahtarı); UI'dan girilir, gömülü değildir.
+//  Sohbet hafızası: numara-başı gün içi son N tur (state.convo) modele geçmiş
+//  olarak verilir → "az önce ne dedim" bilen tutarlı konuşma.
+//
+//  Sağlayıcı: 'vega' (KONTÖRLÜ — anahtar bizde, kontör sunucusunda düşer) ya da
+//  BYOK: anthropic | openai | gemini. BYOK'ta anahtar bu bilgisayarda ŞİFRELİ
+//  saklanır (server.js encrypt/decrypt — makine anahtarı), gömülü değildir.
+//
+//  Kontör: yalnız müşteriye mesaj GERÇEKTEN gidince düşer. Model çağrısı bir
+//  rezervasyon döndürür; gönderim başarılıysa credits.commit(), sessiz kalındı
+//  ya da gönderilemediyse credits.release() → ücretsiz.
+//
+//  Güvenlik/KVKK: yalnız cari kartında EŞLEŞEN numaralara cevap verilir;
+//  tanınmayan numaraya hiçbir şey yazılmaz.
 //
 //  Anti-ban / döngü koruması: çalışma saati penceresi, günlük cevap tavanı,
 //  numara-başı min cevap aralığı, mesaj-id tekrar (dedupe) koruması.
@@ -24,10 +39,14 @@ let LOG_PATH = null;
 
 const DEFAULT_CONFIG = {
     enabled: false,
-    provider: 'anthropic',         // 'anthropic' | 'openai' | 'gemini' (BYOK — her işletme kendi sağlayıcısı)
+    provider: 'vega',              // 'vega' (kontörlü, anahtar gerekmez) | BYOK: 'anthropic' | 'openai' | 'gemini'
     baseUrl: '',                   // OpenAI-uyumlu özel uç (OpenRouter/DeepSeek/Groq/yerel); boşsa sağlayıcı varsayılanı
-    apiKeyEnc: null,               // Seçili sağlayıcının anahtarı — ŞİFRELİ (asla düz metin diskte)
+    apiKeyEnc: null,               // BYOK anahtarı — ŞİFRELİ (asla düz metin diskte). 'vega'da kullanılmaz.
     model: 'claude-haiku-4-5',
+    // ─── Kapsam / sohbet ───
+    chatMode: true,                // AÇIK: neredeyse her şeye cevap ver (geniş). KAPALI: eski dar kapsam.
+    historyTurns: 10,              // modele verilen gün içi geçmiş tur sayısı (0 = hafızasız)
+    maxReplyTokens: 800,           // cevap uzunluk tavanı (token)
     firmaNo: null,                 // boşsa watcher/uiContext bağlamına düşer
     donemNo: null,
     businessName: '',              // imza / "biz kimiz" (mesaj altına)
@@ -52,7 +71,8 @@ const DEFAULT_CLOSING = 'Görüşmemizi burada nazikçe sonlandırıyorum. Bakiy
 let config = { ...DEFAULT_CONFIG };
 // state: günlük sayaç + numara-başı son cevap + işlenmiş mesaj id'leri (dedupe)
 //        + thread: numara-başı sohbet sayacı/kapanış (tartışma-kredi koruması)
-let state = { date: null, sent: 0, lastByPhone: {}, seenIds: [], thread: {} };
+//        + convo: numara-başı gün içi konuşma hafızası [{role,text}]
+let state = { date: null, sent: 0, lastByPhone: {}, seenIds: [], thread: {}, convo: {} };
 let log = []; // son ~200 olay (UI canlı kayıt)
 
 const todayKey = () => new Date().toISOString().slice(0, 10);
@@ -75,6 +95,10 @@ function loadConfig() {
         if (fs.existsSync(CONFIG_PATH)) {
             const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
             config = { ...DEFAULT_CONFIG, ...raw };
+            // Yükseltme koruması: varsayılan sağlayıcı 'vega' (kontörlü) oldu. Sağlayıcı
+            // alanı olmayan ESKİ config'te anahtar varsa kullanıcı BYOK kurmuş demektir —
+            // sessizce kontörlü moda geçirip botu susturmayalım.
+            if (raw.provider === undefined && raw.apiKeyEnc) config.provider = 'anthropic';
         }
     } catch (e) { console.error('[AIBot] config okunamadı:', e.message); }
 }
@@ -104,10 +128,33 @@ function saveLog() {
     try { fs.writeFileSync(LOG_PATH, JSON.stringify(log)); } catch { /* bellekte devam */ }
 }
 
-// Gün dönünce günlük sayaç + numara-başı geçmiş sıfırlanır.
+// Gün dönünce günlük sayaç + numara-başı geçmiş (sohbet hafızası dahil) sıfırlanır.
 function rollDay() {
     const t = todayKey();
-    if (state.date !== t) { state.date = t; state.sent = 0; state.lastByPhone = {}; state.thread = {}; saveState(); }
+    if (state.date !== t) {
+        state.date = t; state.sent = 0; state.lastByPhone = {}; state.thread = {}; state.convo = {};
+        saveState();
+    }
+}
+
+// ─── Sohbet hafızası (gün içi, numara-başı) ─────────────────────────────────
+// Modele geçmiş turlar verilir → bot "az önce ne konuştuk" bilir. Sessiz kalınan
+// turda da müşteri mesajı yazılır (bağlam kopmasın).
+function convoOf(phone) {
+    if (!state.convo) state.convo = {};
+    if (!Array.isArray(state.convo[phone])) state.convo[phone] = [];
+    return state.convo[phone];
+}
+
+function pushConvo(phone, role, text) {
+    const turns = Math.max(0, Number(config.historyTurns) || 0);
+    if (turns <= 0) { state.convo[phone] = []; return; }
+    const arr = convoOf(phone);
+    arr.push({ role, text: String(text || '').slice(0, 2000) });
+    // N tur ≈ 2N mesaj (soru + cevap).
+    const max = turns * 2;
+    if (arr.length > max) state.convo[phone] = arr.slice(-max);
+    saveState();
 }
 
 function addLog(entry) {
@@ -138,6 +185,7 @@ function setConfig(patch) {
         'enabled', 'provider', 'baseUrl', 'model', 'firmaNo', 'donemNo', 'businessName', 'paymentInfo',
         'extraInstructions', 'startHour', 'endHour', 'dailyCap', 'minGapSec',
         'onlySmsGonder', 'includeMovements',
+        'chatMode', 'historyTurns', 'maxReplyTokens',
         'maxThreadReplies', 'threadWindowMin', 'closeCooldownHours', 'closingMessage',
     ];
     for (const k of ALLOWED) if (patch[k] !== undefined) next[k] = patch[k];
@@ -153,9 +201,14 @@ function setConfig(patch) {
 
 function getStatus() {
     rollDay();
+    const metered = isMetered();
     return {
         enabled: config.enabled,
-        hasApiKey: hasApiKey(),
+        // Kontörlü modda anahtar aranmaz — "hazır mı" bilgisi kontöre bakar.
+        hasApiKey: metered ? true : hasApiKey(),
+        metered,
+        chatMode: !!config.chatMode,
+        credits: metered && deps?.credits ? deps.credits.getStatus() : null,
         provider: config.provider, model: config.model,
         firmaNo: config.firmaNo, donemNo: config.donemNo,
         sentToday: state.sent, dailyCap: config.dailyCap,
@@ -175,11 +228,15 @@ function withinHours() {
     return h >= s || h < e;                    // gece aşan
 }
 
-// ─── LLM sağlayıcıları (BYOK) — https, harici bağımlılık yok ─────────────────
-// Desteklenen: anthropic (Claude), openai (+OpenAI-uyumlu: OpenRouter/DeepSeek/Groq/
-// yerel — baseUrl ile), gemini (Google). Tek aktif sağlayıcı + tek anahtar.
-const PROVIDERS = ['anthropic', 'openai', 'gemini'];
+// ─── LLM sağlayıcıları — https, harici bağımlılık yok ────────────────────────
+// 'vega'  : KONTÖRLÜ. İstek kontör sunucusuna gider; API anahtarı orada, müşteride
+//           anahtar yok. Kontör gönderilen mesaj başına düşer (credits.js).
+// BYOK    : anthropic (Claude), openai (+OpenAI-uyumlu: OpenRouter/DeepSeek/Groq/
+//           yerel — baseUrl ile), gemini (Google). Müşteri kendi anahtarını girer,
+//           token parasını kendi öder, kontör harcanmaz.
+const PROVIDERS = ['vega', 'anthropic', 'openai', 'gemini'];
 const DEFAULT_MODEL = {
+    vega: 'claude-haiku-4-5',
     anthropic: 'claude-haiku-4-5',
     openai: 'gpt-4o-mini',
     gemini: 'gemini-2.0-flash',
@@ -190,7 +247,10 @@ const DEFAULT_BASE = {
     gemini: 'https://generativelanguage.googleapis.com/v1beta',
 };
 
-function normProvider(p) { return PROVIDERS.includes(p) ? p : 'anthropic'; }
+function normProvider(p) { return PROVIDERS.includes(p) ? p : 'vega'; }
+
+// Kontörlü mod mu? (BYOK'ta kontör harcanmaz.)
+function isMetered() { return normProvider(config.provider) === 'vega'; }
 
 // Ortak HTTPS POST → { statusCode, json }. url mutlak; baseUrl override desteği.
 function postJson(urlStr, headers, bodyObj) {
@@ -221,26 +281,46 @@ function postJson(urlStr, headers, bodyObj) {
     });
 }
 
-// Sağlayıcıya göre istek kur, tek düz metin cevap döndür.
-async function callLLM({ provider, baseUrl, apiKey, model, system, user, maxTokens = 500 }) {
+// Geçmiş + güncel mesajı sağlayıcı biçimine hazırla. Anthropic/Gemini ilk mesajın
+// 'user' olmasını şart koşar → baştaki assistant turları kırpılır.
+function normMessages(messages, user) {
+    let msgs = Array.isArray(messages) && messages.length
+        ? messages
+        : [{ role: 'user', text: String(user || '') }];
+    msgs = msgs
+        .filter(m => m && typeof m.text === 'string' && m.text.trim())
+        .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', text: m.text }));
+    while (msgs.length && msgs[0].role === 'assistant') msgs.shift();
+    return msgs;
+}
+
+// BYOK sağlayıcısına istek kur, tek düz metin cevap döndür.
+// messages = [{role:'user'|'assistant', text}] (geçmiş + güncel). Eski çağrılar
+// için `user` (tek metin) de kabul edilir.
+async function callLLM({ provider, baseUrl, apiKey, model, system, user, messages, maxTokens = 500 }) {
     const prov = normProvider(provider);
     const base = (baseUrl && baseUrl.trim().replace(/\/+$/, '')) || DEFAULT_BASE[prov];
     const mdl = (model && model.trim()) || DEFAULT_MODEL[prov];
+    const msgs = normMessages(messages, user);
+    if (!msgs.length) throw new Error('Gönderilecek mesaj yok.');
 
     if (prov === 'anthropic') {
         const { statusCode, json } = await postJson(`${base}/v1/messages`, {
             'x-api-key': apiKey, 'anthropic-version': '2023-06-01',
-        }, { model: mdl, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] });
+        }, {
+            model: mdl, max_tokens: maxTokens, system,
+            messages: msgs.map(m => ({ role: m.role, content: m.text })),
+        });
         if (statusCode !== 200) throw new Error(json?.error?.message || `HTTP ${statusCode}`);
         return (json.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
     }
 
     if (prov === 'gemini') {
-        // Anahtar query string'te; sistem yönergesi ayrı alanda.
+        // Anahtar query string'te; sistem yönergesi ayrı alanda. Asistan rolü 'model'.
         const url = `${base}/models/${encodeURIComponent(mdl)}:generateContent?key=${encodeURIComponent(apiKey)}`;
         const { statusCode, json } = await postJson(url, {}, {
             systemInstruction: { parts: [{ text: system }] },
-            contents: [{ role: 'user', parts: [{ text: user }] }],
+            contents: msgs.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.text }] })),
             generationConfig: { maxOutputTokens: maxTokens },
         });
         if (statusCode !== 200) throw new Error(json?.error?.message || `HTTP ${statusCode}`);
@@ -253,10 +333,32 @@ async function callLLM({ provider, baseUrl, apiKey, model, system, user, maxToke
         'authorization': `Bearer ${apiKey}`,
     }, {
         model: mdl, max_tokens: maxTokens,
-        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+        messages: [{ role: 'system', content: system }, ...msgs.map(m => ({ role: m.role, content: m.text }))],
     });
     if (statusCode !== 200) throw new Error(json?.error?.message || `HTTP ${statusCode}`);
     return (json?.choices?.[0]?.message?.content || '').trim();
+}
+
+// Tek giriş noktası: kontörlü ('vega') ya da BYOK — çağıran farkı bilmez.
+// Dönüş: { text, reservationId } — reservationId yalnız kontörlü modda dolu ve
+// mesaj gönderilince commit, gönderilmezse release edilmelidir.
+async function runModel({ system, messages, maxTokens }) {
+    if (isMetered()) {
+        if (!deps?.credits) { const e = new Error('Kontör istemcisi kurulu değil.'); e.code = 'NO_CREDITS_CLIENT'; throw e; }
+        const r = await deps.credits.chat({
+            system, messages: normMessages(messages), maxTokens, model: config.model,
+        });
+        if (!r.ok) { const e = new Error(r.error || r.code); e.code = r.code; throw e; }
+        return { text: r.reply, reservationId: r.reservationId, cost: r.cost, balance: r.balance };
+    }
+
+    const apiKey = getApiKey();
+    if (!apiKey) { const e = new Error('API anahtarı yok'); e.code = 'NO_KEY'; throw e; }
+    const text = await callLLM({
+        provider: config.provider, baseUrl: config.baseUrl, apiKey, model: config.model,
+        system, messages, maxTokens,
+    });
+    return { text, reservationId: null };
 }
 
 const fmtTR = (n) => (Number(n) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -289,9 +391,57 @@ function buildInvoiceText(inv) {
 }
 
 // ─── Sistem istemi (Türkçe) ──────────────────────────────────────────────────
-// Modele: yalnız KAPSAM içi (bakiye/ödeme/borç sebebi) sorulara cevap ver, aksi
-// halde tam olarak [SESSIZ] üret. Rakam uydurma; verilen bakiyeyi kullan.
+// chatMode AÇIK  → GENİŞ: neredeyse her mesaja cevap; [SESSIZ] dar bir alana çekilir.
+// chatMode KAPALI → DAR: yalnız bakiye/ödeme/borç sebebi; gerisi [SESSIZ].
+// Her iki modda da rakam uydurma ve taahhüt yasağı geçerlidir.
 function buildSystem() {
+    return config.chatMode ? buildSystemChat() : buildSystemNarrow();
+}
+
+function buildSystemChat() {
+    const biz = config.businessName?.trim();
+    const pay = config.paymentInfo?.trim();
+    const extra = config.extraInstructions?.trim();
+    return [
+        `Sen bir Türk işletmesinin${biz ? ` (${biz})` : ''} WhatsApp müşteri asistanısın. Müşterilerle (carilerle) doğal, sıcak ve profesyonel Türkçe konuşursun. Amacın müşteriyi karşılıksız bırakmamak: gelen hemen her mesaja yardımcı, kısa ve net bir cevap verirsin.`,
+        ``,
+        `CEVAP VERDİĞİN KONULAR (geniş):`,
+        `- Selamlaşma, hatır sorma, teşekkür, günlük nezaket sözleri → doğal karşılık ver.`,
+        `- Güncel bakiye / borç durumu → SADECE sana "GÜNCEL BAKİYE" olarak verilen rakamı kullan.`,
+        `- Ödeme / hesap bilgileri → sana verilen "ÖDEME BİLGİSİ" metnini paylaş.`,
+        `- Borç sebebi, son işlemler, hesap dökümü → sana verilen hareket özetini kullan.`,
+        `- İşletme hakkında genel sorular (çalışma saatleri, konum, iletişim, nasıl ödeme yapılır) → sana verilen bilgilerden cevapla; bilgi verilmemişse uydurma, "yetkilimiz en kısa sürede size dönecektir" de.`,
+        `- Sipariş/teslimat/ürün soruları → elinde bilgi varsa aktar; yoksa yetkiliye ileteceğini söyle.`,
+        `- Şikâyet, memnuniyetsizlik → önce anlayış göster, çözüm için yetkiliye ileteceğini söyle.`,
+        `- Kapsam dışı ya da alakasız sohbet → kısaca ve kibarca karşılık ver, konuyu işletmeyle ilgili yardıma yönlendir.`,
+        ``,
+        `DEĞİŞMEZ KURALLAR:`,
+        `1) RAKAM UYDURMA. Bakiye, fiyat, tarih, stok, vade, iskonto gibi hiçbir sayıyı kendin üretme. Yalnız sana açıkça verilen rakamları kullan. Verilmemişse "bu bilgiyi yetkilimiz teyit edip dönecektir" de.`,
+        `2) TAAHHÜT YASAĞI. Müşteri adına söz veremezsin: fiyat/iskonto/indirim, vade veya ödeme ertelemesi, teslimat tarihi, sipariş kabulü, iade, iptal, garanti kapsamı konularında ASLA kesin söz verme, pazarlık yapma, onay verme. Bu konularda tek doğru cevap: "Bu konuda yetkilimiz en kısa sürede size dönüş yapacaktır."`,
+        `3) BAKİYEYİ KENDİLİĞİNDEN SÖYLEME. Müşteri açıkça sormadıysa rakam veya bakiye yazma; selamlaşmaya bakiye ekleme.`,
+        `4) Sana "GÜNCEL BAKİYE: BİLİNMİYOR" verildiyse bakiye/borç sorulsa bile ASLA rakam söyleme; sistemden teyit edip döneceğini söyle.`,
+        `5) Bakiye "BORCU YOK" / 0 ise: "Güncel bir borcunuz bulunmamaktadır." de, rakam uydurma.`,
+        `6) MÜŞTERİ SİNİRLİ / KABA / HAKARET EDİYORSA: karşılık verme, tartışmaya girme, savunma yapma. Sakin, en fazla iki cümle, gerekirse özür dile ve yardım teklif et.`,
+        `7) BAŞKASININ BİLGİSİ İSTENİRSE (başka firma/kişi bakiyesi vb.) verme; yalnız yazan müşterinin kendi hesabı hakkında konuş.`,
+        `8) Bilmediğin bir şeyi bildiğin gibi anlatma. Emin değilsen yetkiliye ileteceğini söyle.`,
+        ``,
+        `SESSİZ KALMAN GEREKEN DAR DURUMLAR — bu hâllerde tam olarak [SESSIZ] üret (hiçbir şey yazma, insana bırakılır):`,
+        `- Hukuki tehdit, avukat/icra/mahkeme/şikâyet başvurusu içeren mesajlar.`,
+        `- Ciddi şikâyet, tazminat/iade talebi ya da yönetici müdahalesi gereken konular.`,
+        `- Anlaşılmayan, bozuk, spam veya boş mesajlar.`,
+        `- Sana verilmemiş bilgiyi uydurmadan cevaplamanın mümkün olmadığı, hassas konular.`,
+        pay ? null : `- Ödeme bilgisi isteniyor ama sana ÖDEME BİLGİSİ verilmemiş.`,
+        ``,
+        `ETİKETLER:`,
+        `- Müşteri "neden borcum var / bu borç nereden / hesap dökümü / ekstre / detay" gibi DÖKÜM/EKSTRE isterse cevabına [EKSTRE] etiketini ekle ve tek cümle kısa açıklama yaz (örn. "[EKSTRE] Hesap ekstreniz ektedir."). Sistem PDF ekstreyi otomatik ekler.`,
+        `- Müşteri "son faturam / faturamı gönder / fatura içeriği / ne aldım / fatura kalemleri" isterse cevabına [FATURA] etiketini ekle ve tek cümle yaz. Sistem fatura kalemlerini otomatik ekler; kalem/rakam yazma.`,
+        ``,
+        `ÜSLUP: Kısa tut (1-5 cümle). Emoji kullanma. Yanıtında köşeli parantez [ ] kullanma (yalnız yukarıdaki etiketler hariç). Doğal konuş, robot gibi tekrar etme; aynı cümleyi her mesajda kurma.`,
+        extra ? `\nEk talimat: ${extra}` : '',
+    ].filter(l => l !== null).join('\n');
+}
+
+function buildSystemNarrow() {
     const biz = config.businessName?.trim();
     const pay = config.paymentInfo?.trim();
     const extra = config.extraInstructions?.trim();
@@ -327,6 +477,9 @@ function buildUser(ctx, incomingText) {
             : ctx.net < 0 ? 'ALACAKLI (biz borçluyuz)'
             : 'BORCU YOK (bakiye kapalı — borç/alacak bulunmuyor)';
         lines.push(`GÜNCEL BAKİYE: ${fmtTR(Math.abs(ctx.net))} TL — ${durum}`);
+    } else if (config.chatMode) {
+        // Geniş modda sessiz kalmak yerine dürüst cevap: rakam yok, teyit sözü var.
+        lines.push(`GÜNCEL BAKİYE: BİLİNMİYOR — bakiye şu an sorgulanamadı; ASLA rakam söyleme, "yetkilimiz teyit edip dönecektir" de.`);
     } else {
         lines.push(`GÜNCEL BAKİYE: BİLİNMİYOR — bakiye şu an sorgulanamadı; bakiye/borç sorulsa bile ASLA rakam söyleme, [SESSIZ] üret.`);
     }
@@ -365,8 +518,20 @@ async function handleIncoming({ phone, text, jid, id }) {
 }
 
 async function handleIncomingInner({ phone, text, jid, id }) {
-    const apiKey = getApiKey();
-    if (!apiKey) { addLog({ phone, kind: 'skip', reason: 'API anahtarı yok' }); return; }
+    // Sağlayıcı hazırlık kontrolü: kontörlü modda anahtar değil KONTÖR aranır.
+    if (isMetered()) {
+        if (!deps.credits) { addLog({ phone, kind: 'skip', reason: 'kontör istemcisi yok' }); return; }
+        if (!deps.credits.hasIdentity()) {
+            addLog({ phone, kind: 'skip', reason: 'kontörlü AI için lisans gerekli (deneme sürümünde kapalı)' }); return;
+        }
+        // Önbellekteki bakiye sıfırsa modeli hiç çağırma (boş ağ turu olmasın).
+        // Kesin karar sunucuda; uzaktan kontör yüklenince bir sonraki tazelemede açılır.
+        if (deps.credits.likelyOutOfCredit()) {
+            addLog({ phone, kind: 'skip', reason: 'kontör bitti — yeni kontör yüklenmesi gerekiyor' }); return;
+        }
+    } else if (!getApiKey()) {
+        addLog({ phone, kind: 'skip', reason: 'API anahtarı yok' }); return;
+    }
 
     if (!withinHours()) { addLog({ phone, kind: 'skip', reason: 'çalışma saati dışı' }); return; }
     if (state.sent >= Number(config.dailyCap || 0) && Number(config.dailyCap) > 0) {
@@ -447,25 +612,45 @@ async function handleIncomingInner({ phone, text, jid, id }) {
         }
     } catch (e) { console.error('[AIBot] bağlam hatası:', e.message); }
 
-    // Modeli çağır.
+    // Modeli çağır. Geçmiş turlar ham metin; güncel mesaj bağlam bloğuyla sarılır
+    // (bakiye/hareket her turda tazelenir, eski turdaki rakam yeniden kullanılmaz).
+    const history = convoOf(phone).slice();
+    const messages = [...history, { role: 'user', text: buildUser(ctx, text) }];
+
     let reply = '';
+    let reservationId = null;
     try {
-        reply = await callLLM({
-            provider: config.provider, baseUrl: config.baseUrl, apiKey, model: config.model,
-            system: buildSystem(), user: buildUser(ctx, text),
+        const out = await runModel({
+            system: buildSystem(),
+            messages,
+            maxTokens: Number(config.maxReplyTokens) || 800,
         });
+        reply = out.text;
+        reservationId = out.reservationId;
     } catch (e) {
-        addLog({ phone, name: ctx.name, kind: 'error', reason: 'API: ' + e.message });
+        // Kontör bitti / hesap kapalı → kullanıcıya sebebi ayırt edilebilir yazılır.
+        const meteredCode = e.code && ['NO_CREDIT', 'DAILY_CAP', 'ACCOUNT_BLOCKED'].includes(e.code);
+        addLog({
+            phone, name: ctx.name,
+            kind: meteredCode ? 'skip' : 'error',
+            reason: (meteredCode ? '' : 'API: ') + e.message,
+        });
         return;
     }
 
+    // Sessiz kalınan turda da müşteri mesajı hafızaya yazılır (bağlam kopmasın).
+    pushConvo(phone, 'user', text);
+
     // Kapsam dışı / emin değil → sessiz kal (mesaj gönderme).
+    // KONTÖR DÜŞMEZ: rezervasyon iptal edilir (yalnız giden mesajdan ücret alınır).
     if (!reply || /\[SESSIZ\]/i.test(reply)) {
+        if (reservationId && deps.credits) await deps.credits.release(reservationId);
         addLog({ phone, name: ctx.name, kind: 'silent', incoming: text.slice(0, 80) });
         return;
     }
 
     if (!deps.waStatus || !deps.waStatus().ready) {
+        if (reservationId && deps.credits) await deps.credits.release(reservationId);
         addLog({ phone, name: ctx.name, kind: 'skip', reason: 'WhatsApp bağlı değil' }); return;
     }
 
@@ -492,7 +677,10 @@ async function handleIncomingInner({ phone, text, jid, id }) {
 
     // Ekstre istendi ama üretilemediyse: en azından metin varsa onu gönder, yoksa sessiz.
     const outText = caption || (media ? 'Hesap ekstreniz ektedir.' : '');
-    if (!outText && !media) { addLog({ phone, name: ctx.name, kind: 'silent', incoming: text.slice(0, 80) }); return; }
+    if (!outText && !media) {
+        if (reservationId && deps.credits) await deps.credits.release(reservationId);
+        addLog({ phone, name: ctx.name, kind: 'silent', incoming: text.slice(0, 80) }); return;
+    }
 
     const r = await deps.waSend(phone, outText, media, { simulateTyping: true, typingMs: 1200, channel: 'aibot' });
     if (r && r.success) {
@@ -501,20 +689,45 @@ async function handleIncomingInner({ phone, text, jid, id }) {
         // Tartışma sayacı: bu numaraya verilen bot cevabı (eşiğe yaklaşınca sohbet kapanır).
         th.n = (th.n || 0) + 1; th.since = th.since || Date.now(); th.name = ctx.name; state.thread[phone] = th;
         saveState();
+        pushConvo(phone, 'assistant', outText);
         if (deps.recordSent) deps.recordSent(); // anti-ban gün/saat sayacı
-        addLog({ phone, name: ctx.name, kind: 'reply', incoming: text.slice(0, 80), reply: (media ? '[EKSTRE PDF] ' : '') + outText.slice(0, 200) });
+
+        // KONTÖR BURADA DÜŞER — mesaj müşteriye gerçekten gitti.
+        let spent = null, balance = null;
+        if (reservationId && deps.credits) {
+            const c = await deps.credits.commit(reservationId, ctx.name || phone);
+            if (c.ok) { spent = c.spent; balance = c.balance; }
+        }
+        addLog({
+            phone, name: ctx.name, kind: 'reply', incoming: text.slice(0, 80),
+            reply: (media ? '[EKSTRE PDF] ' : '') + outText.slice(0, 200),
+            ...(spent != null ? { credit: spent, balance } : {}),
+        });
     } else {
+        // Gönderilemedi → kontör düşmez.
+        if (reservationId && deps.credits) await deps.credits.release(reservationId);
         addLog({ phone, name: ctx.name, kind: 'error', reason: 'gönderim: ' + (r?.error || 'bilinmiyor') });
     }
 }
 
-// Anahtar geçerliliğini sınamak için minik çağrı (UI "Anahtarı Sına").
+// Bağlantı sınaması (UI "Sına"). Kontörlü modda anahtar yoktur: kontör
+// sunucusuna erişim + bakiye sınanır, model ÇAĞRILMAZ (boşuna kontör yanmasın).
 async function testApiKey(rawKey, opts = {}) {
+    const prov = normProvider(opts.provider || config.provider);
+
+    if (prov === 'vega') {
+        if (!deps?.credits) throw new Error('Kontör istemcisi kurulu değil.');
+        if (!deps.credits.hasIdentity()) throw new Error('Kontörlü AI için lisans gerekli (deneme sürümünde kapalıdır).');
+        const t = await deps.credits.test();
+        if (t.error) throw new Error(t.error);
+        return { ok: true, sample: `kontör sunucusu hazır — kalan kontör: ${t.balance ?? 0}` };
+    }
+
     const key = (rawKey && rawKey.trim()) || getApiKey();
     if (!key) throw new Error('Anahtar yok.');
     // UI'da kaydetmeden sınama: gönderilen provider/baseUrl/model'i kullan, yoksa config.
     const text = await callLLM({
-        provider: opts.provider || config.provider,
+        provider: prov,
         baseUrl: opts.baseUrl !== undefined ? opts.baseUrl : config.baseUrl,
         model: opts.model || config.model,
         apiKey: key, maxTokens: 16,

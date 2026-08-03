@@ -2039,6 +2039,7 @@ async function initAiBotView() {
         $('ab_save').onclick = saveAiBot;
         $('ab_test').onclick = testAiBotKey;
         $('ab_provider').onchange = () => abApplyProvider(true);
+        $('ab_kontorRefresh').onclick = () => abRefreshKontor(true);
         abLoaded = true;
     }
     await loadAiBotConfig();
@@ -2067,20 +2068,66 @@ async function loadAbDonemler(selectDonem) {
 }
 
 // Sağlayıcı meta: varsayılan model, anahtar placeholder, "anahtar al" linki.
+// vega = kontörlü: anahtar yok, ücret gönderilen mesaj başına kontör.
 const AB_PROVIDERS = {
+    vega:      { model: 'claude-haiku-4-5', metered: true },
     anthropic: { model: 'claude-haiku-4-5', keyPh: 'sk-ant-...', link: 'https://console.anthropic.com/settings/keys', linkT: 'console.anthropic.com' },
     openai:    { model: 'gpt-4o-mini',      keyPh: 'sk-...',     link: 'https://platform.openai.com/api-keys',       linkT: 'platform.openai.com' },
     gemini:    { model: 'gemini-2.0-flash', keyPh: 'AIza...',    link: 'https://aistudio.google.com/app/apikey',      linkT: 'aistudio.google.com' },
 };
 
-// Sağlayıcı değişince placeholder/link güncelle. resetModel=true → model kutusunu varsayılana çek.
+// Sağlayıcı değişince placeholder/link + kontör paneli görünürlüğü güncellenir.
+// resetModel=true → model kutusunu varsayılana çek.
 function abApplyProvider(resetModel) {
-    const p = AB_PROVIDERS[$('ab_provider').value] || AB_PROVIDERS.anthropic;
+    const p = AB_PROVIDERS[$('ab_provider').value] || AB_PROVIDERS.vega;
     $('ab_model').placeholder = p.model;
-    $('ab_apiKey').placeholder = p.keyPh + ' (değişmeyecekse boş bırak)';
-    const link = $('ab_keyLink');
-    if (link) { link.href = p.link; link.textContent = p.linkT + ' → anahtar al'; }
+    // Kontörlü modda anahtar alanı anlamsız → gizle, yerine açıklama göster.
+    $('ab_keyBox').style.display = p.metered ? 'none' : '';
+    $('ab_meteredNote').style.display = p.metered ? '' : 'none';
+    $('ab_kontorCard').style.display = p.metered ? '' : 'none';
+    $('ab_test').textContent = p.metered ? 'Kontör Sunucusunu Sına' : 'Anahtarı Sına';
+    if (!p.metered) {
+        $('ab_apiKey').placeholder = p.keyPh + ' (değişmeyecekse boş bırak)';
+        const link = $('ab_keyLink');
+        if (link) { link.href = p.link; link.textContent = p.linkT + ' → anahtar al'; }
+    }
     if (resetModel) $('ab_model').value = p.model;
+    if (p.metered) abRefreshKontor();
+}
+
+// ─── Kontör paneli ──────────────────────────────────────────────────────────
+// Bakiye kontör sunucusundadır; burada yalnız gösterilir. Yükleme uzaktan yapılır.
+async function abRefreshKontor(force) {
+    const card = $('ab_kontorCard');
+    if (!card || card.style.display === 'none') return;
+    const r = await api(force === true ? '/credits/refresh' : '/credits', force === true ? { method: 'POST' } : {});
+    const c = r && r.credits;
+    if (!c) return;
+    abPaintKontor(c);
+}
+
+function abPaintKontor(c) {
+    const bal = $('ab_kontorBalance');
+    if (!bal) return;
+    bal.textContent = (c.balance != null && c.known) ? c.balance : '—';
+    bal.style.color = c.low ? 'var(--danger, #dc2626)' : '';
+
+    const parts = [];
+    if (c.sentToday != null) parts.push(`bugün ${c.sentToday} mesaj`);
+    if (c.dailyCap) parts.push(`günlük çağrı ${c.callsToday ?? 0}/${c.dailyCap}`);
+    if (c.lastSync) parts.push('son kontrol ' + new Date(c.lastSync).toLocaleTimeString('tr-TR'));
+    $('ab_kontorInfo').textContent = parts.join(' · ') || '—';
+    $('ab_kontorHw').textContent = c.hardwareId ? 'Kimlik: ' + c.hardwareId : '';
+
+    const warn = $('ab_kontorWarnBox');
+    let msg = '';
+    if (!c.hasIdentity) msg = 'Kontörlü AI için lisans gerekli — deneme sürümünde kapalıdır.';
+    else if (c.blocked) msg = 'Kontör hesabınız kapalı. Tedarikçinizle görüşün.';
+    else if (c.lastError) msg = c.lastError;
+    else if (c.known && c.balance <= 0) msg = 'Kontör bitti — bot cevap veremez. Kontör yüklenmesi için tedarikçinizle görüşün.';
+    else if (c.low) msg = `Kontör azaldı (${c.balance}). Tedarikçinizden yükleme isteyin.`;
+    warn.textContent = msg;
+    warn.style.display = msg ? '' : 'none';
 }
 
 async function loadAiBotConfig() {
@@ -2088,10 +2135,21 @@ async function loadAiBotConfig() {
     if (!r.success) return;
     const c = r.config;
     $('ab_enabled').checked = !!c.enabled;
-    $('ab_provider').value = c.provider || 'anthropic';
+    $('ab_chatMode').checked = c.chatMode !== false;
+    $('ab_provider').value = c.provider || 'vega';
     $('ab_model').value = c.model || '';
     $('ab_baseUrl').value = c.baseUrl || '';
+    $('ab_history').value = c.historyTurns ?? 10;
+    $('ab_maxTokens').value = c.maxReplyTokens ?? 800;
     abApplyProvider(false);
+    // Kontör ayarları ayrı uçtan gelir (bakiye sunucuda tutulur).
+    const kr = await api('/credits');
+    if (kr && kr.credits) {
+        $('ab_kontorUrl').value = kr.credits.endpointCustom ? kr.credits.endpoint : '';
+        $('ab_kontorUrl').placeholder = kr.credits.endpoint || 'https://vega-kontor.workers.dev';
+        $('ab_kontorWarn').value = kr.credits.lowWarn ?? 50;
+        abPaintKontor(kr.credits);
+    }
     $('ab_apiKey').value = '';
     $('ab_keyState').textContent = c.hasApiKey ? '(kayıtlı ✓)' : '(girilmedi)';
     const ctx = (typeof localContext === 'function') ? localContext() : {};
@@ -2117,9 +2175,12 @@ async function saveAiBot() {
     $('ab_err').textContent = '';
     const patch = {
         enabled: $('ab_enabled').checked,
+        chatMode: $('ab_chatMode').checked,
         provider: $('ab_provider').value,
         model: $('ab_model').value.trim(),
         baseUrl: $('ab_baseUrl').value.trim(),
+        historyTurns: Number($('ab_history').value) || 0,
+        maxReplyTokens: Number($('ab_maxTokens').value) || 800,
         firmaNo: $('ab_firma').value || null,
         donemNo: $('ab_donem').value || null,
         businessName: $('ab_businessName').value.trim(),
@@ -2137,6 +2198,20 @@ async function saveAiBot() {
     };
     const key = $('ab_apiKey').value.trim();
     if (key) patch.apiKey = key;
+
+    // Kontör ayarları ayrı uçta (bakiye sunucuda; burada yalnız adres/uyarı eşiği).
+    const kr = await api('/credits/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            endpoint: $('ab_kontorUrl').value.trim(),
+            lowWarn: Number($('ab_kontorWarn').value) || 0,
+            // Model yalnız kontörlü modda kontör sunucusuna geçer; BYOK modelini
+            // oraya yazmak sunucudaki izinli model listesini bozar.
+            ...($('ab_provider').value === 'vega' ? { model: $('ab_model').value.trim() || undefined } : {}),
+        }),
+    });
+    if (kr && kr.credits) abPaintKontor(kr.credits);
+
     const r = await api('/aibot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
     if (r.success) {
         $('ab_apiKey').value = '';
@@ -2164,9 +2239,14 @@ async function testAiBotKey() {
 function abStatus(st) {
     if (!st) return;
     const on = st.enabled ? 'AÇIK' : 'kapalı';
-    const key = st.hasApiKey ? 'anahtar var' : 'anahtar YOK';
-    const prov = st.provider ? ` · ${st.provider}` : '';
-    $('ab_status').textContent = `Bot: ${on}${prov} · ${key} · bugün ${st.sentToday}/${st.dailyCap} cevap · saat ${st.startHour}:00–${st.endHour}:00`;
+    const prov = st.metered ? ' · kontörlü' : (st.provider ? ` · ${st.provider}` : '');
+    const key = st.metered
+        ? (st.credits && st.credits.known ? `${st.credits.balance} kontör` : 'kontör okunamadı')
+        : (st.hasApiKey ? 'anahtar var' : 'anahtar YOK');
+    const mode = st.chatMode ? 'sohbet modu' : 'dar kapsam';
+    $('ab_status').textContent = `Bot: ${on}${prov} · ${key} · ${mode} · bugün ${st.sentToday}/${st.dailyCap} cevap · saat ${st.startHour}:00–${st.endHour}:00`;
+    // Kontör bakiyesi durum akışıyla birlikte tazelenir (uzaktan yükleme görünür olsun).
+    if (st.metered && st.credits) abPaintKontor(st.credits);
 }
 
 const AB_KIND = {
@@ -2191,8 +2271,12 @@ async function abRefreshLog() {
             : e.kind === 'silent'
                 ? `<div style="font-size:12px;color:#64748b">↩ ${esc(e.incoming || '')}</div>`
                 : `<div style="font-size:12px;color:#64748b">${esc(e.reason || '')}</div>`;
+        // Kontörlü modda düşen kontör + kalan bakiye rozeti.
+        const credit = (e.credit != null)
+            ? ` <span class="muted" style="font-size:11px">· −${e.credit} kontör${e.balance != null ? ` (kalan ${e.balance})` : ''}</span>`
+            : '';
         return `<div style="padding:8px; border-bottom:1px solid var(--border)">
-            <div style="font-size:13px"><b style="color:${k.c}">${k.t}</b> · ${who} <span class="muted" style="font-size:11px">${time}</span></div>
+            <div style="font-size:13px"><b style="color:${k.c}">${k.t}</b> · ${who} <span class="muted" style="font-size:11px">${time}</span>${credit}</div>
             ${detail}
         </div>`;
     }).join('');

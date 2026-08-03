@@ -420,29 +420,37 @@
             <!-- SOL: Ayarlar -->
             <div class="card">
                 <h2>AI Oto-Yanıt</h2>
-                <p class="sub">Gelen mesajlara <b>seçmeli</b> otomatik cevap: yalnız bakiye, ödeme bilgisi ve borç sebebi sorularına yanıt verir; diğerlerine sessiz kalır. Yalnız cari kartında kayıtlı numaralara cevap verilir.</p>
+                <p class="sub">Gelen mesajlara otomatik cevap. <b>Sohbet modu</b> açıkken selamlaşmadan bakiye ve ödeme sorularına kadar hemen her mesaja yanıt verir; kapalıyken yalnız bakiye/ödeme/borç sebebi. Yalnız cari kartında kayıtlı numaralara cevap verilir.</p>
 
-                <label class="check" style="margin:0 0 12px"><input type="checkbox" id="ab_enabled" /> <b>Botu aç</b></label>
+                <label class="check" style="margin:0 0 8px"><input type="checkbox" id="ab_enabled" /> <b>Botu aç</b></label>
+                <label class="check" style="margin:0 0 12px"><input type="checkbox" id="ab_chatMode" /> <b>Sohbet modu</b> — neredeyse her mesaja cevap ver (kapalıyken yalnız bakiye/ödeme)</label>
 
                 <div class="row">
                     <div class="field">
                         <label>Sağlayıcı</label>
                         <select id="ab_provider">
-                            <option value="anthropic">Anthropic (Claude)</option>
-                            <option value="openai">OpenAI (ChatGPT)</option>
-                            <option value="gemini">Google (Gemini)</option>
+                            <option value="vega">Vega Kontör (anahtar gerekmez)</option>
+                            <option value="anthropic">Anthropic (Claude) — kendi anahtarım</option>
+                            <option value="openai">OpenAI (ChatGPT) — kendi anahtarım</option>
+                            <option value="gemini">Google (Gemini) — kendi anahtarım</option>
                         </select>
                     </div>
                     <div class="field"><label>Model</label><input id="ab_model" placeholder="claude-haiku-4-5" /></div>
                 </div>
 
-                <div class="field">
-                    <label>API Anahtarı <span class="muted" id="ab_keyState"></span></label>
-                    <input id="ab_apiKey" type="password" placeholder="değişmeyecekse boş bırak" />
-                    <div class="hint">Bu bilgisayarda <b>şifreli</b> saklanır. <a id="ab_keyLink" href="https://console.anthropic.com/settings/keys" target="_blank">anahtar al →</a></div>
+                <!-- Kontörlü mod: anahtar alanı gizlenir -->
+                <div id="ab_keyBox">
+                    <div class="field">
+                        <label>API Anahtarı <span class="muted" id="ab_keyState"></span></label>
+                        <input id="ab_apiKey" type="password" placeholder="değişmeyecekse boş bırak" />
+                        <div class="hint">Bu bilgisayarda <b>şifreli</b> saklanır. <a id="ab_keyLink" href="https://console.anthropic.com/settings/keys" target="_blank">anahtar al →</a></div>
+                    </div>
+                </div>
+                <div class="hint" id="ab_meteredNote" style="display:none; margin:-4px 0 8px">
+                    Kontörlü mod: API anahtarı gerekmez, ücret <b>gönderilen mesaj başına kontör</b> olarak düşer. Sessiz kalınan ya da gönderilemeyen cevaplardan <b>kontör düşmez</b>.
                 </div>
                 <div class="toolbar" style="margin:-4px 0 8px">
-                    <button class="btn ghost sm" id="ab_test">Anahtarı Sına</button>
+                    <button class="btn ghost sm" id="ab_test">Sına</button>
                     <span class="hint" id="ab_testResult" style="display:none"></span>
                 </div>
 
@@ -477,11 +485,23 @@
                     </div>
                     <label class="check"><input type="checkbox" id="ab_onlySms" /> Yalnız 'SMS Gönder' izinli carilere cevap ver</label>
                     <label class="check" style="margin-top:6px"><input type="checkbox" id="ab_movements" /> Borç sebebi için son işlemleri bağlama ekle</label>
+                    <div class="row" style="margin-top:10px">
+                        <div class="field"><label>Hatırlanan Tur (sohbet hafızası)</label><input id="ab_history" type="number" min="0" max="30" /></div>
+                        <div class="field"><label>Cevap Uzunluk Tavanı (token)</label><input id="ab_maxTokens" type="number" min="100" max="1500" /></div>
+                    </div>
+                    <div class="hint" style="margin:-4px 0 6px">Hafıza gün içinde tutulur, gece sıfırlanır. 0 = hafızasız (her mesaj bağımsız).</div>
+
                     <div class="field" style="margin-top:10px">
                         <label>Özel Uç (OpenAI-uyumlu) <span class="muted">opsiyonel</span></label>
                         <input id="ab_baseUrl" placeholder="https://openrouter.ai/api/v1" />
                         <div class="hint">Boşsa sağlayıcı varsayılan ucu. OpenRouter / DeepSeek / Groq / yerel için sağlayıcıyı <b>OpenAI</b> seçip uç adresini buraya yazın.</div>
                     </div>
+
+                    <div class="row" style="margin-top:10px">
+                        <div class="field"><label>Kontör Sunucusu <span class="muted">boşsa varsayılan</span></label><input id="ab_kontorUrl" placeholder="https://vega-kontor.workers.dev" /></div>
+                        <div class="field"><label>Düşük Kontör Uyarısı</label><input id="ab_kontorWarn" type="number" min="0" /></div>
+                    </div>
+                    <div class="hint" style="margin:-4px 0 6px">Kontör sunucusu adresini tedarikçiniz söylemedikçe değiştirmeyin.</div>
 
                     <div class="row" style="margin-top:10px">
                         <div class="field"><label>Tartışma Kapanış Eşiği (cevap)</label><input id="ab_maxThread" type="number" min="0" /></div>
@@ -500,13 +520,28 @@
                 <div class="err" id="ab_err"></div>
             </div>
 
-            <!-- SAĞ: Durum + canlı kayıt -->
+            <!-- SAĞ: Kontör + durum + canlı kayıt -->
             <div class="panel">
+                <div class="card" id="ab_kontorCard" style="display:none">
+                    <h2>Kontör</h2>
+                    <div style="display:flex; align-items:baseline; gap:10px; margin:4px 0 6px">
+                        <div id="ab_kontorBalance" style="font-size:32px; font-weight:700; line-height:1">—</div>
+                        <div class="muted" style="font-size:13px">kontör kaldı</div>
+                    </div>
+                    <div class="muted" id="ab_kontorInfo" style="font-size:12px; margin-bottom:8px">—</div>
+                    <div id="ab_kontorWarnBox" class="err" style="display:none; margin-bottom:8px"></div>
+                    <p class="sub" style="margin-top:0">Kontör <b>yalnız müşteriye giden mesajdan</b> düşer. Yükleme tedarikçiniz tarafından <b>uzaktan</b> yapılır; yüklendiğinde burada kendiliğinden görünür.</p>
+                    <div class="toolbar">
+                        <button class="btn ghost sm" id="ab_kontorRefresh">Bakiyeyi Yenile</button>
+                        <span class="hint" id="ab_kontorHw"></span>
+                    </div>
+                </div>
+
                 <div class="card">
                     <h2>Durum</h2>
                     <div class="muted" id="ab_status" style="font-size:13px; margin-bottom:8px">—</div>
-                    <p class="sub" style="margin-top:0">Kararlar: <b>cevap</b>, <b>sessiz</b> (kapsam dışı), <b>atlandı</b> (numara yok / saat dışı / tavan).</p>
-                    <div class="log" id="ab_log" style="max-height:520px"></div>
+                    <p class="sub" style="margin-top:0">Kararlar: <b>cevap</b>, <b>sessiz</b> (kapsam dışı), <b>atlandı</b> (numara yok / saat dışı / tavan / kontör).</p>
+                    <div class="log" id="ab_log" style="max-height:420px"></div>
                 </div>
             </div>
         </div>

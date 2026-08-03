@@ -524,6 +524,20 @@ function activate(content) {
     return { ok: true, license: getStatus() };
 }
 
+// Kontör sunucusuna (Cloudflare Worker) gönderilen KİMLİK KANITI.
+// Ayrı bir parola/jeton dağıtmak yerine mevcut imzalı lisans kullanılır:
+//   { p: <payload'un JSON metni>, s: <base64 imza> }
+// Worker imzayı TAM OLARAK gönderilen p baytları üzerinde doğrular; payload
+// orada yeniden serileştirilmez (anahtar sırası farkı imzayı bozmasın).
+// Lisans yoksa (deneme sürümü) null → kontörlü AI kullanılamaz.
+function getLicenseProof() {
+    const stored = readStoredLicense();
+    if (!stored || !stored.license) return null;
+    const { payload, signature } = stored.license;
+    if (!payload || !signature) return null;
+    return { p: JSON.stringify(payload), s: String(signature) };
+}
+
 // Lisansı diskten kaldır (destek/hata ayıklama). Deneme süresi geri gelmez —
 // deneme başlangıcı ayrı saklanır ve dolmuşsa dolu kalır.
 function deactivate() {
@@ -540,6 +554,7 @@ module.exports = {
     isAllowed,
     getStatus,
     getHardwareId,
+    getLicenseProof,
     activate,
     deactivate,
     verifySignature,

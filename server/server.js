@@ -35,6 +35,7 @@ const watcher = require('./watcher');
 const reminders = require('./reminders');
 const activeCari = require('./activeCari');
 const aiBot = require('./aiBot');
+const credits = require('./credits');
 const license = require('./license');
 const antiban = require('./antiban');
 const stats = require('./stats');
@@ -1100,6 +1101,7 @@ app.post('/api/aibot', (req, res) => {
         'enabled', 'apiKey', 'clearApiKey', 'provider', 'baseUrl', 'model', 'firmaNo', 'donemNo',
         'businessName', 'paymentInfo', 'extraInstructions', 'startHour', 'endHour',
         'dailyCap', 'minGapSec', 'onlySmsGonder', 'includeMovements',
+        'chatMode', 'historyTurns', 'maxReplyTokens',
         'maxThreadReplies', 'threadWindowMin', 'closeCooldownHours', 'closingMessage',
     ];
     const patch = {};
@@ -1118,6 +1120,38 @@ app.post('/api/aibot/test', async (req, res) => {
         const b = req.body || {};
         const out = await aiBot.testApiKey(b.apiKey, { provider: b.provider, baseUrl: b.baseUrl, model: b.model });
         res.json({ success: true, ...out });
+    } catch (err) {
+        res.status(200).json({ success: false, message: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  KONTÖR (kontörlü AI bakiyesi)
+//  Bakiye kontör sunucusunda tutulur; burada yalnız okunur/gösterilir.
+//  Yükleme UZAKTAN yapılır (lisans yöneticisi → Kontör) — bu tarafta yükleme ucu
+//  YOKTUR; olsaydı müşteri kendine kontör yazabilirdi.
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/credits', (req, res) => {
+    res.json({ success: true, credits: credits.getStatus() });
+});
+
+// Bakiyeyi sunucudan tazele (UI "Yenile" + kontör yüklendi bildirimi sonrası).
+app.post('/api/credits/refresh', async (req, res) => {
+    try {
+        await credits.refresh();
+        res.json({ success: true, credits: credits.getStatus() });
+    } catch (err) {
+        res.status(200).json({ success: false, message: err.message, credits: credits.getStatus() });
+    }
+});
+
+// Sunucu adresi / model / düşük bakiye uyarı eşiği.
+app.post('/api/credits/config', async (req, res) => {
+    try {
+        const b = req.body || {};
+        credits.setConfig({ endpoint: b.endpoint, model: b.model, lowWarn: b.lowWarn });
+        await credits.refresh();
+        res.json({ success: true, credits: credits.getStatus() });
     } catch (err) {
         res.status(200).json({ success: false, message: err.message });
     }
@@ -2428,6 +2462,14 @@ app.get('*', (req, res) => {
 // Çevrimdışı lisans: data/ altındaki şifreli lisans deposu + deneme sayacı.
 license.configure({ baseDir });
 
+// Kontör istemcisi: kontörlü ("vega") AI sağlayıcısının bakiye/çağrı katmanı.
+// Kimlik olarak imzalı lisans kullanılır → ayrı parola/jeton dağıtılmaz.
+credits.configure({
+    baseDir,
+    getLicenseProof: () => license.getLicenseProof(),
+    getHardwareId: () => license.getHardwareId(),
+});
+
 // Lisans geçersizken çalışan her şeyi durdur. API kapısı manuel gönderimi zaten
 // keser; bu, ARKA PLAN otomasyonunu (watcher/hatırlatma/aktif cari) susturur —
 // aksi halde deneme dolduktan sonra da mesaj atmayı sürdürürdü.
@@ -2504,6 +2546,7 @@ activeCari.configure({ getPool: () => pool, sql });
 // AI oto-yanıt botu: gelen WA mesajlarına Claude Haiku ile SEÇMELİ cevap.
 // Anahtar config.json'daki DB parolasıyla aynı makine anahtarıyla şifrelenir.
 aiBot.configure({
+    credits,                       // kontörlü ('vega') sağlayıcı: çağrı + kontör düşme
     getPool: () => pool,
     sql,
     findCariByPhone,
