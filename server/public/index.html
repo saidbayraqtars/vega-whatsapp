@@ -805,24 +805,35 @@
                 <input id="lg_hwid" readonly style="font-family:monospace; font-size:14px; letter-spacing:1px" />
                 <button class="btn ghost sm" id="lg_copy" style="white-space:nowrap">Kopyala</button>
             </div>
-            <div class="hint">Bu kimliği tedarikçinize gönderin; size özel bir lisans dosyası üretilecek. Lisans başka bilgisayarda çalışmaz.</div>
+            <div class="hint">Bu kimliği tedarikçinize gönderin; size özel lisans tanımlanacak. Lisans başka bilgisayarda çalışmaz.</div>
         </div>
 
         <div class="contact">
             <div class="contact-t">Lisans için iletişime geçin</div>
             <a class="contact-n" href="https://wa.me/905461914055" target="_blank" rel="noopener">0546 191 40 55</a>
-            <div class="contact-s">Yukarıdaki <b>Donanım Kimliği</b>'ni bu numaraya iletin; size özel lisans dosyanız gönderilecek.</div>
+            <div class="contact-s">Yukarıdaki <b>Donanım Kimliği</b>'ni bu numaraya iletin. Lisansınız tanımlandığı anda bu ekran <b>kendiliğinden</b> açılır — dosya yüklemenize gerek yoktur.</div>
         </div>
 
         <div class="field">
-            <label>Lisans Dosyası (.lic)</label>
-            <input type="file" id="lg_file" accept=".lic,.json,application/json,text/plain" />
+            <div id="lg_waitBox" class="hint" style="display:flex; align-items:center; gap:8px; padding:10px 12px; border:1px solid var(--border); border-radius:8px">
+                <span class="dot wait" id="lg_waitDot"></span>
+                <span id="lg_waitText">Lisans bekleniyor — tanımlandığında otomatik alınacak.</span>
+            </div>
         </div>
+
+        <details class="adv" style="margin-top:4px">
+            <summary>Lisans dosyam var (.lic)</summary>
+            <div class="field" style="margin-top:10px">
+                <input type="file" id="lg_file" accept=".lic,.json,application/json,text/plain" />
+                <div class="hint">İnternet erişimi yoksa tedarikçinizin gönderdiği dosyayı buradan yükleyin.</div>
+            </div>
+            <button class="btn green" id="lg_activate" style="width:100%">Dosyadan Etkinleştir</button>
+        </details>
 
         <div class="err" id="lg_err"></div>
         <div class="row">
             <button class="btn ghost" id="lg_recheck" style="flex:.6">Yeniden Denetle</button>
-            <button class="btn green" id="lg_activate" style="flex:1">Etkinleştir</button>
+            <button class="btn green" id="lg_fetch" style="flex:1">Lisansımı Al</button>
         </div>
     </div>
 </div>

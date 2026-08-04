@@ -1721,9 +1721,11 @@ function showLicenseGate(L) {
     $('lg_title').textContent = LIC_REASONS[L.reason] || 'Lisans Gerekli';
     $('lg_msg').textContent = L.detail
         || (L.reason === 'TRIAL_EXPIRED'
-            ? `${L.trialDays} günlük ücretsiz deneme sona erdi. Kullanmaya devam etmek için lisans dosyanızı yükleyin.`
-            : 'Devam etmek için lisans dosyanızı yükleyin.');
+            ? `${L.trialDays} günlük ücretsiz deneme sona erdi. Kullanmaya devam etmek için lisansınızı tanımlatın.`
+            : 'Devam etmek için lisansınızı tanımlatın.');
     $('lg_hwid').value = L.hardwareId || '';
+    // Lisans tanımlandığı an ekranın kendiliğinden açılması için arka plan yoklaması.
+    startLicenseGatePolling();
 }
 
 // Sidebar rozeti: deneme sayacı / lisans durumu.
@@ -1805,6 +1807,45 @@ $('lg_recheck').onclick = async () => {
     if (r.license && r.license.valid) await boot();
     else showLicenseGate(r.license);
 };
+
+// ─── Uzaktan lisans alma ───
+// Tedarikçi panelden lisansı tanımlar; uygulama kendi donanım kimliğiyle çeker.
+// Müşteriye dosya göndermeye gerek yok. Ekran açıkken arka planda da yoklanır.
+const LG_FETCH_MSG = {
+    NOT_FOUND: 'Bu bilgisayara henüz lisans tanımlanmamış. Donanım kimliğini tedarikçinize ilettiyseniz birkaç dakika içinde otomatik gelecektir.',
+    NETWORK: 'Lisans sunucusuna ulaşılamadı. İnternet bağlantınızı kontrol edin ya da lisans dosyanızı elle yükleyin.',
+    SAME: 'Sunucudaki lisans zaten kurulu.',
+};
+
+async function fetchLicenseFromServer(silent) {
+    const btn = $('lg_fetch');
+    if (!silent && btn) { btn.disabled = true; btn.textContent = 'Alınıyor...'; }
+    try {
+        const r = await fetch('/api/license/fetch', { method: 'POST' }).then(x => x.json());
+        if (r.success) { await boot(); return true; }
+        if (!silent) $('lg_err').textContent = LG_FETCH_MSG[r.reason] || r.message || 'Lisans alınamadı.';
+        return false;
+    } catch (e) {
+        if (!silent) $('lg_err').textContent = 'Lisans alınamadı: ' + e.message;
+        return false;
+    } finally {
+        if (!silent && btn) { btn.disabled = false; btn.textContent = 'Lisansımı Al'; }
+    }
+}
+
+$('lg_fetch').onclick = () => fetchLicenseFromServer(false);
+
+// Kapı ekranı açıkken sessiz yoklama: lisans tanımlandığı an ekran kendiliğinden
+// açılsın, müşteri hiçbir şeye basmasın. Ekran kapanınca zamanlayıcı durur.
+let lgPollTimer = null;
+function startLicenseGatePolling() {
+    if (lgPollTimer) return;
+    lgPollTimer = setInterval(async () => {
+        const gate = $('licenseScreen');
+        if (!gate || gate.classList.contains('hidden')) { clearInterval(lgPollTimer); lgPollTimer = null; return; }
+        await fetchLicenseFromServer(true);
+    }, 20000);
+}
 
 // ─── Modal (uygulama içi lisans bilgisi) ───
 $('licBtn').onclick = async () => { await loadLicense(); $('licModal').classList.remove('hidden'); };

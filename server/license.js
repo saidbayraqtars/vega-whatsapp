@@ -538,6 +538,143 @@ function getLicenseProof() {
     return { p: JSON.stringify(payload), s: String(signature) };
 }
 
+// ─── Uzaktan lisans teslimi ─────────────────────────────────────────────────
+// Müşteriye .lic dosyası göndermek yerine: panelde lisans verilir, uygulama
+// kendi donanım kimliğiyle sunucudan çeker. Dosya alışverişi biter.
+//
+// Bu YALNIZCA teslimi kolaylaştırır — doğrulama hâlâ %100 çevrimdışıdır:
+// gelen lisans aynı imza/donanım/ürün denetimlerinden geçer, sunucuya
+// "geçerli mi" diye sorulmaz. İnternet yoksa mevcut lisans çalışmaya devam eder.
+const REMOTE_BASE = 'https://vega-kontor.expertbilisim.workers.dev';
+const REMOTE_TIMEOUT_MS = 15000;
+
+function httpsGetJson(urlStr) {
+    return new Promise((resolve, reject) => {
+        let u;
+        try { u = new URL(urlStr); } catch { return reject(new Error('Geçersiz adres.')); }
+        const mod = u.protocol === 'http:' ? require('http') : require('https');
+        const req = mod.get({
+            hostname: u.hostname,
+            port: u.port || (u.protocol === 'http:' ? 80 : 443),
+            path: u.pathname + u.search,
+            timeout: REMOTE_TIMEOUT_MS,
+        }, (res) => {
+            let body = '';
+            res.on('data', (c) => { body += c; });
+            res.on('end', () => {
+                try { resolve({ statusCode: res.statusCode, json: JSON.parse(body) }); }
+                catch { reject(new Error(`Sunucu yanıtı çözümlenemedi (HTTP ${res.statusCode}).`)); }
+            });
+        });
+        req.on('error', (e) => reject(new Error('Lisans sunucusuna ulaşılamadı: ' + e.message)));
+        req.on('timeout', () => req.destroy(new Error('Lisans sunucusu zaman aşımı.')));
+    });
+}
+
+function httpsPostJson(urlStr, bodyObj, headers = {}) {
+    return new Promise((resolve, reject) => {
+        let u;
+        try { u = new URL(urlStr); } catch { return reject(new Error('Geçersiz adres.')); }
+        const mod = u.protocol === 'http:' ? require('http') : require('https');
+        const data = Buffer.from(JSON.stringify(bodyObj || {}), 'utf8');
+        const req = mod.request({
+            method: 'POST',
+            hostname: u.hostname,
+            port: u.port || (u.protocol === 'http:' ? 80 : 443),
+            path: u.pathname + u.search,
+            timeout: REMOTE_TIMEOUT_MS,
+            headers: { 'content-type': 'application/json', 'content-length': data.length, ...headers },
+        }, (res) => {
+            let body = '';
+            res.on('data', (c) => { body += c; });
+            res.on('end', () => {
+                try { resolve({ statusCode: res.statusCode, json: JSON.parse(body) }); }
+                catch { reject(new Error(`Sunucu yanıtı çözümlenemedi (HTTP ${res.statusCode}).`)); }
+            });
+        });
+        req.on('error', (e) => reject(new Error('Lisans sunucusuna ulaşılamadı: ' + e.message)));
+        req.on('timeout', () => req.destroy(new Error('Lisans sunucusu zaman aşımı.')));
+        req.end(data);
+    });
+}
+
+// Bu makineyi tanıtan ipuçları — panelde "hangi müşteri?" ayırt edilsin diye.
+// Kimlik doğrulamada KULLANILMAZ, yalnız gösterim içindir.
+function machineHints() {
+    let hostname = '';
+    try { hostname = os.hostname() || ''; } catch { /* önemsiz */ }
+    // server.js ile aynı sıra: exe'de kök package.json, geliştirmede server/.
+    let version = '';
+    try { version = require(path.join(__dirname, '..', 'package.json')).version || ''; }
+    catch { try { version = require('./package.json').version || ''; } catch { /* önemsiz */ } }
+    return { hostname: String(hostname).slice(0, 64), version: String(version).slice(0, 24) };
+}
+
+/**
+ * Elimizdeki lisansı panele BİLDİR. Eski (masaüstü araçla verilmiş) lisanslar
+ * böylece imzasıyla birlikte panele düşer; oradan yeniden indirilebilir ve
+ * yenileme takibi yapılabilir.
+ *
+ * Hiçbir hak istemez, hiçbir cevabı beklemez: sunucu "hayır" dese bile lisans
+ * çalışmaya devam eder (doğrulama çevrimdışı). Sessizce başarısız olur.
+ * Dönüş: { ok:true } | { ok:false, reason, error }
+ */
+async function reportRemote() {
+    const proof = getLicenseProof();
+    if (!proof) return { ok: false, reason: 'NO_LICENSE' };
+
+    let res;
+    try {
+        res = await httpsPostJson(`${REMOTE_BASE}/v1/license/register`, machineHints(), {
+            authorization: 'Vega ' + Buffer.from(JSON.stringify(proof), 'utf8').toString('base64'),
+        });
+    } catch (e) {
+        return { ok: false, reason: 'NETWORK', error: e.message };
+    }
+    if (res.statusCode !== 200 || !res.json || res.json.success !== true) {
+        return { ok: false, reason: 'SERVER', error: (res.json && res.json.error) || `HTTP ${res.statusCode}` };
+    }
+    return { ok: true, revoked: !!res.json.revoked };
+}
+
+// Sunucuda bu makineye tanımlı lisans var mı? Varsa indirip etkinleştirir.
+// Dönüş: { ok:true, license } | { ok:false, reason, error }
+//   reason: 'NOT_FOUND' (henüz tanımlanmamış) | 'SAME' (zaten kurulu) | diğer hatalar
+async function fetchRemote() {
+    const hwId = getHardwareId();
+    const hints = machineHints();
+    let res;
+    try {
+        // host/v yalnız panelde cihazı tanımak için; sorgunun sonucunu etkilemez.
+        const qs = `hwid=${encodeURIComponent(hwId)}`
+            + `&host=${encodeURIComponent(hints.hostname)}`
+            + `&v=${encodeURIComponent(hints.version)}`;
+        res = await httpsGetJson(`${REMOTE_BASE}/v1/license?${qs}`);
+    } catch (e) {
+        return { ok: false, reason: 'NETWORK', error: e.message };
+    }
+
+    const { statusCode, json } = res;
+    if (statusCode !== 200 || !json || json.success !== true) {
+        return { ok: false, reason: 'SERVER', error: (json && json.error) || `HTTP ${statusCode}` };
+    }
+    if (!json.found || !json.license) {
+        return { ok: false, reason: 'NOT_FOUND', error: 'Bu bilgisayara tanımlı lisans bulunamadı.' };
+    }
+
+    // Zaten kurulu olanla aynıysa diske tekrar yazma (gereksiz IO + log gürültüsü).
+    const cur = readStoredLicense();
+    if (cur && cur.license && cur.license.payload && cur.license.payload.id === json.license.payload?.id) {
+        return { ok: false, reason: 'SAME', error: 'Sunucudaki lisans zaten kurulu.' };
+    }
+
+    // activate() imza + ürün + donanım + süre denetimlerini yapar; geçersizse
+    // eski lisansı geri yükler. Yani kötü bir cevap mevcut kurulumu bozamaz.
+    const r = activate(JSON.stringify(json.license));
+    if (!r.ok) return { ok: false, reason: r.reason || 'INVALID', error: r.error };
+    return { ok: true, license: r.license };
+}
+
 // Lisansı diskten kaldır (destek/hata ayıklama). Deneme süresi geri gelmez —
 // deneme başlangıcı ayrı saklanır ve dolmuşsa dolu kalır.
 function deactivate() {
@@ -556,6 +693,8 @@ module.exports = {
     getHardwareId,
     getLicenseProof,
     activate,
+    fetchRemote,
+    reportRemote,
     deactivate,
     verifySignature,
     TRIAL_DAYS,

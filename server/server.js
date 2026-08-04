@@ -66,6 +66,7 @@ const LICENSE_OPEN_PATHS = new Set([
     '/api/license',
     '/api/license/activate',
     '/api/license/recheck',
+    '/api/license/fetch',    // uzaktan lisans alma — lisanssızken de çalışmalı
 ]);
 app.use((req, res, next) => {
     if (!req.path.startsWith('/api/')) return next();
@@ -2059,6 +2060,28 @@ app.post('/api/license/activate', async (req, res) => {
         }
         // Lisans geldi → kilitliyken atlanan otomatik bağlantıyı şimdi kur.
         try { await autoConnectFromConfig(); } catch (e) { console.error('lisans sonrası oto-bağlantı:', e.message); }
+        // Dosyayla kurulan lisansı panele bildir → elle takip gerekmesin.
+        lastReport = Date.now();
+        license.reportRemote().catch(() => { });
+        res.json({ success: true, license: r.license });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Uzaktan lisans al: bu bilgisayara tanımlı lisansı sunucudan indirip kurar.
+// Müşteriye .lic dosyası göndermeye gerek kalmaz — panelde lisans verilir,
+// müşteri "İnternetten Al" der (ya da lisans ekranı kendiliğinden yoklar).
+app.post('/api/license/fetch', async (req, res) => {
+    try {
+        const r = await license.fetchRemote();
+        if (!r.ok) {
+            return res.json({
+                success: false, reason: r.reason, message: r.error,
+                license: license.getStatus(),
+            });
+        }
+        try { await autoConnectFromConfig(); } catch (e) { console.error('lisans sonrası oto-bağlantı:', e.message); }
         res.json({ success: true, license: r.license });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -2487,6 +2510,50 @@ setInterval(() => {
     const st = license.getStatus();
     if (!st.valid) stopAutomation(st.reason || 'geçersiz');
 }, 60 * 60 * 1000).unref?.();
+
+// ─── Uzaktan lisans yoklaması ────────────────────────────────────────────────
+// Lisans dosyası göndermeyi tamamen gereksiz kılar:
+//  • Lisans yoksa/geçersizse sık sık yoklar → biz panelden lisansı verir vermez
+//    müşterinin ekranı kendiliğinden açılır, kimseye dosya yollamaya gerek kalmaz.
+//  • Lisans varsa ve bitmesine az kaldıysa seyrek yoklar → panelden süre
+//    uzatınca müşteri hiçbir şey yapmadan yenilenir.
+// İnternet yoksa hiçbir şey bozulmaz: mevcut lisans çevrimdışı doğrulanmaya devam eder.
+//  • Lisans varsa panele BİLDİRİLİR (günde bir) → eski masaüstü araçla verilmiş
+//    lisanslar da panele kendiliğinden düşer; artık elle içe aktarma gerekmez.
+const LIC_POLL_UNLICENSED_MS = 3 * 60 * 1000;    // lisans bekleniyor
+const LIC_POLL_RENEWAL_MS = 6 * 60 * 60 * 1000;  // yenileme kollaması
+const LIC_REPORT_MS = 24 * 60 * 60 * 1000;       // panele kendini bildirme
+let lastRenewalCheck = 0;
+let lastReport = 0;
+
+async function pollRemoteLicense() {
+    const st = license.getStatus();
+    const now = Date.now();
+
+    // Lisansı panele bildir. Hak istemez, cevabı beklenmez; internet yoksa
+    // sessizce geçilir. Amaç: panelde kimde hangi lisans var, görünsün.
+    if (st.valid && now - lastReport >= LIC_REPORT_MS) {
+        lastReport = now;
+        license.reportRemote().catch(() => { });
+    }
+
+    if (st.valid) {
+        // Süresiz lisansta yenileme aramaya gerek yok.
+        if (st.daysLeft == null || st.daysLeft > 10) return;
+        if (now - lastRenewalCheck < LIC_POLL_RENEWAL_MS) return;
+        lastRenewalCheck = now;
+    }
+
+    const r = await license.fetchRemote();
+    if (r.ok) {
+        console.log(`  ✓ Lisans sunucudan alındı: ${r.license.customerName || ''}`);
+        try { await autoConnectFromConfig(); } catch (e) { console.error('lisans sonrası oto-bağlantı:', e.message); }
+    }
+    // NOT_FOUND / SAME / NETWORK sessizce geçilir — her 3 dakikada bir log basmasın.
+}
+
+setTimeout(() => { pollRemoteLicense().catch(() => { }); }, 20_000).unref?.();
+setInterval(() => { pollRemoteLicense().catch(() => { }); }, LIC_POLL_UNLICENSED_MS).unref?.();
 
 // Anti-ban katmanı: warm-up rampı + saatlik/günlük tavan (hesap-başı sayaç).
 antiban.configure(baseDir);
