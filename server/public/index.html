@@ -676,7 +676,10 @@
         <div class="field"><label>Relay parolası (token)</label><input id="set_relayToken" type="password" placeholder="(değişmeyecekse boş bırak)" /></div>
         <div class="hint">İki PC'de de <b>AYNI</b> token olmalı. Ana PC (Yerel) bu token'la gelen relay isteklerini kabul eder; ikinci PC (Relay) bu token'la bağlanır.</div>
         <div id="set_relayFields" style="display:none">
-            <div class="field"><label>Ana PC adresi</label><input id="set_relayTarget" placeholder="http://192.168.1.10:3100" /></div>
+            <div class="field"><label>Ana PC adresi</label><input id="set_relayTarget" placeholder="192.168.0.99" /></div>
+            <div class="hint">Ana PC'nin <b>yerel ağ IP adresi</b> yeter — <code>http://</code> ve port kendiliğinden eklenir.
+                IP'yi ana PC'de <b>Başlat → cmd → ipconfig</b> ile bulun (IPv4 Adresi).
+                Bağlanmıyorsa ana PC'nin güvenlik duvarında <b>3100</b> portu gelen bağlantıya açık olmalı.</div>
         </div>
         <div class="row">
             <button class="btn green sm" id="set_saveWa" style="flex:1">WhatsApp Modunu Kaydet</button>

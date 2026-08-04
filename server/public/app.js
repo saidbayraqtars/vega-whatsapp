@@ -484,9 +484,11 @@ $('set_saveWa').onclick = async () => {
         if (r.success) {
             box.className = 'hint ok';
             if (r.mode === 'relay') {
+                // Adres tamamlanmış olabilir (IP yazıldıysa http:// ve port eklenir) — göster.
+                if (r.relayTarget) $('set_relayTarget').value = r.relayTarget;
                 box.textContent = (r.relay && r.relay.ready)
-                    ? '✓ Relay kaydedildi — ana PC bağlı.'
-                    : `✓ Relay kaydedildi. Ana PC durumu: ${(r.relay && r.relay.error) || 'bekleniyor'}`;
+                    ? `✓ Relay kaydedildi — ana PC bağlı (${r.relayTarget}).`
+                    : `✓ Relay kaydedildi (${r.relayTarget}). Ana PC durumu: ${(r.relay && r.relay.error) || 'bekleniyor'}`;
             } else {
                 box.textContent = '✓ Yerel mod kaydedildi (bu PC WhatsApp oturumu tutar).';
             }

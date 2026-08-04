@@ -539,18 +539,32 @@ app.get('/api/settings/wa', (req, res) => {
         relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null,
     });
 });
+// Kullanıcı çoğunlukla yalnız IP yazıyor ("192.168.0.99"). Eksikleri tamamla:
+// şema yoksa http://, port yoksa bu uygulamanın portu. Bilgisayar adı da olur.
+// Dönüş: normalize adres | null (çözümlenemedi) | '' (boş girdi)
+function normalizeRelayTarget(value) {
+    let s = String(value || '').trim();
+    if (!s) return '';
+    if (!/^https?:\/\//i.test(s)) s = 'http://' + s.replace(/^\/+/, '');
+    let u;
+    try { u = new URL(s); } catch { return null; }
+    if (!u.hostname) return null;
+    if (!u.port) u.port = String(PORT);
+    return u.origin;
+}
+
 app.post('/api/settings/wa', async (req, res) => {
     const b = req.body || {};
     const mode = b.mode === 'relay' ? 'relay' : 'local';
-    const relayTarget = String(b.relayTarget || '').trim();
+    const relayTarget = normalizeRelayTarget(b.relayTarget);
     // Parola boş bırakılırsa mevcut korunur (yeniden yazmaya gerek kalmasın).
     const relayToken = (b.relayToken != null && b.relayToken !== '') ? String(b.relayToken) : (waCfg && waCfg.relayToken) || '';
     if (mode === 'relay') {
-        if (!relayTarget) return res.status(400).json({ success: false, message: 'Ana PC adresi gerekli (ör. http://192.168.1.10:3100).' });
+        if (relayTarget === null) return res.status(400).json({ success: false, message: 'Ana PC adresi anlaşılamadı. Ana PC\'nin IP adresini yazın (ör. 192.168.0.99).' });
+        if (!relayTarget) return res.status(400).json({ success: false, message: 'Ana PC adresi gerekli (ör. 192.168.0.99).' });
         if (!relayToken) return res.status(400).json({ success: false, message: 'Relay parolası (token) gerekli — ana PC ile aynı olmalı.' });
-        try { new URL(relayTarget); } catch { return res.status(400).json({ success: false, message: 'Ana PC adresi geçersiz.' }); }
     }
-    const next = { mode, relayTarget, relayToken };
+    const next = { mode, relayTarget: relayTarget || '', relayToken };
     try {
         const existing = loadConfigFile() || {};
         existing.wa = next;
@@ -561,7 +575,7 @@ app.post('/api/settings/wa', async (req, res) => {
     }
     // Relay'e geçildiyse hemen durum çek + otomasyon zaten relay guard'ıyla susar.
     if (isRelay()) { try { await pollRelayStatus(); } catch { /* yok say */ } }
-    res.json({ success: true, mode, relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null });
+    res.json({ success: true, mode, relayTarget: next.relayTarget, relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
