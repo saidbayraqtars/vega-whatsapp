@@ -340,13 +340,14 @@
                 <h2>Sipariş Bildirimi
                     <span class="pill" style="margin-left:auto"><span class="dot" id="spDot"></span> <span id="spState">Pasif</span></span>
                 </h2>
-                <p class="sub">Vega'da <b>sipariş fişi</b> oluşunca bildirim gider — ama cariye değil, aşağıda yazdığın <b>tek numaraya</b>. Firma/dönem yukarıdaki seçimden alınır.</p>
+                <p class="sub">Vega'da <b>sipariş fişi</b> oluşunca bildirim gider — ama cariye değil, aşağıda yazdığın <b>numaralara</b>. Firma/dönem yukarıdaki seçimden alınır.</p>
 
                 <div class="row">
                     <div class="field">
-                        <label>Bildirim numarası</label>
-                        <input id="sp_phone" placeholder="05xx xxx xx xx" />
-                        <div class="hint">Siparişleri haber alacak <b>tek</b> numara (kendi hattın / depo / satış sorumlusu).</div>
+                        <label>Bildirim numaraları</label>
+                        <input id="sp_phone" placeholder="05321234567, 05339876543" />
+                        <div class="hint">Siparişleri haber alacak numaralar — <b>virgülle</b> çoğalt. Başındaki <b>0</b> / <b>+90</b> fark etmez, nasıl yazarsan yaz.</div>
+                        <div class="hint" id="sp_phonePreview"></div>
                     </div>
                     <div class="field">
                         <label>Alt tutar sınırı (TL)</label>

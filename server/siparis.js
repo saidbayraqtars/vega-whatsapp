@@ -1,8 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  Sipariş Bildirimi (tek sabit numaraya iç bildirim)
+//  Sipariş Bildirimi (sabit iç numara listesine bildirim)
 //  Vega'da ALINAN SİPARİŞ fişi oluşunca, satış faturası bildirimi gibi WhatsApp
-//  gönderir — ama CARİYE DEĞİL, kullanıcının elle girdiği TEK numaraya (kendi
-//  personeli / depo / patron).
+//  gönderir — ama CARİYE DEĞİL, kullanıcının elle girdiği numara(lar)a (kendi
+//  personeli / depo / patron). Birden çok numara virgülle yazılır; her birine
+//  aynı mesaj gider.
 //
 //  NEDEN AYRI MODÜL: sipariş fişi cari hareket tablosuna HİÇ yazmaz (canlı
 //  doğrulandı, F0101D0017: son 5 siparişin BELGENO'su TBLCARIHAREKETLERI'nde
@@ -18,7 +19,7 @@
 //    • IPTAL     bit — sipariş iptal edildi (canlı kullanımda: 89/6748)
 //  Kalemler: TBLALSIPHAREKET.EVRAKNO = BASLIK.IND (fatura ile aynı desen).
 //
-//  ANTI-BAN: hedef tek, kayıtlı, kendi numaramız → günlük/saatlik tavan ve
+//  ANTI-BAN: hedefler az sayıda, kayıtlı, kendi numaralarımız → günlük/saatlik tavan ve
 //  gece penceresi UYGULANMAZ (sipariş girildiği an haber gitmeli). Yalnız
 //  ban-şüphesi SOĞUMASI (403/401) dinlenir: flaglenen numarayı dövmeyiz.
 //  Gönderim yine de recordSent ile hesap toplamına yazılır (tavanlar dürüst kalsın).
@@ -59,7 +60,8 @@ const DEFAULT_CONFIG = {
     enabled: false,
     firmaNo: null,
     donemNo: null,
-    // Bildirimin gideceği TEK numara (elle girilir). Boşken gönderim yapılmaz.
+    // Bildirimin gideceği numara(lar) — elle girilir, virgülle çoğaltılır.
+    // Format serbest (0532…, +90532…, 532…). Boşken gönderim yapılmaz.
     phone: '',
     intervalSec: 30,
     // Bu tutarın altındaki siparişleri bildirme (0 = hepsi).
@@ -146,10 +148,24 @@ function fmtAmount(n) {
     return num.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-// Hedef numara: normalize edilmiş hali (geçersizse '').
-function targetPhone() {
-    const p = normalizePhone(config.phone || '');
-    return isLikelyValid(p) ? p : '';
+// Hedef numaralar: kullanıcı virgülle (veya ; / satır sonu ile) birden çok numara
+// yazabilir. Format serbest — 0532…, +90532…, 90532…, 532… hepsi kabul; normalizePhone
+// tek biçime çeker. ÖNCE AYIR SONRA NORMALİZE: normalizePhone rakam-dışını atar,
+// bölmeden çağrılırsa "0532...,0533..." tek dev numaraya yapışır.
+const splitPhones = (raw) => String(raw || '').split(/[,;\n\r/|]+/).map(s => s.trim()).filter(Boolean);
+
+// Geçerli (905XXXXXXXXX) numaralar, tekilleştirilmiş.
+function targetPhones() {
+    const out = [];
+    for (const part of splitPhones(config.phone)) {
+        const p = normalizePhone(part);
+        if (isLikelyValid(p) && !out.includes(p)) out.push(p);
+    }
+    return out;
+}
+// Kullanıcının yazdığı ama numaraya çevrilemeyen parçalar (UI uyarısı için).
+function invalidPhoneParts() {
+    return splitPhones(config.phone).filter(part => !isLikelyValid(normalizePhone(part)));
 }
 
 function renderTemplate(tpl, vars) {
@@ -183,37 +199,45 @@ function cooldownReason() {
     return null;
 }
 
-// Tek gönderim noktası: WA kapalı/soğumada/pencere dışındaysa kuyruğa alır.
+// Tek gönderim noktası: aynı bildirimi TÜM hedef numaralara yollar. WA kapalı/
+// soğumada/pencere dışındaysa numara başına kuyruğa alır.
 // entry = { key, ind, evrak, firma, kod, tutar, kind:'new'|'cancel' }
+// Döner: { sent, queued } (numara sayısı bazında).
 async function sendOrQueue(entry, text) {
-    const phone = targetPhone();
-    if (!phone) {
+    const phones = targetPhones();
+    if (!phones.length) {
         pushLog({ ...entry, status: 'noPhone', error: 'Bildirim numarası girilmemiş/geçersiz' });
-        return { queued: false, sent: false };
+        return { sent: 0, queued: 0 };
     }
     const blockers = [];
     if (config.respectSendWindow && antiban.inQuietHours()) blockers.push(antiban.quietReason());
     if (!deps.waStatus().ready) blockers.push('WhatsApp bağlı değil');
     const cd = cooldownReason();
     if (cd) blockers.push(cd);
-    if (blockers.length) {
-        enqueue(entry, phone, text, blockers.join(' • '));
-        return { queued: true, sent: false };
+
+    let sent = 0, queued = 0;
+    for (const phone of phones) {
+        if (blockers.length) { enqueue(entry, phone, text, blockers.join(' • ')); queued++; continue; }
+        const res = await deps.waSend(phone, text, null, {
+            simulateTyping: config.simulateTyping, typingMs: rand(900, 1800), channel: 'siparis',
+        });
+        if (res.success) {
+            try { antiban.recordSent(deps.waStatus().me, 'siparis'); } catch { /* yok say */ }
+            recordSentDoc(entry, phone, res.id);
+            pushLog({ ...entry, phone, status: entry.kind === 'cancel' ? 'cancelled' : 'sent', message: text });
+            sent++;
+        } else {
+            enqueue(entry, phone, text, `Gönderilemedi (${res.error})`);
+            queued++;
+        }
+        if (phones.length > 1) await sleep(rand(1500, 3500));   // aynı anda seri atış yapma
     }
-    const res = await deps.waSend(phone, text, null, {
-        simulateTyping: config.simulateTyping, typingMs: rand(900, 1800), channel: 'siparis',
-    });
-    if (res.success) {
-        try { antiban.recordSent(deps.waStatus().me, 'siparis'); } catch { /* yok say */ }
-        pushLog({ ...entry, phone, status: entry.kind === 'cancel' ? 'cancelled' : 'sent', message: text });
-        return { queued: false, sent: true, id: res.id };
-    }
-    enqueue(entry, phone, text, `Gönderilemedi (${res.error})`);
-    return { queued: true, sent: false };
+    return { sent, queued };
 }
 
 function enqueue(entry, phone, text, reason) {
-    if (pending.some(p => p.key === entry.key && p.kind === entry.kind)) return;
+    // Tekillik numara bazında: aynı sipariş iki numaraya ayrı ayrı kuyruklanır.
+    if (pending.some(p => p.key === entry.key && p.kind === entry.kind && p.phone === phone)) return;
     pending.push({ ...entry, phone, text, attempts: 0, queuedAt: new Date().toISOString(), lastError: reason });
     savePending();
     pushLog({ ...entry, phone, status: 'queued', error: reason, message: text });
@@ -422,9 +446,9 @@ async function pollOnce() {
             }
 
             const res = await sendOrQueue(entry, text);
-            if (res.sent) { sent++; recordSentDoc(entry, targetPhone(), res.id); }
-            else if (res.queued) queued++;
-            else skipped++;
+            sent += res.sent;
+            queued += res.queued;
+            if (!res.sent && !res.queued) skipped++;    // hedef numara yok
             maxHandled = row.IND;
             await sleep(rand(2000, 5000));
         }
@@ -455,7 +479,7 @@ function bitsNote(sent, queued, skipped, cancelled) {
 // ─── Yaşam döngüsü ─────────────────────────────────────────────────────────────
 function start() {
     if (!config.firmaNo || !config.donemNo) { lastError = 'Firma/dönem seçilmemiş.'; return false; }
-    if (!targetPhone()) { lastError = 'Bildirim numarası girilmemiş veya geçersiz.'; return false; }
+    if (!targetPhones().length) { lastError = 'Geçerli bildirim numarası yok.'; return false; }
     stop();
     running = true;
     config.enabled = true;
@@ -463,7 +487,7 @@ function start() {
     const ms = Math.max(10, config.intervalSec || 30) * 1000;
     pollOnce();
     timer = setInterval(pollOnce, ms);
-    console.log(`[Sipariş] başlatıldı → ${tableName()} her ${config.intervalSec}sn → ${targetPhone()}`);
+    console.log(`[Sipariş] başlatıldı → ${tableName()} her ${config.intervalSec}sn → ${targetPhones().join(', ')}`);
     return true;
 }
 
@@ -475,7 +499,7 @@ function stop() {
 }
 
 function autoStart() {
-    if (config.enabled && config.firmaNo && config.donemNo && targetPhone()) start();
+    if (config.enabled && config.firmaNo && config.donemNo && targetPhones().length) start();
 }
 
 function getConfig() { return { ...config }; }
@@ -491,7 +515,7 @@ function getStatus() {
         running, enabled: config.enabled,
         firmaNo: config.firmaNo, donemNo: config.donemNo,
         table: tableName(), intervalSec: config.intervalSec,
-        phone: config.phone || '', phoneValid: !!targetPhone(),
+        phone: config.phone || '', phones: targetPhones(), invalidPhones: invalidPhoneParts(),
         minAmount: config.minAmount || 0,
         includeContent: config.includeContent !== false,
         watchCancel: config.watchCancel !== false,
@@ -515,8 +539,8 @@ function resetWatermark() {
 
 // UI "Test mesajı gönder": son gerçek siparişi (yoksa örnek veriyi) şablonla gönderir.
 async function sendTest() {
-    const phone = targetPhone();
-    if (!phone) return { success: false, message: 'Önce geçerli bir bildirim numarası girin.' };
+    const phones = targetPhones();
+    if (!phones.length) return { success: false, message: 'Önce geçerli bir bildirim numarası girin.' };
     if (!deps.waStatus().ready) return { success: false, message: 'WhatsApp bağlı değil.' };
     const pool = deps.getPool();
     const tbl = tableName();
@@ -544,13 +568,23 @@ async function sendTest() {
         } catch { /* içerik olmadan gönder */ }
     }
     text = '🔔 TEST\n' + text;
-    const res = await deps.waSend(phone, text, null, { simulateTyping: false, channel: 'siparis' });
-    if (res.success) {
-        try { antiban.recordSent(deps.waStatus().me, 'siparis'); } catch { /* yok say */ }
-        pushLog({ key: 'test', kind: 'new', evrak: vars.evrak, firma: vars.firma, tutar: vars.tutar, phone, status: 'sent', message: text, error: 'Test mesajı' });
-        return { success: true };
+    // Test TÜM hedef numaralara gider — kullanıcı listenin tamamını doğrulasın.
+    let ok = 0; const errors = [];
+    for (const phone of phones) {
+        const res = await deps.waSend(phone, text, null, { simulateTyping: false, channel: 'siparis' });
+        if (res.success) {
+            try { antiban.recordSent(deps.waStatus().me, 'siparis'); } catch { /* yok say */ }
+            pushLog({ key: 'test', kind: 'new', evrak: vars.evrak, firma: vars.firma, tutar: vars.tutar, phone, status: 'sent', message: text, error: 'Test mesajı' });
+            ok++;
+        } else {
+            errors.push(`${phone}: ${res.error || 'gönderilemedi'}`);
+            pushLog({ key: 'test', kind: 'new', evrak: vars.evrak, firma: vars.firma, tutar: vars.tutar, phone, status: 'failed', error: `Test — ${res.error || 'gönderilemedi'}` });
+        }
+        if (phones.length > 1) await sleep(rand(1200, 2500));
     }
-    return { success: false, message: res.error || 'Gönderilemedi.' };
+    if (ok === phones.length) return { success: true, message: `${ok} numaraya test gönderildi.` };
+    if (ok) return { success: true, message: `${ok}/${phones.length} numaraya gitti. Hata: ${errors.join(' • ')}` };
+    return { success: false, message: errors.join(' • ') || 'Gönderilemedi.' };
 }
 
 module.exports = {

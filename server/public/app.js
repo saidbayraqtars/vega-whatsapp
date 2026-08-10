@@ -1257,11 +1257,44 @@ async function refreshWatcherLog() {
 // ─── Sipariş bildirimi (cariye değil, tek sabit numaraya) ────────────────────
 // Firma/dönem yukarıdaki Belge Mesajları seçimini paylaşır; ayrı zamanlayıcı.
 
+// Sunucudaki phone.js normalizePhone'un tarayıcı ikizi — kullanıcı yazarken
+// numaraların nasıl yorumlandığını anında göstermek için (0 / +90 / 90 / çıplak).
+function spNormalize(raw) {
+    let d = String(raw || '').replace(/\D/g, '');
+    if (!d) return '';
+    if (d.startsWith('00')) d = d.slice(2);
+    if (d.startsWith('0')) d = '90' + d.slice(1);
+    else if (d.length === 10 && d.startsWith('5')) d = '90' + d;
+    return d;
+}
+const spSplit = (raw) => String(raw || '').split(/[,;\n\r/|]+/).map(s => s.trim()).filter(Boolean);
+
+// Girilen listeyi ayrıştırıp "şuna gidecek / bunu anlayamadım" önizlemesi yaz.
+function renderSiparisPhonePreview() {
+    const box = $('sp_phonePreview');
+    const parts = spSplit($('sp_phone').value);
+    if (!parts.length) { box.textContent = ''; box.className = 'hint'; return; }
+    const ok = [], bad = [];
+    parts.forEach(p => {
+        const n = spNormalize(p);
+        if (/^905\d{9}$/.test(n) && !ok.includes(n)) ok.push(n);
+        else if (!/^905\d{9}$/.test(n)) bad.push(p);
+    });
+    const fmt = (n) => `0${n.slice(2, 5)} ${n.slice(5, 8)} ${n.slice(8, 10)} ${n.slice(10)}`;
+    const bits = [];
+    if (ok.length) bits.push(`✓ ${ok.length} numaraya gidecek: ${ok.map(fmt).join(', ')}`);
+    if (bad.length) bits.push(`⚠ anlaşılmadı: ${bad.join(', ')}`);
+    box.textContent = bits.join('  •  ');
+    box.className = 'hint' + (bad.length ? '' : ' ok');
+}
+
 async function loadSiparisConfig() {
     const r = await api('/siparis');
     if (!r.success) return;
     const s = r.status;
     $('sp_phone').value = s.phone || '';
+    $('sp_phone').oninput = renderSiparisPhonePreview;
+    renderSiparisPhonePreview();
     $('sp_min').value = s.minAmount || 0;
     $('sp_includeContent').checked = s.includeContent !== false;
     $('sp_watchCancel').checked = s.watchCancel !== false;
@@ -1280,6 +1313,8 @@ function renderSiparisState(s) {
     $('sp_save').textContent = on ? 'Ayarları Kaydet' : 'Kaydet ve Başlat';
     $('sp_stop').style.display = on ? '' : 'none';
     const parts = [];
+    if (s.phones?.length) parts.push(`${s.phones.length} numaraya bildiriliyor`);
+    if (s.invalidPhones?.length) parts.push(`⚠ geçersiz: ${s.invalidPhones.join(', ')}`);
     if (s.table) parts.push(`Tablo: ${s.table}`);
     if (s.watermark != null) parts.push(`Son IND: ${s.watermark}`);
     if (s.pendingCount > 0) parts.push(`⏳ Kuyrukta ${s.pendingCount} bildirim`);
@@ -1310,7 +1345,7 @@ $('sp_save').onclick = async () => {
     $('sp_err').textContent = '';
     const cfg = collectSiparisConfig();
     if (!cfg.firmaNo || !cfg.donemNo) { $('sp_err').textContent = 'Yukarıdan firma ve dönem seçin.'; return; }
-    if (!cfg.phone) { $('sp_err').textContent = 'Bildirim numarası girin.'; return; }
+    if (!cfg.phone) { $('sp_err').textContent = 'En az bir bildirim numarası girin.'; return; }
     if (!cfg.template.trim()) { $('sp_err').textContent = 'Sipariş mesajı boş olamaz.'; return; }
     $('sp_save').disabled = true;
     try {
@@ -1337,7 +1372,7 @@ $('sp_test').onclick = async () => {
         await api('/siparis', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
         const r = await api('/siparis/test', { method: 'POST' });
         $('sp_err').textContent = r.success ? '' : (r.message || 'Test gönderilemedi.');
-        if (r.success) $('sp_status').textContent = 'Test mesajı gönderildi.';
+        if (r.success) $('sp_status').textContent = r.message || 'Test mesajı gönderildi.';
         refreshSiparisLog();
     } catch (e) { $('sp_err').textContent = 'Hata: ' + e.message; }
     $('sp_test').disabled = false;
