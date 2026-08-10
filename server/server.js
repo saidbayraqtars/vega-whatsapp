@@ -28,10 +28,11 @@ const multer = require('multer');
 const {
     initializeWhatsApp, refreshWhatsApp, logoutWhatsApp,
     getStatus: waStatus, sendMessage: waSend, deleteMessage: waDelete, checkOnWhatsApp, getDailySent,
-    waitForReady: waWaitForReady, setIncomingHandler, setDisconnectHandler, setOpenHandler,
+    waitForReady: waWaitForReady, setIncomingHandler, setDisconnectHandler, setOpenHandler, setRevokedHandler,
 } = require('./whatsapp');
 const { normalizePhone, isLikelyValid } = require('./phone');
 const watcher = require('./watcher');
+const siparis = require('./siparis');
 const reminders = require('./reminders');
 const activeCari = require('./activeCari');
 const aiBot = require('./aiBot');
@@ -290,6 +291,7 @@ const recordSentX = (me, ch) => { if (!isRelay()) { try { antiban.recordSent(me,
 function startAutomationUnlessRelay() {
     if (isRelay()) { console.log('[Relay] İkinci PC (ekstre) modu — watcher/hatırlatma/aktif-cari BAŞLATILMADI (ana PC yürütür).'); return; }
     watcher.autoStart();
+    try { siparis.autoStart(); } catch { /* yok say */ }
     try { reminders.autoStart(); } catch { /* Faz 6 */ }
     try { activeCari.autoStart(); } catch { /* yok say */ }
 }
@@ -426,6 +428,7 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/reset', async (req, res) => {
     try {
         watcher.stop(); // DB ayarları silinirken izleme açık kalmasın
+        try { siparis.stop(); } catch { /* yok say */ }
         if (pool) { await pool.close(); pool = null; }
         if (fs.existsSync(CONFIG_PATH)) fs.unlinkSync(CONFIG_PATH);
         res.json({ success: true });
@@ -1105,6 +1108,48 @@ app.get('/api/watcher/log', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  SİPARİŞ BİLDİRİMİ (tek sabit numaraya iç bildirim)
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/siparis', (req, res) => {
+    res.json({ success: true, status: siparis.getStatus() });
+});
+
+app.post('/api/siparis', (req, res) => {
+    const allowed = ['firmaNo', 'donemNo', 'phone', 'intervalSec', 'minAmount', 'includeContent',
+        'watchCancel', 'cancelScanSec', 'respectSendWindow', 'simulateTyping', 'template', 'cancelTemplate'];
+    const patch = {};
+    for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    const prev = siparis.getConfig();
+    siparis.setConfig(patch);
+    // Firma/dönem değiştiyse yeni tablonun GEÇMİŞ siparişlerine mesaj atılmasın.
+    if (patch.firmaNo && (patch.firmaNo !== prev.firmaNo || patch.donemNo !== prev.donemNo)) {
+        siparis.resetWatermark();
+    }
+    res.json({ success: true, status: siparis.getStatus() });
+});
+
+app.post('/api/siparis/start', (req, res) => {
+    if (!requireDb(req, res)) return;
+    const ok = siparis.start();
+    res.json({ success: ok, status: siparis.getStatus(), message: ok ? '' : (siparis.getStatus().lastError || 'Başlatılamadı.') });
+});
+
+app.post('/api/siparis/stop', (req, res) => {
+    siparis.stop();
+    res.json({ success: true, status: siparis.getStatus() });
+});
+
+app.get('/api/siparis/log', (req, res) => {
+    res.json({ success: true, log: siparis.getLog(), status: siparis.getStatus() });
+});
+
+// Şablonu gerçek (son) siparişle deneyip bildirim numarasına tek mesaj atar.
+app.post('/api/siparis/test', async (req, res) => {
+    try { res.json(await siparis.sendTest()); }
+    catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  AI OTO-YANIT BOTU
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/aibot', (req, res) => {
@@ -1725,28 +1770,34 @@ async function fetchBelgeKalemleri(firmaNo, donemNo, izahat, evrakno) {
             SELECT MALINCINSI, STOKKODU, MIKTAR, BIRIM, FIYATI, GERCEKTOPLAM, KDV
             FROM [${hTbl}] WHERE EVRAKNO=${Number(b.IND)} ORDER BY SATIRNO
         `)).recordset;
-        const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
-        if (lines.length) return lines.map(l => {
-            const miktar = Number(l.MIKTAR) || 0;
-            const fiyatHaric = Number(l.FIYATI) || 0;
-            const oran = Number(l.KDV) || 0;              // KDV oranı (%), 0 olabilir
-            const k = 1 + oran / 100;
-            const satirHaric = Number(l.GERCEKTOPLAM) || 0;
-            // Birim fiyatı önce yuvarla, satır tutarını ONDAN türet — yoksa mesajda
-            // "10 ADET x 11.250,00 = 112.500,02" gibi çarpımı tutmayan satır çıkar
-            // (FIYATI zaten yuvarlanmış matrahtır: 9.533,90 ≈ 11.250 / 1,18).
-            // GERCEKTOPLAM doluysa o esastır (iskonto/kampanya satırda uygulanmış olur).
-            const fiyat = round2(fiyatHaric * k);
-            const tutar = satirHaric > 0 ? round2(satirHaric * k) : round2(miktar * fiyat);
-            return {
-                ad: (l.MALINCINSI != null && String(l.MALINCINSI).trim()) || (l.STOKKODU != null && String(l.STOKKODU).trim()) || '',
-                miktar, birim: (l.BIRIM == null ? '' : String(l.BIRIM)).trim(),
-                fiyat, tutar, kdv: oran,
-                fiyatHaric, tutarHaric: satirHaric || round2(miktar * fiyatHaric),
-            };
-        });
+        if (lines.length) return mapKalemRows(lines);
     }
     return null;
+}
+
+// Belge/sipariş satırlarını (aynı sütun şeması) mesajda kullanılan KDV DAHİL
+// kalem nesnesine çevirir. Fatura ve sipariş hareket tabloları aynı alanları taşır.
+function mapKalemRows(lines) {
+    const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+    return lines.map(l => {
+        const miktar = Number(l.MIKTAR) || 0;
+        const fiyatHaric = Number(l.FIYATI) || 0;
+        const oran = Number(l.KDV) || 0;              // KDV oranı (%), 0 olabilir
+        const k = 1 + oran / 100;
+        const satirHaric = Number(l.GERCEKTOPLAM) || 0;
+        // Birim fiyatı önce yuvarla, satır tutarını ONDAN türet — yoksa mesajda
+        // "10 ADET x 11.250,00 = 112.500,02" gibi çarpımı tutmayan satır çıkar
+        // (FIYATI zaten yuvarlanmış matrahtır: 9.533,90 ≈ 11.250 / 1,18).
+        // GERCEKTOPLAM doluysa o esastır (iskonto/kampanya satırda uygulanmış olur).
+        const fiyat = round2(fiyatHaric * k);
+        const tutar = satirHaric > 0 ? round2(satirHaric * k) : round2(miktar * fiyat);
+        return {
+            ad: (l.MALINCINSI != null && String(l.MALINCINSI).trim()) || (l.STOKKODU != null && String(l.STOKKODU).trim()) || '',
+            miktar, birim: (l.BIRIM == null ? '' : String(l.BIRIM)).trim(),
+            fiyat, tutar, kdv: oran,
+            fiyatHaric, tutarHaric: satirHaric || round2(miktar * fiyatHaric),
+        };
+    });
 }
 
 // Carinin dönem hareket satırları + yürüyen bakiye. opts.withKalemler → fatura/stok
@@ -1813,12 +1864,12 @@ async function fetchLastSalesInvoice(firmaNo, donemNo, ind) {
 // toplamı) genel toplam ONDAN yazılır — kalem toplamından DEĞİL. İskonto/masraf içeren
 // faturalarda kalem toplamı başlıktan sapıyor (F0103D0012: 10.735 faturanın 48'i);
 // müşteriye giden toplam, borcuna yazılan tutarla birebir aynı olmalı.
-function formatDocContentText(kalemler, belgeTutari) {
+function formatDocContentText(kalemler, belgeTutari, baslik = 'Belge içeriği:') {
     const ks = Array.isArray(kalemler) ? kalemler : [];
     if (!ks.length) return null;
     const money = (n) => (Number(n) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const qty = (n) => { const x = Number(n) || 0; return Number.isInteger(x) ? String(x) : money(x); };
-    const out = ['Belge içeriği:'];
+    const out = [baslik];
     const MAX = 25;
     for (const k of ks.slice(0, MAX)) {
         const q = Number(k.miktar) ? `${qty(k.miktar)}${k.birim ? ' ' + k.birim : ''} x ${money(k.fiyat)}` : '';
@@ -1844,6 +1895,29 @@ async function buildDocContentText(firmaNo, donemNo, docType, evrak, belgeTutari
     let kalemler = null;
     try { kalemler = await fetchBelgeKalemleri(firmaNo, donemNo, izahat, evrak); } catch { kalemler = null; }
     return formatDocContentText(kalemler, belgeTutari);
+}
+
+// Sipariş bildirimi "içeriği de ekle" seçeneği: ALINAN SİPARİŞ fişinin kalemleri.
+// Fatura'dan farkı: bağlantı BELGENO değil, başlık IND üzerinden kurulur (sipariş
+// cari harekete yazmadığı için elimizde zaten başlık IND'i var).
+// TBLALSIPHAREKET.EVRAKNO = TBLALSIPBASLIK.IND (canlı doğrulandı).
+// SATIRNO sipariş satırlarında NULL olabiliyor → IND ile sırala.
+async function buildSiparisContentText(firmaNo, donemNo, basIND, tutar) {
+    const ind = parseInt(basIND, 10);
+    if (!pool || !pool.connected || !/^\d+$/.test(String(firmaNo)) || !/^\d+$/.test(String(donemNo)) || !Number.isFinite(ind)) return null;
+    const hTbl = `F${firmaNo}D${donemNo}TBLALSIPHAREKET`;
+    if (!(await tableExistsCached(hTbl))) return null;
+    try {
+        const lines = (await pool.request().query(`
+            SELECT MALINCINSI, STOKKODU, MIKTAR, BIRIM, FIYATI, GERCEKTOPLAM, KDV
+            FROM [${hTbl}] WHERE EVRAKNO=${ind} ORDER BY ISNULL(SATIRNO, IND)
+        `)).recordset;
+        if (!lines.length) return null;
+        return formatDocContentText(mapKalemRows(lines), tutar, 'Sipariş içeriği:');
+    } catch (e) {
+        console.error('[Sipariş] kalem sorgusu:', e.message);
+        return null;
+    }
 }
 
 // Dönemde bakiyesi (net) sıfır OLMAYAN carileri listele (borçlu + alacaklı).
@@ -2512,6 +2586,7 @@ credits.configure({
 // aksi halde deneme dolduktan sonra da mesaj atmayı sürdürürdü.
 function stopAutomation(sebep) {
     try { watcher.stop(); } catch { /* yok say */ }
+    try { siparis.stop(); } catch { /* yok say */ }
     try { reminders.stop(); } catch { /* yok say */ }
     try { activeCari.stop(); } catch { /* yok say */ }
     console.warn(`[Lisans] Otomasyon durduruldu — ${sebep}`);
@@ -2573,8 +2648,16 @@ setInterval(() => { pollRemoteLicense().catch(() => { }); }, LIC_POLL_UNLICENSED
 antiban.configure(baseDir);
 // Ban-şüpheli bağlantı kapanışını anti-ban'a bildir: 403/401 veya reconnect
 // fırtınasında gate() gönderimi soğutur (flaglenen numarayı dövmeyi keser).
-setDisconnectHandler((code, accountId, errMsg) => {
-    try { antiban.noteDisconnect(accountId || waStatus().me, code, errMsg); } catch { /* yok say */ }
+setDisconnectHandler((code, accountId, errMsg, conflict) => {
+    try { antiban.noteDisconnect(accountId || waStatus().me, code, errMsg, conflict); } catch { /* yok say */ }
+});
+// Oturumu WhatsApp iptal etti (diskte bağlı kimlik varken QR isteniyor). Sebebi ne
+// olursa olsun gönderime devam etmek yanlış → 24 saat sticky soğuma + warm-up sıfır.
+setRevokedHandler((accountId) => {
+    try {
+        const r = antiban.noteSessionRevoked(accountId || waStatus().me);
+        if (r) console.warn(`[Antiban] Oturum iptali — gönderim durduruldu: ${r.reason}`);
+    } catch { /* yok say */ }
 });
 // Kimlik doğrulanmış açılış = numara kısıtlı değil → yanlış alarm soğumasını kaldır.
 setOpenHandler((accountId) => {
@@ -2602,6 +2685,19 @@ watcher.configure({
     isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
     shouldAskSave: (phone) => { try { return stats.shouldAskSave(phone); } catch { return false; } },
     saveContactText: SAVE_CONTACT_LINE,
+});
+
+// Sipariş bildirimi: alınan sipariş fişi oluşunca TEK sabit numaraya haber ver.
+// (Sipariş cari harekete yazmaz → watcher göremez; ayrı tablo taranır.)
+siparis.configure({
+    getPool: () => pool,
+    sql,
+    resolveCariContacts,
+    waSend,
+    waStatus,
+    baseDir,
+    getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
+    buildSiparisContentText,
 });
 
 // Periyodik bakiye/borç hatırlatma zamanlayıcısı.

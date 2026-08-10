@@ -955,9 +955,11 @@ async function initWatcherView() {
         wcLoaded = true;
     }
     await loadWatcherConfig();
+    await loadSiparisConfig();
     if (wcLogTimer) clearInterval(wcLogTimer);
     refreshWatcherLog();
-    wcLogTimer = setInterval(refreshWatcherLog, 5000);
+    refreshSiparisLog();
+    wcLogTimer = setInterval(() => { refreshWatcherLog(); refreshSiparisLog(); }, 5000);
 }
 
 async function loadWatcherDonemler(selectDonem) {
@@ -1248,6 +1250,124 @@ async function refreshWatcherLog() {
         box.querySelectorAll('.wc_msg').forEach(a => a.onclick = (ev) => {
             ev.preventDefault();
             showSentMessage(wcLogEntries[+a.dataset.i]);
+        });
+    } catch { /* yok say */ }
+}
+
+// ─── Sipariş bildirimi (cariye değil, tek sabit numaraya) ────────────────────
+// Firma/dönem yukarıdaki Belge Mesajları seçimini paylaşır; ayrı zamanlayıcı.
+
+async function loadSiparisConfig() {
+    const r = await api('/siparis');
+    if (!r.success) return;
+    const s = r.status;
+    $('sp_phone').value = s.phone || '';
+    $('sp_min').value = s.minAmount || 0;
+    $('sp_includeContent').checked = s.includeContent !== false;
+    $('sp_watchCancel').checked = s.watchCancel !== false;
+    $('sp_template').value = s.template || '';
+    $('sp_cancelTemplate').value = s.cancelTemplate || '';
+    $('sp_interval').value = s.intervalSec || 30;
+    $('sp_respectWindow').checked = s.respectSendWindow === true;
+    $('sp_typing').checked = s.simulateTyping === true;
+    renderSiparisState(s);
+}
+
+function renderSiparisState(s) {
+    const on = s.running;
+    $('spDot').className = 'dot ' + (on ? 'on' : '');
+    $('spState').textContent = on ? 'Aktif' : 'Pasif';
+    $('sp_save').textContent = on ? 'Ayarları Kaydet' : 'Kaydet ve Başlat';
+    $('sp_stop').style.display = on ? '' : 'none';
+    const parts = [];
+    if (s.table) parts.push(`Tablo: ${s.table}`);
+    if (s.watermark != null) parts.push(`Son IND: ${s.watermark}`);
+    if (s.pendingCount > 0) parts.push(`⏳ Kuyrukta ${s.pendingCount} bildirim`);
+    if (s.lastPollAt) parts.push(`Son tarama: ${new Date(s.lastPollAt).toLocaleTimeString('tr-TR')}`);
+    if (s.lastResult?.note) parts.push(s.lastResult.note);
+    if (s.lastError) parts.push(`⚠ ${s.lastError}`);
+    $('sp_status').textContent = parts.join('  •  ') || '—';
+    $('sp_info').textContent = on ? `Her ${s.intervalSec}sn taranıyor` : '';
+}
+
+function collectSiparisConfig() {
+    return {
+        firmaNo: $('wc_firma').value,      // firma/dönem Belge Mesajları kartından
+        donemNo: $('wc_donem').value,
+        phone: $('sp_phone').value.trim(),
+        minAmount: Math.max(0, +$('sp_min').value || 0),
+        includeContent: $('sp_includeContent').checked,
+        watchCancel: $('sp_watchCancel').checked,
+        template: $('sp_template').value,
+        cancelTemplate: $('sp_cancelTemplate').value,
+        intervalSec: Math.max(10, +$('sp_interval').value || 30),
+        respectSendWindow: $('sp_respectWindow').checked,
+        simulateTyping: $('sp_typing').checked,
+    };
+}
+
+$('sp_save').onclick = async () => {
+    $('sp_err').textContent = '';
+    const cfg = collectSiparisConfig();
+    if (!cfg.firmaNo || !cfg.donemNo) { $('sp_err').textContent = 'Yukarıdan firma ve dönem seçin.'; return; }
+    if (!cfg.phone) { $('sp_err').textContent = 'Bildirim numarası girin.'; return; }
+    if (!cfg.template.trim()) { $('sp_err').textContent = 'Sipariş mesajı boş olamaz.'; return; }
+    $('sp_save').disabled = true;
+    try {
+        await api('/siparis', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+        const r = await api('/siparis/start', { method: 'POST' });
+        if (!r.success) $('sp_err').textContent = r.message || 'Başlatılamadı.';
+        await loadSiparisConfig();
+    } catch (e) { $('sp_err').textContent = 'Hata: ' + e.message; }
+    $('sp_save').disabled = false;
+};
+
+$('sp_stop').onclick = async () => {
+    const r = await api('/siparis/stop', { method: 'POST' });
+    renderSiparisState(r.status);
+};
+
+$('sp_test').onclick = async () => {
+    $('sp_err').textContent = '';
+    const cfg = collectSiparisConfig();
+    if (!cfg.phone) { $('sp_err').textContent = 'Önce bildirim numarası girin.'; return; }
+    $('sp_test').disabled = true;
+    try {
+        // Test gerçek şablonla gider → önce ekrandaki ayarları kaydet.
+        await api('/siparis', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+        const r = await api('/siparis/test', { method: 'POST' });
+        $('sp_err').textContent = r.success ? '' : (r.message || 'Test gönderilemedi.');
+        if (r.success) $('sp_status').textContent = 'Test mesajı gönderildi.';
+        refreshSiparisLog();
+    } catch (e) { $('sp_err').textContent = 'Hata: ' + e.message; }
+    $('sp_test').disabled = false;
+};
+
+let spLogEntries = [];
+
+async function refreshSiparisLog() {
+    try {
+        const r = await api('/siparis/log');
+        if (!r.success) return;
+        renderSiparisState(r.status);
+        const box = $('sp_log');
+        if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz sipariş bildirimi yok.</div>'; return; }
+        spLogEntries = r.log;
+        const labels = { sent: 'Gönderildi', cancelled: 'İptal bildirildi', queued: 'Kuyrukta', failed: 'Başarısız', noPhone: 'Numara yok', skipped: 'Atlandı' };
+        box.innerHTML = r.log.map((e, i) => `
+            <div class="logline">
+                <span>${esc(e.firma || '')}
+                    ${e.tutar ? `<b>${esc(e.tutar)} TL</b>` : ''}
+                    ${e.evrak ? `<span class="muted">(${esc(e.evrak)})</span>` : ''}
+                    ${e.error ? `<span class="muted">— ${esc(e.error)}</span>` : ''}
+                    <span class="muted" style="font-size:11px">${e.at ? new Date(e.at).toLocaleTimeString('tr-TR') : ''}</span>
+                    ${e.message ? `<a href="#" class="sp_msg" data-i="${i}">mesajı gör</a>` : ''}
+                </span>
+                <span class="st ${e.status === 'sent' ? 'sent' : (e.status === 'failed' ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>
+            </div>`).join('');
+        box.querySelectorAll('.sp_msg').forEach(a => a.onclick = (ev) => {
+            ev.preventDefault();
+            showSentMessage(spLogEntries[+a.dataset.i]);
         });
     } catch { /* yok say */ }
 }

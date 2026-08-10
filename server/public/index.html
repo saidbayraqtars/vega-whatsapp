@@ -334,6 +334,60 @@
                     <div class="log" id="wc_log" style="max-height:520px"></div>
                 </div>
             </div>
+
+            <!-- ALT SOL: Sipariş bildirimi (cariye değil, tek numaraya) -->
+            <div class="card">
+                <h2>Sipariş Bildirimi
+                    <span class="pill" style="margin-left:auto"><span class="dot" id="spDot"></span> <span id="spState">Pasif</span></span>
+                </h2>
+                <p class="sub">Vega'da <b>sipariş fişi</b> oluşunca bildirim gider — ama cariye değil, aşağıda yazdığın <b>tek numaraya</b>. Firma/dönem yukarıdaki seçimden alınır.</p>
+
+                <div class="row">
+                    <div class="field">
+                        <label>Bildirim numarası</label>
+                        <input id="sp_phone" placeholder="05xx xxx xx xx" />
+                        <div class="hint">Siparişleri haber alacak <b>tek</b> numara (kendi hattın / depo / satış sorumlusu).</div>
+                    </div>
+                    <div class="field">
+                        <label>Alt tutar sınırı (TL)</label>
+                        <input id="sp_min" type="number" min="0" value="0" />
+                        <div class="hint">0 = her sipariş bildirilir.</div>
+                    </div>
+                </div>
+
+                <label class="check"><input type="checkbox" id="sp_includeContent" checked /> Sipariş <b>kalemlerini</b> de yaz (ürün / miktar / fiyat)</label>
+                <label class="check"><input type="checkbox" id="sp_watchCancel" checked /> Sipariş sonradan <b>iptal edilir/silinirse</b> iptal mesajı gönder</label>
+
+                <div class="field" style="margin-top:10px">
+                    <label>Sipariş mesajı</label>
+                    <textarea id="sp_template" style="min-height:100px"></textarea>
+                    <div class="hint">{firma}=cari adı, {kod}=cari kodu, {evrak}=belge no, {tarih}=belge tarihi, {saat}=giriş saati, {tutar}=tutar, {firmaadi}=kendi firma adın.</div>
+                </div>
+
+                <details class="adv">
+                    <summary>Gelişmiş ayarlar</summary>
+                    <div class="field" style="margin-top:4px">
+                        <label>İptal mesajı</label>
+                        <textarea id="sp_cancelTemplate" style="min-height:80px"></textarea>
+                    </div>
+                    <div class="grid2" style="margin-top:10px">
+                        <div><label>Tarama sıklığı (sn)</label><input id="sp_interval" type="number" value="30" min="10" /></div>
+                    </div>
+                    <label class="check" style="margin-top:8px"><input type="checkbox" id="sp_respectWindow" /> <b>Gönderim saati/gün penceresine</b> uy <span class="muted">(kapalıyken sipariş anında bildirilir — hedef kendi numaran, spam riski yok)</span></label>
+                    <label class="check"><input type="checkbox" id="sp_typing" /> "Yazıyor..." simülasyonu</label>
+                </details>
+
+                <div class="selbar" style="margin-top:14px">
+                    <button class="btn green sm" id="sp_save">Kaydet ve Başlat</button>
+                    <button class="btn danger sm" id="sp_stop" style="display:none">Durdur</button>
+                    <button class="btn ghost sm" id="sp_test">Test mesajı gönder</button>
+                    <div class="spacer"></div>
+                    <span class="count" id="sp_info"></span>
+                </div>
+                <div class="err" id="sp_err"></div>
+                <div class="muted" id="sp_status" style="font-size:13px; margin-top:10px">—</div>
+                <div class="log" id="sp_log" style="max-height:260px; margin-top:8px"></div>
+            </div>
         </div>
 
         <!-- ─── BAKİYE HATIRLATMA ─── -->

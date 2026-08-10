@@ -49,6 +49,26 @@ const setDisconnectHandler = (fn) => { disconnectHandler = fn; };
 // olamaz, dolayısıyla açılış önceki ban şüphesini çürütür.
 let openHandler = null;
 const setOpenHandler = (fn) => { openHandler = fn; };
+// Oturumun SUNUCU tarafından iptal edildiğini üst katmana bildir (bkz. sessionRevoked).
+let revokedHandler = null;
+const setRevokedHandler = (fn) => { revokedHandler = fn; };
+
+// ─── Oturum iptali / QR döngüsü koruması ─────────────────────────────────────
+// Çakışma (conflict) İKİ kapanış olayı üretir: önce "401 Stream Errored (conflict)",
+// saniyeler sonra düz "401 Connection Failure". İkincisinin mesajında 'conflict'
+// geçmediği için tek tek bakan koruma onu GERÇEK logout sanıp auth'u siliyordu
+// (canlı vaka 4 Ağu 2026: 07:08:57 → 07:09:02) → her çakışma yeni QR + YENİ CİHAZ
+// SLOTU. Aynı numara :60. slota kadar gitti; cihaz fırtınası flag sebebidir.
+// Çözüm: ilk çakışmadan sonraki kısa pencerede gelen 401'i aynı olay say.
+const CONFLICT_GRACE_MS = 60_000;
+let lastConflictAt = 0;
+// Oturumu WhatsApp iptal etti mi? (diskte bağlı kimlik varken QR isteniyor)
+let sessionRevoked = false;
+// Okutulmayan QR kaç tur döndü? Baileys QR süresi dolunca 408 "QR refs attempts
+// ended" ile kapanıyor; eski kod bunu sonsuza dek yeniden deniyordu (tek günlükte
+// 2074 tur). Her tur WhatsApp'a yeni el sıkışma = şüpheli trafik. Tavanla kes.
+let qrCycles = 0;
+const MAX_QR_CYCLES = 5;
 
 // Baileys mesaj gövdesinden düz metni çıkar (farklı sarmalayıcı tipleri).
 const extractText = (msg) => {
@@ -205,7 +225,18 @@ const getStatus = () => ({
     qr: currentQR,
     error: lastError,
     me: meId,
+    revoked: sessionRevoked,
 });
+
+// Diskteki oturumda bağlı bir kimlik var mı? (creds.json → me.id) Baileys QR
+// istiyorsa ama diskte kimlik VARSA, oturumu biz düşürmedik: WhatsApp iptal etti
+// (kullanıcı "bağlı cihazlar"dan çıkardı ya da hesap kısıtlandı).
+const credsIdentity = () => {
+    try {
+        const c = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, 'creds.json'), 'utf8'));
+        return c?.me?.id || null;
+    } catch { return null; }
+};
 
 const clearQrTimer = () => { if (qrTimer) { clearTimeout(qrTimer); qrTimer = null; } };
 
@@ -329,6 +360,19 @@ const initializeWhatsApp = async () => {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
+                // Diskte BAĞLI bir kimlik dururken QR isteniyorsa oturumu biz
+                // düşürmedik: WhatsApp iptal etmiştir (kullanıcı "bağlı cihazlar"dan
+                // çıkardı ya da hesap kısıtlandı). Bunu sessizce yeni QR turu sanmak
+                // ölümcül: her eşleşme YENİ bir cihaz slotu yakar (canlı vaka: aynı
+                // numara :60. slotta) ve cihaz fırtınası başlı başına flag sebebidir.
+                const linkedId = credsIdentity();
+                if (linkedId && !sessionRevoked) {
+                    sessionRevoked = true;
+                    meId = meId || linkedId;
+                    waEvent(`session-revoked me=${linkedId}`);
+                    lastError = 'WhatsApp oturumu iptal edildi. Numara "Bağlı cihazlar"dan çıkarılmış ya da hesap kısıtlanmış olabilir. Yeniden QR okutmadan önce numaranın durumunu telefondan kontrol edin.';
+                    try { revokedHandler && revokedHandler(linkedId); } catch { /* yok say */ }
+                }
                 currentQR = qr;
                 isReady = false;
                 isInitializing = false;
@@ -344,6 +388,10 @@ const initializeWhatsApp = async () => {
                 meId = sock?.user?.id || null;
                 reconnectFails = 0;
                 badSessionFails = 0;
+                // Başarılı açılış: çakışma gerçekten iyi huyluydu, oturum geçerli.
+                lastConflictAt = 0;
+                sessionRevoked = false;
+                qrCycles = 0;
                 clearQrTimer();
                 console.log('[WhatsApp] Bağlantı kuruldu!', meId || '');
                 waEvent(`open ${meId || ''}`);
@@ -360,23 +408,36 @@ const initializeWhatsApp = async () => {
                 waEvent(`close code=${statusCode} msg=${errMsg || ''}`);
                 isReady = false;
                 cleanupSocket();
-                // Anti-ban: ban-şüpheli kapanış / fırtına → gönderim soğuması. meId
-                // kapanışta korunur; oturum hiç açılmadıysa (connect'te 403) null gider
-                // ve anti-ban son bilinen numaraya yazar.
-                try { disconnectHandler && disconnectHandler(statusCode, meId, errMsg); } catch { /* yok say */ }
 
                 // Aynı oturum başka yerde açıldı (WhatsApp Web / ikinci kopya). Baileys
                 // bunu 440 connectionReplaced ile bildirir; bazı sürümlerde 401 +
                 // "Stream Errored (conflict)" olarak gelir. İkincisi 401 sanılıp oturum
                 // SİLİNİYORDU → her WA Web açılışında QR fırtınası. Çakışma oturumu
                 // geçersiz kılmaz: silme, sadece daha uzun bekle.
-                const conflict =
+                // DİKKAT: çakışma İKİ kapanış üretiyor; ikincisinde mesajda 'conflict'
+                // GEÇMİYOR (canlı 4 Ağu: 07:08:57 "401 (conflict)" → 07:09:02 düz "401
+                // Connection Failure"). Olaya tek tek bakınca ikincisi gerçek logout
+                // sanılıp auth siliniyordu. Kısa pencereyle aynı olay say.
+                const conflictNow =
                     statusCode === DisconnectReason.connectionReplaced ||
                     statusCode === 440 ||
                     /conflict|replaced/i.test(String(errMsg || ''));
+                if (conflictNow) lastConflictAt = Date.now();
+                const conflict = conflictNow || (Date.now() - lastConflictAt < CONFLICT_GRACE_MS);
                 if (conflict) {
                     lastError = 'Bu WhatsApp oturumu başka bir yerde açıldı (WhatsApp Web / ikinci kopya). Diğer oturumu kapatın.';
                 }
+
+                // Anti-ban: ban-şüpheli kapanış / fırtına → gönderim soğuması. meId
+                // kapanışta korunur; oturum hiç açılmadıysa (connect'te 403) null gider
+                // ve anti-ban son bilinen numaraya yazar. Çakışma kararını BURADA
+                // çözüp geçiriyoruz — antiban tek mesaja bakarak aynı hatayı yapmasın.
+                try { disconnectHandler && disconnectHandler(statusCode, meId, errMsg, conflict); } catch { /* yok say */ }
+
+                // Okutulmayan QR turu: Baileys süre dolunca 408 "QR refs attempts ended"
+                // ile kapanıyor. Eski kod bunu sonsuza dek yeniden deniyordu (tek
+                // günlükte 2074 tur) — her tur WhatsApp'a yeni el sıkışma demek.
+                if (statusCode === 408 && /QR refs/i.test(String(errMsg || ''))) qrCycles++;
 
                 // badSession (500) çoğu zaman geçici senkron hatası; ilk gelişte
                 // oturumu SİLMEDEN diskten yeniden bağlan, ÜST ÜSTE 2. kez gelirse
@@ -397,6 +458,17 @@ const initializeWhatsApp = async () => {
                     reconnectFails = 0;
                     badSessionFails = 0;
                     scheduleInit(1500);
+                } else if (sessionRevoked || qrCycles >= MAX_QR_CYCLES) {
+                    // Otomatik döngüyü DURDUR. Oturum iptal edildiyse ya da QR
+                    // okutulmuyorsa yeniden denemek numaraya zarar veriyor: her tur
+                    // yeni el sıkışma, her yeni eşleşme yeni cihaz slotu. Kullanıcı
+                    // "Yenile"ye basınca (refreshWhatsApp) sayaçlar sıfırlanıp devam eder.
+                    isInitializing = false;
+                    clearRetry();
+                    if (!sessionRevoked) {
+                        lastError = 'QR okutulmadı — otomatik yeniden deneme durduruldu. Devam etmek için "Yenile"ye basın.';
+                    }
+                    waEvent(`qr-loop-stopped cycles=${qrCycles} revoked=${sessionRevoked}`);
                 } else {
                     isInitializing = false;
                     currentQR = null;
@@ -413,7 +485,8 @@ const initializeWhatsApp = async () => {
                 lastError = 'QR oluşturulamadı, yeniden deneniyor...';
                 cleanupSocket();
                 isInitializing = false;
-                scheduleInit(500);
+                // Oturum iptalinde bu yol da döngüye girmemeli (yukarıdaki gerekçe).
+                if (!sessionRevoked) scheduleInit(500);
             }
         }, QR_TIMEOUT_MS);
 
@@ -442,6 +515,10 @@ const refreshWhatsApp = async () => {
     meId = null;
     reconnectFails = 0;
     badSessionFails = 0;
+    // Kullanıcı bilerek yeni oturum istiyor: iptal/QR-döngüsü kilitlerini kaldır.
+    sessionRevoked = false;
+    qrCycles = 0;
+    lastConflictAt = 0;
     wipeAuth();
     return initializeWhatsApp();
 };
@@ -457,6 +534,9 @@ const logoutWhatsApp = async () => {
     meId = null;
     reconnectFails = 0;
     badSessionFails = 0;
+    sessionRevoked = false;
+    qrCycles = 0;
+    lastConflictAt = 0;
     wipeAuth();
     return getStatus();
 };
@@ -587,6 +667,7 @@ module.exports = {
     setIncomingHandler,
     setDisconnectHandler,
     setOpenHandler,
+    setRevokedHandler,
     toJid,
     get client() { return sock; },
 };

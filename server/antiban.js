@@ -44,10 +44,16 @@ const DEFAULT_LIMITS = { userDailyCap: null, warnAt: 120 };
 // etmek uyarıyı tam bana çevirir; iki numaranın da yanmasının asıl mekanizması buydu.
 const COOLDOWN_FORBIDDEN_MS = 24 * 60 * 60 * 1000; // 403 = hesap kısıtlı (kesin)
 const COOLDOWN_LOGGEDOUT_MS = 2 * 60 * 60 * 1000;  // 401 = oturum düşürüldü (çoğu kez flag)
+const COOLDOWN_REVOKED_MS = 24 * 60 * 60 * 1000;   // oturumu WA iptal etti = 403 ağırlığında
 const COOLDOWN_STORM_MS = 30 * 60 * 1000;          // reconnect fırtınası
 // Fırtına eşiği: STORM_WINDOW_MS içinde >= STORM_MAX_CLOSES kopma = anormal.
 const STORM_WINDOW_MS = 10 * 60 * 1000;
 const STORM_MAX_CLOSES = 8;
+// Çakışma (conflict) eşiği: tek çakışma iyi huyludur (kullanıcı WA Web açtı), ama
+// araya BAŞARILI bir 'open' girmeden tekrarlıyorsa sebep ikinci kopya değil,
+// WhatsApp'ın cihazı düşürmesidir — ban/cihaz iptali aynı stream error'ı üretir.
+const CONFLICT_WINDOW_MS = 30 * 60 * 1000;
+const CONFLICT_MAX = 3;
 
 let STATE_PATH = null;
 // accounts[accountId] = {
@@ -252,31 +258,48 @@ function acknowledgeWarn(accountId) {
 // çağrılır). Ban-şüpheli kapanışta (403 forbidden / 401 loggedOut) veya kısa sürede
 // çok kopmada (ağ fırtınası) hesaba SOĞUMA koy → gate() o süre gönderime izin vermez.
 // 403/401'de warm-up da sıfırlanır: kick yiyen numara sıfırdan yavaş ısınmalı.
-// NOT: 440 (connectionReplaced = WA Web başka yerde açıldı) iyi huyludur; tek başına
-// soğuma tetiklemez, yalnız fırtına sayımına girer. Bazı Baileys sürümleri aynı
-// çakışmayı 401 + "Stream Errored (conflict)" olarak bildirir — mesajdan ayıklarız,
-// yoksa WA Web'i açan kullanıcı hesabı 2 saat kilitliyor ve warm-up'ı sıfırlıyor.
+// NOT: 440 (connectionReplaced = WA Web başka yerde açıldı) TEK BAŞINA iyi huyludur.
+// Bazı Baileys sürümleri aynı çakışmayı 401 + "Stream Errored (conflict)" olarak
+// bildirir — mesajdan ayıklarız, yoksa WA Web'i açan kullanıcı hesabı 2 saat
+// kilitliyor ve warm-up'ı sıfırlıyor.
+// AMA "iyi huylu" varsayımı koşulsuz DEĞİLDİR: WhatsApp bir cihazı zorla düşürdüğünde
+// (hesap kısıtlama / cihaz iptali) İSTEMCİYE AYNI conflict stream error'ı gelir.
+// Ayırt edici: iyi huylu çakışmadan sonra aynı creds ile yeniden bağlanma 'open'
+// verir; iptalde QR ister (bkz. whatsapp.js session-revoked). Ara bir güvenlik ağı
+// olarak da: 'open' görmeden tekrarlayan çakışma soğutulur (aşağıdaki sayaç).
 const isConflict = (code, errMsg) =>
     code === 440 || /conflict|replaced/i.test(String(errMsg || ''));
 
-function noteDisconnect(accountId, statusCode, errMsg) {
+// conflictHint: whatsapp.js çakışmayı olay-üstü çözer (çakışma İKİ kapanış üretir;
+// ikincisinde mesajda 'conflict' geçmez) ve sonucu buraya bildirir. Mesaja tek
+// başına bakmak yetmiyordu — canlı vaka 4 Ağu: 07:08:57 "401 (conflict)" ardından
+// 07:09:02 düz "401 Connection Failure" → ikincisi gerçek logout sanılıp 2 saatlik
+// sticky soğuma + warm-up sıfırlaması yiyordu.
+function noteDisconnect(accountId, statusCode, errMsg, conflictHint) {
     if (!STATE_PATH) return null;
     const { acc } = touch(resolveAccount(accountId));
     const now = Date.now();
     const code = Number(statusCode);
     let ms = 0, reason = null, resetWarmup = false, sticky = false;
 
-    if (isConflict(code, errMsg)) {
-        // İyi huylu: oturum başka yerde açıldı. Soğuma yok, warm-up sıfırlaması yok.
-        save();
-        return null;
+    if (conflictHint || isConflict(code, errMsg)) {
+        // Tek çakışma iyi huylu: oturum başka yerde açıldı → soğuma yok. Tekrarlarsa
+        // (araya 'open' girmeden) ikinci kopya değil, WhatsApp cihazı düşürüyordur.
+        acc.conflicts = (acc.conflicts || []).filter(t => now - t < CONFLICT_WINDOW_MS);
+        acc.conflicts.push(now);
+        if (acc.conflicts.length < CONFLICT_MAX) { save(); return null; }
+        acc.conflicts = [];
+        ms = COOLDOWN_LOGGEDOUT_MS;
+        reason = `tekrarlayan oturum çakışması (${CONFLICT_MAX}/30dk)`;
+        resetWarmup = true;
+        sticky = true;
     }
     // 403 = KESİN ban sinyali; SOĞUMA KALICIDIR, sonradan 'open' olsa bile kalkmaz.
     // (Canlı vaka 9–11 Tem 2026: 15:03:04 mesaj gitti → 15:03:15 403 fırtınası → numara
     // 'open' olmaya ve mesaj iletmeye devam etti → 11 Tem'de "Hesap gözden geçiriliyor".
     // Yani flaglenen numara bağlanabiliyor: 'open' sağlamlık kanıtı DEĞİL. Bunu bir kez
     // yanlış varsayıp soğumayı open'da kaldırmıştık; koruma o sırada devre dışı kalıyordu.)
-    if (code === 403) { ms = COOLDOWN_FORBIDDEN_MS; reason = 'hesap kısıtlı (403)'; resetWarmup = true; sticky = true; }
+    else if (code === 403) { ms = COOLDOWN_FORBIDDEN_MS; reason = 'hesap kısıtlı (403)'; resetWarmup = true; sticky = true; }
     else if (code === 401) { ms = COOLDOWN_LOGGEDOUT_MS; reason = 'oturum düşürüldü (401)'; resetWarmup = true; sticky = true; }
     else if (acc.cooldownUntil && acc.cooldownUntil > now) {
         return null; // zaten soğumada — fırtına sayımıyla disk churn yapma
@@ -299,6 +322,26 @@ function noteDisconnect(accountId, statusCode, errMsg) {
     return { cooldownMs: ms, reason };
 }
 
+// Oturumu WhatsApp SUNUCUSU iptal etti: diskte bağlı bir kimlik (creds.me) dururken
+// yeniden bağlanma QR istiyor (bkz. whatsapp.js). Sebebi ne olursa olsun — kullanıcı
+// "bağlı cihazlar"dan çıkardı ya da hesap kısıtlandı — gönderime devam etmek yanlış:
+// kısıtlıysa dövmeye devam ederiz, kullanıcı çıkardıysa zaten gönderecek oturum yok.
+// 403 ağırlığında sayılır: 24 saat sticky + warm-up sıfırlanır (yeni QR = taze numara
+// gibi yavaş ısınmalı; her yeni eşleşme WhatsApp'ta yeni bir cihaz slotu yakıyor).
+function noteSessionRevoked(accountId, note) {
+    if (!STATE_PATH) return null;
+    const { acc } = touch(resolveAccount(accountId));
+    const now = Date.now();
+    acc.cooldownUntil = Math.max(acc.cooldownUntil || 0, now + COOLDOWN_REVOKED_MS);
+    acc.cooldownReason = note || 'oturum WhatsApp tarafından iptal edildi (ban şüphesi)';
+    acc.cooldownSticky = true;
+    acc.conflicts = [];
+    acc.closes = [];
+    acc.firstActiveDate = dayKey();
+    save();
+    return { cooldownMs: COOLDOWN_REVOKED_MS, reason: acc.cooldownReason };
+}
+
 // Oturum BAŞARIYLA açıldı. DİKKAT: bu, numaranın sağlam olduğunun kanıtı DEĞİLDİR —
 // WhatsApp flaglediği numarayı bağlamaya ve mesaj iletmeye devam ederken arka planda
 // hesabı incelemeye alabiliyor (canlı vaka için yukarıdaki nota bak). O yüzden burada
@@ -309,6 +352,9 @@ function noteOpen(accountId) {
     if (key === 'unknown') return null;
     const { acc } = touch(key);
     acc.closes = [];
+    // Başarılı açılış = önceki çakışma gerçekten iyi huyluydu (creds hâlâ geçerli).
+    // Sayaç sıfırlanır ki normal WA Web kullanımı zamanla eşiği doldurmasın.
+    acc.conflicts = [];
     if (acc.cooldownUntil && acc.cooldownUntil > Date.now() && !acc.cooldownSticky) {
         const cleared = acc.cooldownReason;
         delete acc.cooldownUntil;
@@ -421,4 +467,4 @@ function snapshot(accountId, userDailyCap) {
     };
 }
 
-module.exports = { configure, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };
+module.exports = { configure, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, noteSessionRevoked, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };
