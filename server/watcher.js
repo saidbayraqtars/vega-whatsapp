@@ -916,14 +916,23 @@ async function pollOnce() {
 
         const r = pool.request();
         r.input('last', deps.sql.Int, lastSeen);
-        const rows = (await r.query(`
+        const mainQuery = `
             SELECT h.IND, h.FIRMANO, h.BORC, h.ALACAK, h.BAKIYE, h.EVRAKNO, h.TARIH, h.IZAHAT, h.PARABIRIMI,
                    CASE WHEN ${isFaturaExpr} THEN 1 ELSE 0 END AS isFatura,
                    ${docTypeExpr} AS docType
             FROM [${tbl}] h
             WHERE h.IND > @last AND (h.BORC > 0 OR h.ALACAK > 0)${devirFilter}
             ORDER BY h.IND ASC
-        `)).recordset;
+        `;
+        let rows;
+        try {
+            rows = (await r.query(mainQuery)).recordset;
+        } catch (e) {
+            // Hangi sorgu patladığını panelde göster (dosyaya bakmaya gerek kalmasın).
+            console.error('[Watcher] ana sorgu hatası, SQL:\n' + mainQuery);
+            e.message = `${e.message} | SQL: ${mainQuery.replace(/\s+/g, ' ').trim()}`;
+            throw e;
+        }
 
         // Kural eşleşen satırları ayıkla
         const matched = [];
