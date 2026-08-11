@@ -619,26 +619,82 @@ async function cachedHasDocCols(pool, name) {
     return v;
 }
 
-// Cari hareket satırını belge tipine sınıflayan SQL CASE'i kur (DOC_PRIORITY sırası).
-// Tablo üyeliği (varsa, BELGENO+FIRMANO ile) + standart IZAHAT kodu yedeği.
-async function buildDocTypeCase(pool) {
-    const whens = [];
-    for (const { docType, suffixes, codes, dir } of DOC_PRIORITY) {
-        const conds = [];
-        for (const suf of suffixes || []) {
-            const ft = `F${config.firmaNo}D${config.donemNo}${suf}`;
-            if (await cachedTableExists(pool, ft) && await cachedHasDocCols(pool, ft)) {
-                conds.push(`EXISTS(SELECT 1 FROM [${ft}] dt WHERE dt.BELGENO=h.EVRAKNO AND dt.FIRMANO=h.FIRMANO)`);
-            }
-        }
-        if (codes && codes.length) conds.push(`TRY_CAST(h.IZAHAT AS INT) IN (${codes.join(',')})`);
-        if (!conds.length) continue;
-        let when = `(${conds.join(' OR ')})`;
-        if (dir === 'alacak') when = `h.ALACAK > 0 AND ${when}`;
-        else if (dir === 'borc') when = `h.BORC > 0 AND ${when}`;
-        whens.push(`WHEN ${when} THEN '${docType}'`);
+// ─── Belge tipi + isFatura sınıflandırma (JS tarafında) ─────────────────────────
+// ESKİ: tek dev SQL (nested CASE+EXISTS+OR zinciri) üretiyordu; bazı müşteri
+// veritabanlarında (eski/farklı SQL Server sürümü/ayarı) açıklanamayan
+// "Incorrect syntax near OR" hatası veriyordu — üretilen metin kendi başına
+// geçerli T-SQL olduğu halde (parantez dengeli, her OR'un iki yanı dolu; 2026-08-11
+// doğrulandı). Kök neden sürücü/sunucu tarafında olabileceğinden, riski SQL
+// karmaşıklığını azaltarak kapatıyoruz: her belge başlık tablosuna dosyadaki diğer
+// sorgularla (scanEditsDeletes, fetchKalanBorc) AYNI basit "parametreli IN" deseniyle
+// tek tek bakılır, sınıflandırma satır satır JS'te yapılır. Ana sorguda artık ne CASE
+// ne de OR'lu EXISTS var.
+async function fetchAuthoritySets(pool, ftList, firmanos, evraknos) {
+    const sets = {};
+    if (!firmanos.length || !evraknos.length) return sets;
+    for (const ft of ftList) {
+        sets[ft] = new Set();
+        try {
+            const req = pool.request();
+            const eParams = evraknos.map((ev, i) => { req.input(`e${i}`, deps.sql.NVarChar, String(ev)); return `@e${i}`; });
+            const rows = (await req.query(`
+                SELECT DISTINCT BELGENO, FIRMANO FROM [${ft}]
+                WHERE FIRMANO IN (${firmanos.join(',')}) AND BELGENO IN (${eParams.join(',')})
+            `)).recordset;
+            rows.forEach(r => sets[ft].add(`${r.FIRMANO}::${r.BELGENO}`));
+        } catch (e) { console.error(`[Watcher] authority sorgusu (${ft}):`, e.message); }
     }
-    return whens.length ? `CASE ${whens.join(' ')} ELSE 'diger' END` : `'diger'`;
+    return sets;
+}
+
+// rows'a isFatura/docType alanlarını ekler (in-place).
+async function classifyRows(pool, tbl, rows) {
+    if (!rows.length) return;
+    const firmanos = [...new Set(rows.map(r => r.FIRMANO).filter(v => v != null))];
+    const evraknos = [...new Set(rows.map(r => r.EVRAKNO).filter(v => v != null && v !== ''))];
+
+    const neededSuffixes = new Set(['TBLALFATBASLIK', 'TBLSATFATBASLIK']);
+    for (const { suffixes } of DOC_PRIORITY) (suffixes || []).forEach(s => neededSuffixes.add(s));
+    const ftBySuf = {};
+    for (const suf of neededSuffixes) {
+        const ft = `F${config.firmaNo}D${config.donemNo}${suf}`;
+        if (await cachedTableExists(pool, ft) && await cachedHasDocCols(pool, ft)) ftBySuf[suf] = ft;
+    }
+    const sets = await fetchAuthoritySets(pool, Object.values(ftBySuf), firmanos, evraknos);
+
+    // Peşin fatura oto-ödeme çifti: aynı FIRMANO+EVRAKNO+tarihte başka bir BORC satırı.
+    let pairRows = [];
+    if (firmanos.length && evraknos.length) {
+        try {
+            const req = pool.request();
+            const eParams = evraknos.map((ev, i) => { req.input(`e${i}`, deps.sql.NVarChar, String(ev)); return `@e${i}`; });
+            pairRows = (await req.query(`
+                SELECT FIRMANO, EVRAKNO, CONVERT(date, TARIH) AS D, IND
+                FROM [${tbl}] WHERE BORC > 0 AND FIRMANO IN (${firmanos.join(',')}) AND EVRAKNO IN (${eParams.join(',')})
+            `)).recordset;
+        } catch (e) { console.error('[Watcher] peşin fatura çift sorgusu:', e.message); }
+    }
+
+    for (const row of rows) {
+        const key = `${row.FIRMANO}::${row.EVRAKNO}`;
+        const rowDate = row.TARIH ? new Date(row.TARIH).toISOString().slice(0, 10) : null;
+        const hasPair = pairRows.some(p => p.FIRMANO === row.FIRMANO && String(p.EVRAKNO) === String(row.EVRAKNO)
+            && p.IND !== row.IND && p.D && rowDate && new Date(p.D).toISOString().slice(0, 10) === rowDate);
+        const alExists = ftBySuf.TBLALFATBASLIK && sets[ftBySuf.TBLALFATBASLIK]?.has(key);
+        const stExists = ftBySuf.TBLSATFATBASLIK && sets[ftBySuf.TBLSATFATBASLIK]?.has(key);
+        row.isFatura = (hasPair || alExists || stExists) ? 1 : 0;
+
+        row.docType = 'diger';
+        const borc = Number(row.BORC) || 0, alacak = Number(row.ALACAK) || 0;
+        const code = parseInt(row.IZAHAT, 10);
+        for (const { docType, suffixes, codes, dir } of DOC_PRIORITY) {
+            if (dir === 'alacak' && !(alacak > 0)) continue;
+            if (dir === 'borc' && !(borc > 0)) continue;
+            const tableHit = (suffixes || []).some(suf => ftBySuf[suf] && sets[ftBySuf[suf]]?.has(key));
+            const codeHit = codes && codes.length && Number.isFinite(code) && codes.includes(code);
+            if (tableHit || codeHit) { row.docType = docType; break; }
+        }
+    }
 }
 
 // Carilerin gerçek kalan borcu: hareket tablosundan SUM(BORC)-SUM(ALACAK).
@@ -900,26 +956,12 @@ async function pollOnce() {
 
         const devirFilter = ` AND TRY_CAST(h.IZAHAT AS INT) NOT IN (${DEVIR_CODES.join(',')})`;
 
-        // isFatura bayrağı: peşin fatura oto-ödeme çifti VEYA fatura başlık kaydı.
-        const pairExpr = `EXISTS (SELECT 1 FROM [${tbl}] b
-            WHERE b.FIRMANO = h.FIRMANO AND b.EVRAKNO = h.EVRAKNO AND b.BORC > 0
-              AND b.IND <> h.IND AND CONVERT(date, b.TARIH) = CONVERT(date, h.TARIH))`;
-        const faturaParts = [pairExpr];
-        for (const [suffix, alias] of [['TBLALFATBASLIK', 'fal'], ['TBLSATFATBASLIK', 'fst']]) {
-            const ft = `F${config.firmaNo}D${config.donemNo}${suffix}`;
-            if (await cachedTableExists(pool, ft)) {
-                faturaParts.push(`EXISTS (SELECT 1 FROM [${ft}] ${alias} WHERE ${alias}.BELGENO = h.EVRAKNO AND ${alias}.FIRMANO = h.FIRMANO)`);
-            }
-        }
-        const isFaturaExpr = faturaParts.join(' OR ');
-        const docTypeExpr = await buildDocTypeCase(pool);
-
+        // Ana sorgu artık düz (CASE/EXISTS/OR yok) — sınıflandırma classifyRows() ile
+        // sorgu sonrası JS'te yapılır (bkz. yukarıdaki blok açıklaması).
         const r = pool.request();
         r.input('last', deps.sql.Int, lastSeen);
         const mainQuery = `
-            SELECT h.IND, h.FIRMANO, h.BORC, h.ALACAK, h.BAKIYE, h.EVRAKNO, h.TARIH, h.IZAHAT, h.PARABIRIMI,
-                   CASE WHEN ${isFaturaExpr} THEN 1 ELSE 0 END AS isFatura,
-                   ${docTypeExpr} AS docType
+            SELECT h.IND, h.FIRMANO, h.BORC, h.ALACAK, h.BAKIYE, h.EVRAKNO, h.TARIH, h.IZAHAT, h.PARABIRIMI
             FROM [${tbl}] h
             WHERE h.IND > @last AND (h.BORC > 0 OR h.ALACAK > 0)${devirFilter}
             ORDER BY h.IND ASC
@@ -931,6 +973,13 @@ async function pollOnce() {
             // Hangi sorgu patladığını panelde göster (dosyaya bakmaya gerek kalmasın).
             console.error('[Watcher] ana sorgu hatası, SQL:\n' + mainQuery);
             e.message = `${e.message} | SQL: ${mainQuery.replace(/\s+/g, ' ').trim()}`;
+            throw e;
+        }
+        try {
+            await classifyRows(pool, tbl, rows);
+        } catch (e) {
+            console.error('[Watcher] sınıflandırma hatası:', e.message);
+            e.message = `${e.message} (sınıflandırma aşaması)`;
             throw e;
         }
 
