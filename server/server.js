@@ -770,10 +770,21 @@ app.get('/api/cari', async (req, res) => {
         r.input('limit', sql.Int, pageSize);
         // SMS Gönder izinliler önce (1. öncelik), sonra ada göre.
         const orderExpr = (info.hasSmsGonder ? 'ISNULL(SMSGONDER,0) DESC, ' : '') + nameExpr;
+        // Sayfalama SQL 2008 UYUMLU: OFFSET/FETCH (SQL 2012+) yerine ROW_NUMBER
+        // (SQL 2005+). Dış SELECT iç sorgunun TAKMA ADLARINI kullanır — ifadeler
+        // tekrarlanmaz (selectCols ile birebir aynı sırada).
+        const outerCols = [
+            'IND', 'KOD', 'UNVAN', 'FIRMA', 'SMSGONDER', 'FIRMATIPI', 'BAKIYE',
+            ...info.phoneCols.map(c => `[PH_${c}]`),
+            ...info.emailCols.map(c => `[EM_${c}]`),
+        ].join(', ');
         const rows = (await r.query(`
-            SELECT ${selectCols} FROM ${T} ${where}
-            ORDER BY ${orderExpr}
-            OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
+            SELECT ${outerCols} FROM (
+                SELECT ${selectCols}, ROW_NUMBER() OVER (ORDER BY ${orderExpr}) AS __rn
+                FROM ${T} ${where}
+            ) q
+            WHERE q.__rn > @offset AND q.__rn <= @offset + @limit
+            ORDER BY q.__rn
         `)).recordset;
 
         // Telefonları normalize et + birincil seç
@@ -1316,17 +1327,31 @@ app.get('/api/watcher/izahat-stats', async (req, res) => {
     const tbl = `F${firmaNo}D${donemNo}TBLCARIHAREKETLERI`;
     try {
         if (!(await validateTableName(tbl))) return res.status(404).json({ success: false, message: 'Tablo yok: ' + tbl });
-        const rows = (await pool.request().query(`
-            SELECT TRY_CAST(IZAHAT AS INT) AS code,
+        // SQL 2008 uyumlu: TRY_CAST (2012+) yerine ham IZAHAT ile grupla, sayıya
+        // çevirme + yeniden toplama JS'te. Farklı yazımlar ('13', ' 13') aynı koda
+        // düştüğü için JS tarafında birleştiriyoruz.
+        const raw = (await pool.request().query(`
+            SELECT IZAHAT AS codeRaw,
                    COUNT(*) AS adet,
                    SUM(CASE WHEN ALACAK>0 THEN 1 ELSE 0 END) AS alacakAdet,
                    CAST(SUM(ALACAK) AS DECIMAL(18,2)) AS toplamAlacak,
                    CAST(SUM(BORC) AS DECIMAL(18,2)) AS toplamBorc
             FROM [${tbl}]
-            GROUP BY TRY_CAST(IZAHAT AS INT)
+            GROUP BY IZAHAT
             HAVING SUM(ALACAK) > 0
-            ORDER BY toplamAlacak DESC
         `)).recordset;
+        const byCode = new Map();
+        for (const r of raw) {
+            const n = parseInt(r.codeRaw, 10);
+            const code = Number.isFinite(n) ? n : null;
+            const cur = byCode.get(code) || { code, adet: 0, alacakAdet: 0, toplamAlacak: 0, toplamBorc: 0 };
+            cur.adet += Number(r.adet) || 0;
+            cur.alacakAdet += Number(r.alacakAdet) || 0;
+            cur.toplamAlacak += Number(r.toplamAlacak) || 0;
+            cur.toplamBorc += Number(r.toplamBorc) || 0;
+            byCode.set(code, cur);
+        }
+        const rows = [...byCode.values()].sort((a, b) => b.toplamAlacak - a.toplamAlacak);
         // Standart Vega işlem (evrak) kodları — F0101 EXPERT BİLİŞİM ile ampirik
         // doğrulandı (2026-06). Belge başlık tablolarına EVRAKNO=BELGENO join ile.
         const KNOWN = {

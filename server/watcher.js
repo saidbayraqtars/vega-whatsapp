@@ -629,20 +629,33 @@ async function cachedHasDocCols(pool, name) {
 // sorgularla (scanEditsDeletes, fetchKalanBorc) AYNI basit "parametreli IN" deseniyle
 // tek tek bakılır, sınıflandırma satır satır JS'te yapılır. Ana sorguda artık ne CASE
 // ne de OR'lu EXISTS var.
+// SQL Server tek istekte EN FAZLA 2100 parametre kabul eder. EVRAKNO listesi
+// parametre olarak gider; uygulama uzun süre kapalı/hatalı kalıp geri yığın
+// birikirse liste 2100'ü aşar ve sorgu "too many parameters" ile patlar.
+// Listeyi parçalayıp sonuçları birleştiriyoruz (sonuç birebir aynı).
+const SQL_PARAM_CHUNK = 1000;
+function chunkList(arr, size = SQL_PARAM_CHUNK) {
+    const out = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+}
+
 async function fetchAuthoritySets(pool, ftList, firmanos, evraknos) {
     const sets = {};
     if (!firmanos.length || !evraknos.length) return sets;
     for (const ft of ftList) {
         sets[ft] = new Set();
-        try {
-            const req = pool.request();
-            const eParams = evraknos.map((ev, i) => { req.input(`e${i}`, deps.sql.NVarChar, String(ev)); return `@e${i}`; });
-            const rows = (await req.query(`
-                SELECT DISTINCT BELGENO, FIRMANO FROM [${ft}]
-                WHERE FIRMANO IN (${firmanos.join(',')}) AND BELGENO IN (${eParams.join(',')})
-            `)).recordset;
-            rows.forEach(r => sets[ft].add(`${r.FIRMANO}::${r.BELGENO}`));
-        } catch (e) { console.error(`[Watcher] authority sorgusu (${ft}):`, e.message); }
+        for (const part of chunkList(evraknos)) {
+            try {
+                const req = pool.request();
+                const eParams = part.map((ev, i) => { req.input(`e${i}`, deps.sql.NVarChar, String(ev)); return `@e${i}`; });
+                const rows = (await req.query(`
+                    SELECT DISTINCT BELGENO, FIRMANO FROM [${ft}]
+                    WHERE FIRMANO IN (${firmanos.join(',')}) AND BELGENO IN (${eParams.join(',')})
+                `)).recordset;
+                rows.forEach(r => sets[ft].add(`${r.FIRMANO}::${r.BELGENO}`));
+            } catch (e) { console.error(`[Watcher] authority sorgusu (${ft}):`, e.message); }
+        }
     }
     return sets;
 }
@@ -665,14 +678,17 @@ async function classifyRows(pool, tbl, rows) {
     // Peşin fatura oto-ödeme çifti: aynı FIRMANO+EVRAKNO+tarihte başka bir BORC satırı.
     let pairRows = [];
     if (firmanos.length && evraknos.length) {
-        try {
-            const req = pool.request();
-            const eParams = evraknos.map((ev, i) => { req.input(`e${i}`, deps.sql.NVarChar, String(ev)); return `@e${i}`; });
-            pairRows = (await req.query(`
-                SELECT FIRMANO, EVRAKNO, CONVERT(date, TARIH) AS D, IND
-                FROM [${tbl}] WHERE BORC > 0 AND FIRMANO IN (${firmanos.join(',')}) AND EVRAKNO IN (${eParams.join(',')})
-            `)).recordset;
-        } catch (e) { console.error('[Watcher] peşin fatura çift sorgusu:', e.message); }
+        for (const part of chunkList(evraknos)) {
+            try {
+                const req = pool.request();
+                const eParams = part.map((ev, i) => { req.input(`e${i}`, deps.sql.NVarChar, String(ev)); return `@e${i}`; });
+                const got = (await req.query(`
+                    SELECT FIRMANO, EVRAKNO, CONVERT(date, TARIH) AS D, IND
+                    FROM [${tbl}] WHERE BORC > 0 AND FIRMANO IN (${firmanos.join(',')}) AND EVRAKNO IN (${eParams.join(',')})
+                `)).recordset;
+                pairRows = pairRows.concat(got);
+            } catch (e) { console.error('[Watcher] peşin fatura çift sorgusu:', e.message); }
+        }
     }
 
     for (const row of rows) {
@@ -756,24 +772,29 @@ async function scanEditsDeletes(pool, tbl) {
     const inds = [...new Set(entries.map(([, e]) => parseInt(e.cariInd, 10)).filter(Number.isFinite))];
     if (!evraks.length || !inds.length) return;
 
-    const req = pool.request();
-    const params = evraks.map((ev, i) => { req.input(`e${i}`, deps.sql.NVarChar, String(ev)); return `@e${i}`; });
+    // 2100 parametre sınırı için parçalı sorgu (bkz. chunkList). DİKKAT: bir parça
+    // hata verirse TÜM tarama iptal — eksik `cur` haritası, var olan belgeyi
+    // "silinmiş" gösterip mesajı yanlışlıkla geri çektirir.
     const cur = new Map();
-    try {
-        // Gruplama defter anahtarıyla aynı kimliği kullanmalı: cari + belge tarihi +
-        // evrak. Sadece cari+evrak ile gruplayınca aynı carinin farklı tarihli, aynı
-        // numaralı iki fişi tek satırda toplanır → uydurma "tutar değişti" mesajı.
-        const rows = (await req.query(`
-            SELECT EVRAKNO, FIRMANO, CONVERT(date, TARIH) AS D,
-                   CAST(SUM(BORC) AS DECIMAL(18,2)) AS B,
-                   CAST(SUM(ALACAK) AS DECIMAL(18,2)) AS A,
-                   COUNT(*) AS N
-            FROM [${tbl}]
-            WHERE FIRMANO IN (${inds.join(',')}) AND EVRAKNO IN (${params.join(',')})
-            GROUP BY EVRAKNO, FIRMANO, CONVERT(date, TARIH)
-        `)).recordset;
-        rows.forEach(r => cur.set(`${r.FIRMANO}::${dayOf(r.D)}::${r.EVRAKNO}`, { B: Number(r.B) || 0, A: Number(r.A) || 0, N: Number(r.N) || 0 }));
-    } catch (e) { console.error('[Watcher] düzenleme/silme sorgusu:', e.message); return; }
+    for (const part of chunkList(evraks)) {
+        const req = pool.request();
+        const params = part.map((ev, i) => { req.input(`e${i}`, deps.sql.NVarChar, String(ev)); return `@e${i}`; });
+        try {
+            // Gruplama defter anahtarıyla aynı kimliği kullanmalı: cari + belge tarihi +
+            // evrak. Sadece cari+evrak ile gruplayınca aynı carinin farklı tarihli, aynı
+            // numaralı iki fişi tek satırda toplanır → uydurma "tutar değişti" mesajı.
+            const rows = (await req.query(`
+                SELECT EVRAKNO, FIRMANO, CONVERT(date, TARIH) AS D,
+                       CAST(SUM(BORC) AS DECIMAL(18,2)) AS B,
+                       CAST(SUM(ALACAK) AS DECIMAL(18,2)) AS A,
+                       COUNT(*) AS N
+                FROM [${tbl}]
+                WHERE FIRMANO IN (${inds.join(',')}) AND EVRAKNO IN (${params.join(',')})
+                GROUP BY EVRAKNO, FIRMANO, CONVERT(date, TARIH)
+            `)).recordset;
+            rows.forEach(r => cur.set(`${r.FIRMANO}::${dayOf(r.D)}::${r.EVRAKNO}`, { B: Number(r.B) || 0, A: Number(r.A) || 0, N: Number(r.N) || 0 }));
+        } catch (e) { console.error('[Watcher] düzenleme/silme sorgusu:', e.message); return; }
+    }
 
     for (const [key, e] of entries) {
         const c = cur.get(`${e.cariInd}::${dayOf(e.tarih)}::${e.evrak}`);
@@ -954,16 +975,15 @@ async function pollOnce() {
             return;
         }
 
-        const devirFilter = ` AND TRY_CAST(h.IZAHAT AS INT) NOT IN (${DEVIR_CODES.join(',')})`;
-
-        // Ana sorgu artık düz (CASE/EXISTS/OR yok) — sınıflandırma classifyRows() ile
-        // sorgu sonrası JS'te yapılır (bkz. yukarıdaki blok açıklaması).
+        // Ana sorgu bilerek SQL Server 2008 UYUMLU tutulur: CASE/EXISTS/OR yok,
+        // TRY_CAST yok (TRY_CAST SQL 2012+ ister; müşterilerimizde 2008 kullanan var).
+        // Devir (103/104) elemesi ve sınıflandırma sorgu sonrası JS'te yapılır.
         const r = pool.request();
         r.input('last', deps.sql.Int, lastSeen);
         const mainQuery = `
             SELECT h.IND, h.FIRMANO, h.BORC, h.ALACAK, h.BAKIYE, h.EVRAKNO, h.TARIH, h.IZAHAT, h.PARABIRIMI
             FROM [${tbl}] h
-            WHERE h.IND > @last AND (h.BORC > 0 OR h.ALACAK > 0)${devirFilter}
+            WHERE h.IND > @last AND (h.BORC > 0 OR h.ALACAK > 0)
             ORDER BY h.IND ASC
         `;
         let rows;
@@ -975,6 +995,9 @@ async function pollOnce() {
             e.message = `${e.message} | SQL: ${mainQuery.replace(/\s+/g, ' ').trim()}`;
             throw e;
         }
+        // Devir (yıl başı açılış) satırları belge değil — eskiden SQL'de TRY_CAST ile
+        // eleniyordu, artık burada.
+        rows = rows.filter(row => !DEVIR_CODES.includes(parseInt(row.IZAHAT, 10)));
         try {
             await classifyRows(pool, tbl, rows);
         } catch (e) {
