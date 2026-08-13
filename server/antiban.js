@@ -174,12 +174,28 @@ function effectiveHourlyCap(dailyCap) {
     return Math.max(6, Math.min(HOURLY_CAP, scaled));
 }
 
+// ─── Kapıyı devre dışı bırakma (resmî Cloud API modu) ────────────────────────
+// Baileys'e özgü ban korumaları (warm-up rampı, saatlik tavan, 403 soğuması)
+// yalnız resmî OLMAYAN istemcide anlamlıdır. Cloud API modunda hepsi yanlış
+// pozitif üretir (1. gün 20 mesajda durmak gibi) → server.js bayrağı takar.
+// Gönderim GÜN PENCERESİ (inQuietHours) bundan etkilenmez: o kullanıcı tercihi.
+let bypassFn = () => false;
+const bypass = () => { try { return !!bypassFn(); } catch { return false; } };
+const setBypass = (fn) => { bypassFn = typeof fn === 'function' ? fn : (() => !!fn); };
+
 // Gönderim ÖNCESİ izin sorgusu. channel = bağımsız günlük sayaç ('belge'|'reminder'|
 // 'bulk'|'manual'…). userDailyCap verilirse warm-up tavanıyla küçüğü alınır.
 // GÜNLÜK tavan KANAL-BAŞI; SAATLİK tavan hesap-geneli (ortak).
 // Döner: { ok, reason, dailyCap, daySent, hourCap, hourSent, dayIndex, capType, channel }
 function gate(accountId, userDailyCap, channel = 'default') {
     if (!STATE_PATH) return { ok: true, dailyCap: null, daySent: 0, hourCap: HOURLY_CAP, hourSent: 0, dayIndex: 0, channel };
+    // Resmî kanal (Cloud API) modunda ısınma rampası/soğuma ANLAMSIZ: ban riski
+    // yok, sınırı Meta'nın kademesi belirler. Kapı açılır; sayaçlar yine işlenir
+    // (Pano göstergesi). Bayrağı server.js takar (bkz. setBypass).
+    if (bypass()) {
+        const { acc, ch } = touch(resolveAccount(accountId), channel);
+        return { ok: true, bypass: true, dailyCap: null, daySent: ch.count, hourCap: null, hourSent: acc.hour.count, dayIndex: 0, channel };
+    }
     rememberAccount(accountId);
     const { acc, ch } = touch(resolveAccount(accountId), channel);
     const dayIndex = daysBetween(acc.firstActiveDate, dayKey());
@@ -467,4 +483,4 @@ function snapshot(accountId, userDailyCap) {
     };
 }
 
-module.exports = { configure, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, noteSessionRevoked, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };
+module.exports = { configure, setBypass, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, noteSessionRevoked, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };

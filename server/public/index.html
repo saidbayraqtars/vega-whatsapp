@@ -149,6 +149,9 @@
                         <div class="ratio-lbl"><span>Saatlik tavan</span><b id="pn_hourcap_txt">0/0</b></div>
                         <div class="bar"><div id="pn_hourcap_bar" style="width:0%;background:linear-gradient(90deg,#d97706,#f59e0b)"></div></div>
                         <div id="pn_cooldown" class="cooldown hidden"></div>
+                        <!-- Çok numaralı kurulumda her hattın kendi tavanı vardır; yukarıdaki
+                             kart en kritik hattı gösterir, aşağıdaki liste hepsini. -->
+                        <div id="pn_ab_accs" class="hint" style="display:none; margin-top:8px"></div>
                     </div>
                     <p class="hint" id="pn_ab_off" style="display:none">WhatsApp bağlı değil — güvenlik sayaçları bağlanınca görünür.</p>
                 </div>
@@ -478,6 +481,37 @@
                 <p class="sub">Gelen mesajlara otomatik cevap. <b>Sohbet modu</b> açıkken selamlaşmadan bakiye ve ödeme sorularına kadar hemen her mesaja yanıt verir; kapalıyken yalnız bakiye/ödeme/borç sebebi. Yalnız cari kartında kayıtlı numaralara cevap verilir.</p>
 
                 <label class="check" style="margin:0 0 8px"><input type="checkbox" id="ab_enabled" /> <b>Botu aç</b></label>
+
+                <div class="field">
+                    <label>Yanıt modu</label>
+                    <select id="ab_replyMode">
+                        <option value="ack">Nöbetçi — yapay zekâ KONUŞMAZ: tek "aldık, ekibimiz dönecek" + iç bildirim (önerilen)</option>
+                        <option value="ai">Yapay zekâ yanıtlasın — model müşteriyle konuşur</option>
+                    </select>
+                    <div class="hint">Nöbetçi modda model hiç çağrılmaz: <b>kontör harcanmaz</b>, uydurma cevap ve uzayan tartışma olmaz.
+                        Müşteriye numara başına <b>tek</b> alındı mesajı gider, ekibiniz bilgilendirilir.</div>
+                </div>
+
+                <!-- Nöbetçi mod alanları -->
+                <div id="ab_ackBox">
+                    <div class="field">
+                        <label>Müşteriye giden alındı mesajı</label>
+                        <textarea id="ab_ackMessage" rows="2" placeholder="Mesajınızı aldık. Teknik ekibimizden bir arkadaşımız en kısa sürede size dönüş yapacaktır."></textarea>
+                        <div class="hint">Boş bırakılırsa yukarıdaki varsayılan kullanılır. Saat/tarih sözü vermeyin.</div>
+                    </div>
+                    <div class="row">
+                        <div class="field"><label>Bildirim numarası (iç)</label><input id="ab_notifyPhone" placeholder="0532…, 0533… (virgülle çoğaltın)" /></div>
+                        <div class="field" style="flex:.45"><label>Bildirim aralığı (dk)</label><input id="ab_notifyGapMin" type="number" min="0" placeholder="5" /></div>
+                    </div>
+                    <div class="row">
+                        <div class="field" style="flex:.5"><label>Aynı numaraya tekrar alındı (saat)</label><input id="ab_ackCooldownHours" type="number" min="0" placeholder="6" /></div>
+                        <div class="field" style="display:flex; align-items:flex-end">
+                            <label class="check" style="margin:0"><input type="checkbox" id="ab_ackUnknown" /> Cari kartında olmayan numaraya da cevap ver</label>
+                        </div>
+                    </div>
+                    <div class="hint" style="margin-bottom:10px">Müşteri arka arkaya 5 mesaj atsa bile <b>tek</b> cevap gider; ekibinize "şu kişi yazdı + mesajı" bildirimi düşer.</div>
+                </div>
+
                 <label class="check" style="margin:0 0 12px"><input type="checkbox" id="ab_chatMode" /> <b>Sohbet modu</b> — neredeyse her mesaja cevap ver (kapalıyken yalnız bakiye/ödeme)</label>
 
                 <div class="row">
@@ -726,6 +760,7 @@
             <select id="set_waMode">
                 <option value="local">Yerel — bu PC WhatsApp oturumu tutar (ana PC)</option>
                 <option value="relay">Relay — gönderimi ana PC'ye yolla (ikinci PC)</option>
+                <option value="cloud">Cloud API — Meta'nın resmî kanalı (ileri seviye)</option>
             </select>
         </div>
         <div class="field"><label>Relay parolası (token)</label><input id="set_relayToken" type="password" placeholder="(değişmeyecekse boş bırak)" /></div>
@@ -735,6 +770,40 @@
             <div class="hint">Ana PC'nin <b>yerel ağ IP adresi</b> yeter — <code>http://</code> ve port kendiliğinden eklenir.
                 IP'yi ana PC'de <b>Başlat → cmd → ipconfig</b> ile bulun (IPv4 Adresi).
                 Bağlanmıyorsa ana PC'nin güvenlik duvarında <b>3100</b> portu gelen bağlantıya açık olmalı.</div>
+        </div>
+        <div id="set_cloudFields" style="display:none">
+            <div class="hint" style="margin:8px 0">
+                <b>Cloud API</b> Meta'nın <b>resmî</b> WhatsApp Business Platform kanalıdır. QR yoktur, telefon gerekmez,
+                <b>hesap kapanma riski yoktur</b>. Karşılığında: mesaj başına ücret ödenir ve müşteri size son 24 saat içinde
+                yazmadıysa serbest metin gönderilemez — Meta'da <b>onaylı şablon</b> zorunludur.
+                Bilgiler: <i>developers.facebook.com → Uygulamanız → WhatsApp → API Kurulumu</i>.
+            </div>
+            <div class="row">
+                <div class="field"><label>Telefon Numarası Kimliği (Phone Number ID)</label><input id="set_cloudPhoneId" placeholder="1234567890123456" /></div>
+                <div class="field" style="flex:.55"><label>API sürümü</label><input id="set_cloudApiVersion" placeholder="v21.0" /></div>
+            </div>
+            <div class="field"><label>Erişim anahtarı (Access Token)</label><input id="set_cloudToken" type="password" placeholder="(değişmeyecekse boş bırak)" /></div>
+            <div class="hint">Geçici (24 saatlik) test anahtarı yerine <b>System User</b> kalıcı anahtarı kullanın; aksi halde her gün gönderim durur.</div>
+            <div class="row">
+                <div class="field"><label>Şablon adı</label><input id="set_cloudTplName" placeholder="hesap_bakiye_bildirimi" /></div>
+                <div class="field" style="flex:.4"><label>Dil</label><input id="set_cloudTplLang" placeholder="tr" /></div>
+                <div class="field" style="flex:.5"><label>Değişken sayısı</label><input id="set_cloudTplParams" type="number" min="0" placeholder="1" /></div>
+            </div>
+            <div class="field">
+                <label>Şablon kullanımı</label>
+                <select id="set_cloudTplMode">
+                    <option value="auto">Otomatik — önce serbest metin, 24 saat penceresi kapalıysa şablona düş (önerilen)</option>
+                    <option value="always">Her zaman şablon</option>
+                    <option value="never">Hiç şablon kullanma (yalnız 24 saat penceresi içinde çalışır)</option>
+                </select>
+            </div>
+            <label class="check"><input type="checkbox" id="set_cloudTplDoc" /> Şablonun başlığı belge (PDF) — ekstre eki şablon başlığına konsun</label>
+            <div class="hint">Mesaj metnimiz çok satırlı olduğu için şablona konurken tek satıra indirilir (satır sonları " · " olur) — şablonun gövdesi <code>{{1}}</code> içermelidir.</div>
+            <div class="row" style="margin-top:6px">
+                <div class="field"><label>Test numarası (isteğe bağlı)</label><input id="set_cloudTestPhone" placeholder="5xx xxx xx xx — boşsa yalnız kimlik doğrulanır" /></div>
+                <div class="field" style="flex:.5; display:flex; align-items:flex-end"><button class="btn ghost sm" id="set_cloudTest" style="width:100%">Cloud API'yi Sına</button></div>
+            </div>
+            <div class="hint" style="margin-top:6px">⚠ Bu modda <b>gelen mesaj alınamaz</b> (webhook gerekir): AI Oto-Yanıt çalışmaz, Pano'da teslim/okundu sayacı boş kalır, gönderilen mesaj <b>geri çekilemez</b>.</div>
         </div>
         <div class="row">
             <button class="btn green sm" id="set_saveWa" style="flex:1">WhatsApp Modunu Kaydet</button>
@@ -776,13 +845,19 @@
 
 <!-- ─── WhatsApp QR MODAL ─── -->
 <div id="waModal" class="overlay hidden">
-    <div class="modal" style="max-width:360px; text-align:center">
-        <h2>WhatsApp Bağlantısı</h2>
+    <div class="modal" style="max-width:760px">
+        <h2 style="text-align:center">WhatsApp Bağlantısı</h2>
+        <!-- Çok numara: her hesabın kendi kartı + kendi QR'ı. Kartlar aynı anda
+             görünür → 2/3/4 telefon aynı anda okutulabilir. -->
         <div id="waContent" class="qrbox">
             <p class="muted">Durum yükleniyor...</p>
         </div>
+        <div class="hint" id="waPoolHint" style="margin-top:10px; display:none">
+            Her numara <b>kendi</b> ısınma rampasını ve günlük tavanını taşır — numara ekledikçe toplam kapasite artar.
+            Bir müşteriye <b>hep aynı</b> numaradan yazılır (yapışkan eşleme), gelen cevap da o hattan yanıtlanır.
+        </div>
         <div class="actions">
-            <button class="btn ghost" id="waRefresh">Oturumu Sıfırla</button>
+            <button class="btn ghost" id="waAdd">+ Numara Ekle</button>
             <button class="btn" id="waClose">Kapat</button>
         </div>
     </div>

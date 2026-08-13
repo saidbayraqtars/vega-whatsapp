@@ -339,15 +339,21 @@ async function pollWa() {
         state.waReady = r.ready;
         const dot = $('waDot');
         const label = $('waLabel');
-        if (r.ready) { dot.className = 'dot on'; label.textContent = r.relay ? 'Ana PC üzerinden bağlı' : 'WhatsApp bağlı'; }
+        // Çok numara: kaç hat bağlı, sidebar'da görünsün ("3/4 numara bağlı").
+        const multi = !r.relay && !r.cloud && (r.total || 0) > 1;
+        if (r.ready && multi) { dot.className = 'dot on'; label.textContent = `${r.readyCount}/${r.total} numara bağlı`; }
+        else if (r.ready) { dot.className = 'dot on'; label.textContent = r.relay ? 'Ana PC üzerinden bağlı' : (r.cloud ? 'Cloud API bağlı' : 'WhatsApp bağlı'); }
+        else if (multi) { dot.className = 'dot wait'; label.textContent = `0/${r.total} numara — QR bekliyor`; }
         else if (r.relay) { dot.className = 'dot wait'; label.textContent = 'Ana PC bekleniyor'; }
+        else if (r.cloud) { dot.className = 'dot wait'; label.textContent = 'Cloud API hatası'; }
         else if (r.hasQr) { dot.className = 'dot wait'; label.textContent = 'QR bekliyor'; }
         else { dot.className = 'dot wait'; label.textContent = 'Bağlanıyor...'; }
 
         // QR modal açıksa içeriği güncelle
         if (!$('waModal').classList.contains('hidden')) renderWaModal(r);
-        // Ban uyarı eşiği aşıldıysa devam-onayı popup'ı.
-        handleWarn(r.antiban);
+        // Ban uyarı eşiği aşıldıysa devam-onayı popup'ı (çok numarada hangi hat olduğu yazılır).
+        const warned = (r.accounts || []).find((a) => a.antiban && a.antiban.warnPending);
+        handleWarn(r.antiban, warned ? warned.label : null);
     } catch { /* yok say */ }
 }
 
@@ -356,12 +362,13 @@ async function pollWa() {
 // Evet → sunucuya onay (o kata) → gönderim sürer. Hayır → 30 dk ertele (otomatik
 // gönderim zaten duraklı kalır; gün dönünce ya da onayla sürer).
 let warnSnoozeUntil = 0;
-function handleWarn(ab) {
+function handleWarn(ab, accLabel) {
     if (!ab || !ab.warnPending) return;
     if (Date.now() < warnSnoozeUntil) return;
     const modal = $('warnModal');
     if (!modal.classList.contains('hidden')) return;
-    $('warnMsg').textContent = `Bu numaradan bugün ${ab.daySent ?? '?'} mesaj gönderildi (uyarı eşiği ${ab.warnAt}). Göndermeye devam edilsin mi?`;
+    const who = accLabel ? `"${accLabel}" hattından` : 'Bu numaradan';
+    $('warnMsg').textContent = `${who} bugün ${ab.daySent ?? '?'} mesaj gönderildi (uyarı eşiği ${ab.warnAt}). Göndermeye devam edilsin mi?`;
     modal.classList.remove('hidden');
 }
 $('warnGo').onclick = async () => {
@@ -377,6 +384,9 @@ $('warnStop').onclick = () => {
 
 function renderWaModal(r) {
     const c = $('waContent');
+    // Numara ekleme/havuz açıklaması yalnız Yerel modda anlamlı (relay/cloud'da QR yok).
+    $('waPoolHint').style.display = 'none';
+    $('waAdd').style.display = 'none';
     if (r.relay) {
         // Relay modu: bu PC kendi WhatsApp'ını açmaz; durum ana PC'den gelir. QR yok.
         c.innerHTML = r.ready
@@ -384,24 +394,115 @@ function renderWaModal(r) {
             : `<p class="nophone">${esc(r.error || 'Ana PC bekleniyor')}</p><p class="muted" style="margin-top:8px">Ana PC açık ve WhatsApp bağlı olmalı. Adres/token için Ayarlar → WhatsApp Gönderim Modu.</p>`;
         return;
     }
-    if (r.ready) {
-        c.innerHTML = `<p style="color:var(--primary); font-weight:600">✓ WhatsApp bağlı</p><p class="muted">${r.me ? r.me.split(':')[0] : ''}</p>`;
-    } else if (r.qrImage) {
-        c.innerHTML = `<img src="${r.qrImage}" alt="QR" /><p class="muted" style="margin-top:10px">Telefonda WhatsApp → Bağlı Cihazlar → Cihaz Bağla</p>`;
-    } else if (r.error) {
-        c.innerHTML = `<p class="nophone">${esc(r.error)}</p><p class="muted">Yeniden deneniyor...</p>`;
-    } else {
-        c.innerHTML = `<p class="muted">Bağlanıyor / QR hazırlanıyor...</p>`;
+    if (r.cloud) {
+        // Cloud API modu: Baileys yok, QR yok. Durum Meta'dan gelir.
+        const info = (r.cloud && typeof r.cloud === 'object') ? r.cloud : null;
+        c.innerHTML = r.ready
+            ? `<p style="color:var(--primary); font-weight:600">✓ Cloud API bağlı (resmî kanal)</p>
+               <p class="muted">${esc((info && info.displayPhone) || r.me || '')}${info && info.name ? ' · ' + esc(info.name) : ''}</p>
+               <p class="muted" style="margin-top:8px">${info && info.quality ? 'Kalite: ' + esc(info.quality) + ' · ' : ''}${info && info.tier ? 'Kademe: ' + esc(info.tier) : ''}</p>
+               <p class="muted" style="margin-top:8px">QR yok — numara Meta'da kayıtlı. Gelen mesaj ve teslim bildirimi bu modda alınmaz.</p>`
+            : `<p class="nophone">${esc(r.error || 'Cloud API hazır değil')}</p><p class="muted" style="margin-top:8px">Ayarlar → WhatsApp Gönderim Modu → Cloud API alanlarını kontrol edin.</p>`;
+        return;
     }
+    // ─── Yerel mod: her numara için ayrı kart (QR'lar AYNI ANDA görünür) ───
+    const accs = Array.isArray(r.accounts) && r.accounts.length ? r.accounts : null;
+    if (accs) { $('waPoolHint').style.display = ''; $('waAdd').style.display = ''; }
+    if (!accs) {
+        // Eski/tekil yanıt (sunucu güncellenmemişse) — geri düşüş.
+        if (r.ready) c.innerHTML = `<p style="color:var(--primary); font-weight:600">✓ WhatsApp bağlı</p><p class="muted">${r.me ? r.me.split(':')[0] : ''}</p>`;
+        else if (r.qrImage) c.innerHTML = `<img src="${r.qrImage}" alt="QR" /><p class="muted" style="margin-top:10px">Telefonda WhatsApp → Bağlı Cihazlar → Cihaz Bağla</p>`;
+        else if (r.error) c.innerHTML = `<p class="nophone">${esc(r.error)}</p><p class="muted">Yeniden deneniyor...</p>`;
+        else c.innerHTML = `<p class="muted">Bağlanıyor / QR hazırlanıyor...</p>`;
+        return;
+    }
+    c.innerHTML = `<div class="waCards">${accs.map(renderWaCard).join('')}</div>`;
+}
+
+// Tek hesap kartı: ad, durum, QR (bağlı değilse), gönderim sayacı, düğmeler.
+function renderWaCard(a) {
+    const phone = a.me ? String(a.me).split(':')[0].split('@')[0] : '';
+    let body, state, stateCls;
+    if (a.ready) {
+        state = '✓ Bağlı'; stateCls = 'ok';
+        const ab = a.antiban || null;
+        const cap = ab && ab.dailyCap != null ? ` / ${ab.dailyCap}` : '';
+        const sent = ab && ab.daySent != null ? ab.daySent : (a.daySent || 0);
+        body = `<p class="waMe">${esc(phone)}</p>
+                <p class="muted" style="font-size:12px">Bugün: <b>${sent}</b>${cap} mesaj${ab && ab.warmup ? ` · ısınma günü ${ab.dayIndex + 1}` : ''}</p>
+                ${ab && ab.cooldownUntil ? `<p class="waState bad">⏸ Soğuma: ${esc(ab.cooldownReason || 'ban şüphesi')}</p>` : ''}`;
+    } else if (a.qrImage) {
+        state = 'QR bekliyor'; stateCls = '';
+        body = `<img src="${a.qrImage}" alt="QR" />
+                <p class="muted" style="font-size:12px">WhatsApp → Bağlı Cihazlar → Cihaz Bağla</p>`;
+    } else if (a.error) {
+        state = 'Hata'; stateCls = 'bad';
+        body = `<p class="nophone" style="font-size:12.5px">${esc(a.error)}</p>`;
+    } else {
+        state = 'Bağlanıyor...'; stateCls = '';
+        body = `<p class="muted" style="font-size:12.5px">QR hazırlanıyor</p>`;
+    }
+    return `<div class="waCard ${a.ready ? 'on' : ''}">
+        <div class="waName"><span class="dot ${a.ready ? 'on' : 'wait'}"></span>${esc(a.label || a.id)}</div>
+        <div class="waState ${stateCls}">${esc(state)}</div>
+        ${body}
+        <div class="waActs">
+            <button class="btn ghost sm" data-wa="rename" data-id="${esc(a.id)}">Ad</button>
+            <button class="btn ghost sm" data-wa="refresh" data-id="${esc(a.id)}">Sıfırla</button>
+            ${a.id === 'main' ? '' : `<button class="btn ghost sm" data-wa="remove" data-id="${esc(a.id)}">Kaldır</button>`}
+        </div>
+    </div>`;
+}
+
+// Kart düğmeleri delege edilir (kartlar her yoklamada yeniden çizilir; ad metni
+// kesme işareti içerse bile inline onclick gibi kırılmaz).
+$('waContent').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-wa]');
+    if (!btn) return;
+    const id = btn.getAttribute('data-id');
+    const card = btn.closest('.waCard');
+    const label = card ? (card.querySelector('.waName')?.textContent || id).trim() : id;
+    if (btn.dataset.wa === 'rename') waRenameAcc(id);
+    else if (btn.dataset.wa === 'refresh') waRefreshAcc(id);
+    else if (btn.dataset.wa === 'remove') waRemoveAcc(id, label);
+});
+
+// Oturumu sıfırla: o numaranın auth'u silinir, yeni QR çıkar. Diğer numaralar etkilenmez.
+async function waRefreshAcc(id) {
+    if (!confirm('Bu numaranın oturumu sıfırlanacak, yeni QR çıkacak. Devam?')) return;
+    try { await api(`/wa/accounts/${id}/refresh`, { method: 'POST' }); } catch (e) { alert('Hata: ' + e.message); }
+    setTimeout(pollWa, 1200);
+}
+
+// Numarayı tamamen kaldır (oturum kapanır, eşlemeleri silinir).
+async function waRemoveAcc(id, label) {
+    if (!confirm(`"${label}" numarası kaldırılacak. Bu hattaki oturum kapanır ve müşteri eşlemeleri silinir. Devam?`)) return;
+    try {
+        const r = await api(`/wa/accounts/${id}`, { method: 'DELETE' });
+        if (!r.success) alert(r.message || 'Kaldırılamadı.');
+    } catch (e) { alert('Hata: ' + e.message); }
+    setTimeout(pollWa, 800);
+}
+
+async function waRenameAcc(id) {
+    const label = prompt('Numara adı (ör. Satış hattı):');
+    if (label == null) return;
+    try { await api(`/wa/accounts/${id}/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label }) }); }
+    catch (e) { alert('Hata: ' + e.message); }
+    setTimeout(pollWa, 400);
 }
 
 $('waBtn').onclick = () => { $('waModal').classList.remove('hidden'); pollWa(); };
 $('waClose').onclick = () => $('waModal').classList.add('hidden');
-$('waRefresh').onclick = async () => {
-    if (!confirm('WhatsApp oturumu sıfırlanacak, yeni QR çıkacak. Devam?')) return;
-    $('waContent').innerHTML = '<p class="muted">Sıfırlanıyor...</p>';
-    await api('/wa/refresh', { method: 'POST' });
-    setTimeout(pollWa, 1500);
+// Yeni numara: hemen kendi QR'ını üretmeye başlar; mevcut bağlantılar bozulmaz.
+$('waAdd').onclick = async () => {
+    const label = prompt('Yeni numaranın adı (ör. 2. Numara / Satış hattı):', '');
+    if (label == null) return;
+    try {
+        const r = await api('/wa/accounts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label }) });
+        if (!r.success) alert(r.message || 'Eklenemedi.');
+    } catch (e) { alert('Hata: ' + e.message); }
+    setTimeout(pollWa, 1000);
 };
 // ═══════════════════════════════════════════════════════════════════════════
 //  Ayarlar modalı (SQL bağlantısı + varsayılan firma/dönem — en başa dönmez)
@@ -451,9 +552,24 @@ async function openSettings() {
             $('set_relayTarget').value = w.relayTarget || '';
             $('set_relayToken').value = '';
             $('set_relayToken').placeholder = w.hasToken ? '(kayıtlı — değişmeyecekse boş bırak)' : 'ortak gizli parola';
+            const c = w.cloud || {};
+            $('set_cloudPhoneId').value = c.phoneNumberId || '';
+            $('set_cloudApiVersion').value = c.apiVersion || 'v21.0';
+            $('set_cloudToken').value = '';
+            $('set_cloudToken').placeholder = c.hasToken ? '(kayıtlı — değişmeyecekse boş bırak)' : 'EAAG... (System User kalıcı anahtarı)';
+            $('set_cloudTplName').value = c.templateName || '';
+            $('set_cloudTplLang').value = c.templateLang || 'tr';
+            $('set_cloudTplParams').value = (c.templateParamCount != null) ? c.templateParamCount : 1;
+            $('set_cloudTplMode').value = c.templateMode || 'auto';
+            $('set_cloudTplDoc').checked = !!c.templateDocHeader;
             toggleRelayFields();
             const wr = $('set_waResult');
-            if (w.relay) {
+            if (w.mode === 'cloud' && c.status) {
+                wr.style.display = ''; wr.className = c.status.ready ? 'hint ok' : 'err';
+                wr.textContent = c.status.ready
+                    ? `✓ Cloud API bağlı (${(c.status.cloud && c.status.cloud.displayPhone) || c.status.me})`
+                    : ('Cloud API: ' + (c.status.error || 'bekleniyor'));
+            } else if (w.relay) {
                 wr.style.display = ''; wr.className = w.relay.ready ? 'hint ok' : 'hint';
                 wr.textContent = w.relay.ready
                     ? `✓ Ana PC bağlı (${(w.relay.me || '').split(':')[0].split('@')[0]})`
@@ -465,12 +581,42 @@ async function openSettings() {
     $('settingsModal').classList.remove('hidden');
 }
 
-// WhatsApp Modu: relay seçilince ana PC adresi alanını göster.
+// WhatsApp Modu: seçime göre ilgili alan grubunu göster (relay adresi / Cloud API).
 function toggleRelayFields() {
-    const el = $('set_relayFields');
-    if (el) el.style.display = ($('set_waMode').value === 'relay') ? '' : 'none';
+    const mode = $('set_waMode').value;
+    const rel = $('set_relayFields');
+    if (rel) rel.style.display = (mode === 'relay') ? '' : 'none';
+    const cl = $('set_cloudFields');
+    if (cl) cl.style.display = (mode === 'cloud') ? '' : 'none';
 }
 $('set_waMode').onchange = toggleRelayFields;
+
+// Cloud API ayar alanlarını istek gövdesine çevir (kaydet + sına ortak kullanır).
+function cloudBody() {
+    return {
+        cloudPhoneNumberId: $('set_cloudPhoneId').value.trim(),
+        cloudApiVersion: $('set_cloudApiVersion').value.trim(),
+        cloudToken: $('set_cloudToken').value,
+        cloudTemplateName: $('set_cloudTplName').value.trim(),
+        cloudTemplateLang: $('set_cloudTplLang').value.trim(),
+        cloudTemplateParamCount: $('set_cloudTplParams').value,
+        cloudTemplateMode: $('set_cloudTplMode').value,
+        cloudTemplateDocHeader: $('set_cloudTplDoc').checked,
+    };
+}
+
+// Kaydetmeden dene: kimlik doğrula, test numarası verilmişse tek mesaj at.
+$('set_cloudTest').onclick = async () => {
+    const box = $('set_waResult');
+    box.style.display = ''; box.className = 'hint'; box.textContent = 'Sınanıyor...';
+    try {
+        const body = { ...cloudBody(), testPhone: $('set_cloudTestPhone').value.trim() };
+        const r = await api('/settings/wa/cloud-test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        box.className = r.success ? 'hint ok' : 'err';
+        box.textContent = r.message || (r.success ? 'Tamam.' : 'Başarısız.');
+    } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
+};
+
 $('set_saveWa').onclick = async () => {
     const box = $('set_waResult');
     box.style.display = ''; box.className = 'hint'; box.textContent = 'Kaydediliyor...';
@@ -479,6 +625,7 @@ $('set_saveWa').onclick = async () => {
             mode: $('set_waMode').value,
             relayTarget: $('set_relayTarget').value.trim(),
             relayToken: $('set_relayToken').value,
+            ...cloudBody(),
         };
         const r = await api('/settings/wa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         if (r.success) {
@@ -489,10 +636,17 @@ $('set_saveWa').onclick = async () => {
                 box.textContent = (r.relay && r.relay.ready)
                     ? `✓ Relay kaydedildi — ana PC bağlı (${r.relayTarget}).`
                     : `✓ Relay kaydedildi (${r.relayTarget}). Ana PC durumu: ${(r.relay && r.relay.error) || 'bekleniyor'}`;
+            } else if (r.mode === 'cloud') {
+                const ok = r.cloud && r.cloud.ready;
+                box.className = ok ? 'hint ok' : 'err';
+                box.textContent = ok
+                    ? `✓ Cloud API kaydedildi — bağlı (${(r.cloud.info && r.cloud.info.displayPhone) || r.cloud.me}).`
+                    : `Kaydedildi ama Meta doğrulamadı: ${(r.cloud && r.cloud.error) || 'bilinmiyor'}`;
             } else {
                 box.textContent = '✓ Yerel mod kaydedildi (bu PC WhatsApp oturumu tutar).';
             }
             $('set_relayToken').value = '';
+            $('set_cloudToken').value = '';
             try { pollWa(); } catch { /* yok say */ }
         } else {
             box.className = 'err'; box.textContent = r.message || 'Kaydedilemedi.';
@@ -892,6 +1046,19 @@ function renderDashboard(r) {
     } else {
         $('pn_ab_body').style.display = 'none';
         $('pn_ab_off').style.display = '';
+    }
+    // Çok numara: hat hat doluluk (kart yalnız en kritik hattı gösteriyor).
+    const abAccs = Array.isArray(r.antibanAccounts) ? r.antibanAccounts : [];
+    const accBox = $('pn_ab_accs');
+    if (accBox) {
+        if (abAccs.length > 1) {
+            accBox.style.display = '';
+            accBox.innerHTML = abAccs.map((a) => {
+                const phone = a.me ? String(a.me).split(':')[0].split('@')[0] : '';
+                return `<div>• <b>${esc(a.label || a.id)}</b> ${esc(phone)} — bugün ${a.daySent || 0}/${a.dailyCap || 0}` +
+                    `${a.cooldownUntil ? ' · ⏸ soğumada' : ''}</div>`;
+            }).join('');
+        } else accBox.style.display = 'none';
     }
 
     // 7 günlük mini grafik
@@ -2237,6 +2404,7 @@ async function initAiBotView() {
         $('ab_save').onclick = saveAiBot;
         $('ab_test').onclick = testAiBotKey;
         $('ab_provider').onchange = () => abApplyProvider(true);
+        $('ab_replyMode').onchange = abApplyReplyMode;
         $('ab_kontorRefresh').onclick = () => abRefreshKontor(true);
         abLoaded = true;
     }
@@ -2293,6 +2461,30 @@ function abApplyProvider(resetModel) {
     if (p.metered) abRefreshKontor();
 }
 
+// ─── Yanıt modu (Nöbetçi / Yapay zekâ) ──────────────────────────────────────
+// Nöbetçi modda model hiç çağrılmaz → sağlayıcı/anahtar/kontör/sohbet ayarları
+// anlamsızdır, gizlenir. Ekranda yalnız gerçekten işleyen alanlar kalsın.
+const AB_AI_ONLY = [
+    'ab_provider', 'ab_keyBox', 'ab_meteredNote', 'ab_test', 'ab_kontorCard', 'ab_chatMode',
+    'ab_history', 'ab_maxTokens', 'ab_businessName', 'ab_paymentInfo', 'ab_extra',
+    'ab_startHour', 'ab_endHour', 'ab_minGap', 'ab_onlySms', 'ab_movements',
+    'ab_maxThread', 'ab_closeCooldown', 'ab_closingMsg',
+];
+function abApplyReplyMode() {
+    const ack = $('ab_replyMode').value === 'ack';
+    $('ab_ackBox').style.display = ack ? '' : 'none';
+    for (const id of AB_AI_ONLY) {
+        const el = $(id);
+        if (!el) continue;
+        // Kutu (div) ise kendisi, alan (input/select) ise etiketiyle birlikte
+        // sarmalayıcısı gizlenir. DİKKAT: closest'a .card KOYMA — sarmalayıcı
+        // bulunamayınca tüm ayar kartını gizler.
+        const box = (el.tagName === 'DIV') ? el : (el.closest('.field, .row, .toolbar, .check') || el);
+        box.style.display = ack ? 'none' : '';
+    }
+    if (!ack) abApplyProvider(false);
+}
+
 // ─── Kontör paneli ──────────────────────────────────────────────────────────
 // Bakiye kontör sunucusundadır; burada yalnız gösterilir. Yükleme uzaktan yapılır.
 async function abRefreshKontor(force) {
@@ -2334,6 +2526,12 @@ async function loadAiBotConfig() {
     const c = r.config;
     $('ab_enabled').checked = !!c.enabled;
     $('ab_chatMode').checked = c.chatMode !== false;
+    $('ab_replyMode').value = c.replyMode || 'ai';
+    $('ab_ackMessage').value = c.ackMessage || '';
+    $('ab_notifyPhone').value = c.notifyPhone || '';
+    $('ab_notifyGapMin').value = c.notifyGapMin ?? 5;
+    $('ab_ackCooldownHours').value = c.ackCooldownHours ?? 6;
+    $('ab_ackUnknown').checked = c.ackUnknown !== false;
     $('ab_provider').value = c.provider || 'vega';
     $('ab_model').value = c.model || '';
     $('ab_baseUrl').value = c.baseUrl || '';
@@ -2366,6 +2564,9 @@ async function loadAiBotConfig() {
     $('ab_maxThread').value = c.maxThreadReplies ?? 4;
     $('ab_closeCooldown').value = c.closeCooldownHours ?? 6;
     $('ab_closingMsg').value = c.closingMessage || '';
+    // Mod uygulaması EN SONDA: abApplyProvider anahtar/kontör kutularını yeniden
+    // görünür yapıyor → nöbetçi modda gizleme ondan sonra çalışmalı.
+    abApplyReplyMode();
     abStatus(r.status);
 }
 
@@ -2374,6 +2575,12 @@ async function saveAiBot() {
     const patch = {
         enabled: $('ab_enabled').checked,
         chatMode: $('ab_chatMode').checked,
+        replyMode: $('ab_replyMode').value,
+        ackMessage: $('ab_ackMessage').value.trim(),
+        notifyPhone: $('ab_notifyPhone').value.trim(),
+        notifyGapMin: Number($('ab_notifyGapMin').value) || 0,
+        ackCooldownHours: Number($('ab_ackCooldownHours').value) || 0,
+        ackUnknown: $('ab_ackUnknown').checked,
         provider: $('ab_provider').value,
         model: $('ab_model').value.trim(),
         baseUrl: $('ab_baseUrl').value.trim(),

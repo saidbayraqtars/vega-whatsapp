@@ -370,6 +370,22 @@ textarea { min-height: 110px; resize: vertical; line-height: 1.55; }
 .qrbox { text-align: center; padding: 10px; }
 .qrbox img { background: #fff; border-radius: 14px; padding: 10px; width: 230px; height: 230px; box-shadow: 0 8px 24px rgba(0, 0, 0, .18); }
 
+/* ─── Çok numara: hesap kartları (her hesabın kendi QR'ı aynı anda görünür) ─── */
+.waCards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; text-align: center; }
+.waCard {
+    border: 1px solid var(--line); border-radius: 14px; padding: 12px 10px;
+    background: var(--card2, var(--card)); display: flex; flex-direction: column; gap: 6px; align-items: center;
+}
+.waCard.on { border-color: var(--primary); }
+.waCard .waName { font-weight: 700; font-size: 13.5px; display: flex; align-items: center; gap: 6px; justify-content: center; }
+.waCard .waMe { font-size: 12px; color: var(--muted); }
+.waCard img { width: 200px; height: 200px; padding: 8px; }
+.waCard .waState { font-size: 12.5px; min-height: 18px; }
+.waCard .waState.ok { color: var(--primary); font-weight: 600; }
+.waCard .waState.bad { color: var(--danger, #e5484d); }
+.waCard .waActs { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; justify-content: center; }
+.waCard .waActs .btn { padding: 5px 9px; font-size: 12px; }
+
 /* ─── Modal / ilerleme ─── */
 .overlay {
     position: fixed; inset: 0; background: rgba(16, 24, 40, .5);

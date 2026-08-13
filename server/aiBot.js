@@ -31,6 +31,7 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const { normalizePhone, isLikelyValid } = require('./phone');
 
 let deps = null;
 let CONFIG_PATH = null;
@@ -39,6 +40,19 @@ let LOG_PATH = null;
 
 const DEFAULT_CONFIG = {
     enabled: false,
+    // ─── Yanıt modu ───
+    // 'ai'  : model konuşur (geniş sohbet — aşağıdaki chatMode/limitler geçerli)
+    // 'ack' : NÖBETÇİ — model HİÇ çağrılmaz. Müşteriye tek kısa alındı mesajı
+    //         ("ekibimiz dönecek") + iç numaraya "şu kişi yazdı" bildirimi.
+    // Canlı kullanımda ('ai') bot arıza/teknik mesajlara ekipten ÖNCE cevap verip
+    // müşteriyle gereksiz diyaloga giriyordu; 'ack' o riski tamamen kaldırır
+    // (halüsinasyon yok, kontör harcanmaz, tartışma büyümez).
+    replyMode: 'ai',
+    ackMessage: '',                // boşsa DEFAULT_ACK
+    ackCooldownHours: 6,           // aynı numaraya alındı mesajı en fazla bu sıklıkta
+    ackUnknown: true,              // cari kartında olmayan numaraya da alındı mesajı gönder
+    notifyPhone: '',               // iç bildirim numaraları (virgülle çoğaltılır)
+    notifyGapMin: 5,               // aynı müşteri için iç bildirim min aralığı (0 = her mesaj)
     provider: 'vega',              // 'vega' (kontörlü, anahtar gerekmez) | BYOK: 'anthropic' | 'openai' | 'gemini'
     baseUrl: '',                   // OpenAI-uyumlu özel uç (OpenRouter/DeepSeek/Groq/yerel); boşsa sağlayıcı varsayılanı
     apiKeyEnc: null,               // BYOK anahtarı — ŞİFRELİ (asla düz metin diskte). 'vega'da kullanılmaz.
@@ -65,6 +79,10 @@ const DEFAULT_CONFIG = {
     closingMessage: '',            // boşsa varsayılan kapanış metni (aşağıda DEFAULT_CLOSING)
 };
 
+// Nöbetçi modun varsayılan alındı mesajı (config.ackMessage boşsa). TEK cümle,
+// söz vermez, saat/tarih taahhüdü içermez.
+const DEFAULT_ACK = 'Mesajınızı aldık. Teknik ekibimizden bir arkadaşımız en kısa sürede size dönüş yapacaktır.';
+
 // Tartışma uzayınca gönderilecek varsayılan kapanış (config.closingMessage boşsa).
 const DEFAULT_CLOSING = 'Görüşmemizi burada nazikçe sonlandırıyorum. Bakiye veya ödemeyle ilgili net bir sorunuz olduğunda tekrar yazabilir ya da bizi telefonla arayabilirsiniz. İyi günler dilerim.';
 
@@ -72,7 +90,8 @@ let config = { ...DEFAULT_CONFIG };
 // state: günlük sayaç + numara-başı son cevap + işlenmiş mesaj id'leri (dedupe)
 //        + thread: numara-başı sohbet sayacı/kapanış (tartışma-kredi koruması)
 //        + convo: numara-başı gün içi konuşma hafızası [{role,text}]
-let state = { date: null, sent: 0, lastByPhone: {}, seenIds: [], thread: {}, convo: {} };
+//        + ack: nöbetçi modda numara-başı son alındı/bildirim anı
+let state = { date: null, sent: 0, lastByPhone: {}, seenIds: [], thread: {}, convo: {}, ack: {} };
 let log = []; // son ~200 olay (UI canlı kayıt)
 
 const todayKey = () => new Date().toISOString().slice(0, 10);
@@ -133,6 +152,12 @@ function rollDay() {
     const t = todayKey();
     if (state.date !== t) {
         state.date = t; state.sent = 0; state.lastByPhone = {}; state.thread = {}; state.convo = {};
+        // Nöbetçi defterinde yalnız SON 3 GÜN tutulur: alındı mesajı soğuması saat
+        // ölçeğinde, eski kayıtlar sadece dosyayı şişirir.
+        const keep = Date.now() - 3 * 24 * 3600000;
+        for (const [k, v] of Object.entries(state.ack || {})) {
+            if (Math.max(v.ackAt || 0, v.notifyAt || 0) < keep) delete state.ack[k];
+        }
         saveState();
     }
 }
@@ -187,6 +212,8 @@ function setConfig(patch) {
         'onlySmsGonder', 'includeMovements',
         'chatMode', 'historyTurns', 'maxReplyTokens',
         'maxThreadReplies', 'threadWindowMin', 'closeCooldownHours', 'closingMessage',
+        // Nöbetçi (ack) modu
+        'replyMode', 'ackMessage', 'ackCooldownHours', 'ackUnknown', 'notifyPhone', 'notifyGapMin',
     ];
     for (const k of ALLOWED) if (patch[k] !== undefined) next[k] = patch[k];
     if (patch.provider !== undefined) next.provider = normProvider(patch.provider);
@@ -208,6 +235,8 @@ function getStatus() {
         hasApiKey: metered ? true : hasApiKey(),
         metered,
         chatMode: !!config.chatMode,
+        replyMode: config.replyMode || 'ai',
+        notifyPhone: config.notifyPhone || '',
         credits: metered && deps?.credits ? deps.credits.getStatus() : null,
         provider: config.provider, model: config.model,
         firmaNo: config.firmaNo, donemNo: config.donemNo,
@@ -493,7 +522,9 @@ function buildUser(ctx, incomingText) {
 // ─── Gelen mesaj işleyici (whatsapp.js → setIncomingHandler) ─────────────────
 const inFlight = new Set(); // numara-başı eş zamanlı işlem kilidi (çift-cevap yarışı önleme)
 
-async function handleIncoming({ phone, text, jid, id }) {
+// accountId: mesajın geldiği WhatsApp hattı (çok numaralı kurulumda). Cevap AYNI
+// hattan gitmeli — müşteri iki ayrı numaradan konuşulmuş gibi görmesin.
+async function handleIncoming({ phone, text, jid, id, accountId = null }) {
     if (!config.enabled) return;
     rollDay();
 
@@ -511,13 +542,102 @@ async function handleIncoming({ phone, text, jid, id }) {
     if (inFlight.has(phone)) { addLog({ phone, kind: 'skip', reason: 'önceki mesaj işleniyor' }); return; }
     inFlight.add(phone);
     try {
-        await handleIncomingInner({ phone, text, jid, id });
+        await handleIncomingInner({ phone, text, jid, id, accountId });
     } finally {
         inFlight.delete(phone);
     }
 }
 
-async function handleIncomingInner({ phone, text, jid, id }) {
+// ═══════════════════════════════════════════════════════════════════════════
+//  NÖBETÇİ (ack) MODU — model hiç çağrılmaz
+// ═══════════════════════════════════════════════════════════════════════════
+//  Canlı denemede AI her konuya (arıza/teknik dahil) atlayıp ekipten önce cevap
+//  veriyor, müşteriyle gereksiz uzun diyaloga giriyordu. Bu modda bot EN FAZLA
+//  iki şey yapar:
+//    1) müşteriye TEK kısa alındı mesajı — söz vermez, saat/tarih taahhüdü yok,
+//       aynı numaraya ackCooldownHours boyunca tekrar yazmaz (5 mesaj = 1 cevap);
+//    2) iç numaraya "şu kişi yazdı + mesajı" bildirimi (notifyGapMin ile kısılır).
+//  Model çağrısı yok → halüsinasyon yok, kontör harcanmaz, tartışma büyümez.
+
+// İç bildirim hedefleri: virgül/;/satır sonu ile çoğaltılır.
+function notifyTargets() {
+    return String(config.notifyPhone || '')
+        .split(/[,;\n\r/|]+/).map((s) => normalizePhone(s.trim())).filter((p) => isLikelyValid(p));
+}
+
+async function handleAckMode({ phone, text, accountId }) {
+    const now = Date.now();
+    const me = normalizePhone(phone);
+    const targets = notifyTargets();
+
+    // Kendi iç numaralarımızdan gelen mesaja alındı yazma (bot-bot döngüsü olmasın).
+    if (targets.includes(me)) { addLog({ phone, kind: 'skip', reason: 'iç bildirim numarası — cevap yazılmadı' }); return; }
+    if (!deps.waStatus || !deps.waStatus().ready) { addLog({ phone, kind: 'skip', reason: 'WhatsApp bağlı değil' }); return; }
+
+    if (!state.ack) state.ack = {};
+    const rec = state.ack[me] || { ackAt: 0, notifyAt: 0 };
+
+    // Müşterinin adı (varsa) bildirimde geçsin — bulunamazsa numara yeter.
+    let name = '';
+    let known = false;
+    try {
+        let firmaNo = config.firmaNo;
+        if (!firmaNo && deps.getContext) firmaNo = deps.getContext()?.firmaNo;
+        if (firmaNo && deps.findCariByPhone) {
+            const cari = await deps.findCariByPhone(firmaNo, phone);
+            if (cari) { known = true; name = cari.name || cari.firma || ''; }
+        }
+    } catch { /* isim bulunamazsa numara ile devam */ }
+
+    // 1) İÇ BİLDİRİM — "şu kişi mesaj attı, haberin olsun".
+    const gapMs = Math.max(0, Number(config.notifyGapMin) || 0) * 60000;
+    if (targets.length && (!gapMs || now - (rec.notifyAt || 0) >= gapMs)) {
+        const body = `📩 *Yeni müşteri mesajı*\n` +
+            `Gönderen: ${name ? name + ' — ' : ''}${me}${known ? '' : ' (cari kartında yok)'}\n` +
+            `Mesaj: ${String(text || '').slice(0, 600)}\n\n` +
+            `Lütfen dönüş yapın.`;
+        for (const t of targets) {
+            // İç bildirimde hat SABİTLENMEZ: müşterinin hattı o an tavanda/kopuksa
+            // haber kaybolmasın diye havuz uygun numarayı seçsin.
+            try { await deps.waSend(t, body, null, { channel: 'aibot' }); }
+            catch (e) { addLog({ phone, kind: 'error', reason: 'iç bildirim gönderilemedi: ' + e.message }); }
+        }
+        rec.notifyAt = now;
+        addLog({ phone, name, kind: 'notify', reason: `iç bildirim → ${targets.join(', ')}`, incoming: String(text || '').slice(0, 80) });
+    }
+
+    // 2) MÜŞTERİYE ALINDI MESAJI — numara başına en fazla ackCooldownHours'ta bir.
+    if (!known && !config.ackUnknown) {
+        state.ack[me] = rec; saveState();
+        addLog({ phone, kind: 'skip', reason: 'numara cari kartında yok (alındı mesajı kapalı)' }); return;
+    }
+    const coolMs = Math.max(0, Number(config.ackCooldownHours) || 0) * 3600000;
+    if (coolMs && now - (rec.ackAt || 0) < coolMs) {
+        state.ack[me] = rec; saveState();
+        addLog({ phone, name, kind: 'skip', reason: 'alındı mesajı yakın zamanda gönderildi (tek cevap kuralı)' }); return;
+    }
+    if (Number(config.dailyCap) > 0 && state.sent >= Number(config.dailyCap)) {
+        addLog({ phone, kind: 'skip', reason: 'günlük tavan doldu' }); return;
+    }
+    const ackText = (config.ackMessage && config.ackMessage.trim()) || DEFAULT_ACK;
+    const r = await deps.waSend(phone, ackText, null, { simulateTyping: true, typingMs: 900, channel: 'aibot', accountId });
+    if (r && r.success) {
+        rec.ackAt = now;
+        state.sent++;
+        state.lastByPhone[phone] = now;
+        if (deps.recordSent) deps.recordSent();
+        addLog({ phone, name, kind: 'reply', reason: 'nöbetçi mod — alındı mesajı', reply: ackText.slice(0, 120), incoming: String(text || '').slice(0, 80) });
+    } else {
+        addLog({ phone, name, kind: 'error', reason: 'alındı mesajı gönderilemedi: ' + ((r && r.error) || 'bilinmiyor') });
+    }
+    state.ack[me] = rec;
+    saveState();
+}
+
+async function handleIncomingInner({ phone, text, jid, id, accountId = null }) {
+    // Nöbetçi mod: model devre dışı — alındı mesajı + iç bildirim ile bitir.
+    if (config.replyMode === 'ack') return handleAckMode({ phone, text, accountId });
+
     // Sağlayıcı hazırlık kontrolü: kontörlü modda anahtar değil KONTÖR aranır.
     if (isMetered()) {
         if (!deps.credits) { addLog({ phone, kind: 'skip', reason: 'kontör istemcisi yok' }); return; }
@@ -558,7 +678,7 @@ async function handleIncomingInner({ phone, text, jid, id }) {
     if (maxThread > 0 && th.n >= maxThread) {
         if (deps.waStatus && deps.waStatus().ready) {
             const closing = (config.closingMessage && config.closingMessage.trim()) || DEFAULT_CLOSING;
-            const r = await deps.waSend(phone, closing, null, { simulateTyping: true, typingMs: 1000, channel: 'aibot' });
+            const r = await deps.waSend(phone, closing, null, { simulateTyping: true, typingMs: 1000, channel: 'aibot', accountId });
             th.closedUntil = nowMs + Math.max(1, Number(config.closeCooldownHours) || 6) * 3600000;
             th.n = 0; th.since = nowMs;
             state.thread[phone] = th;
@@ -682,7 +802,7 @@ async function handleIncomingInner({ phone, text, jid, id }) {
         addLog({ phone, name: ctx.name, kind: 'silent', incoming: text.slice(0, 80) }); return;
     }
 
-    const r = await deps.waSend(phone, outText, media, { simulateTyping: true, typingMs: 1200, channel: 'aibot' });
+    const r = await deps.waSend(phone, outText, media, { simulateTyping: true, typingMs: 1200, channel: 'aibot', accountId });
     if (r && r.success) {
         state.sent++;
         state.lastByPhone[phone] = Date.now();

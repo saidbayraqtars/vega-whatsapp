@@ -31,6 +31,18 @@ const antiban = require('./antiban');
 const { normalizePhone, isLikelyValid } = require('./phone');
 
 let deps = null;
+
+// Anti-ban kapısı/sayacı: çok numaralı kurulumda gönderen hat gönderim anında
+// seçilir → kapıyı server.js verir (accounts.gate), sayacı gönderim yolu işler.
+// deps.gate yoksa eski tekil davranış (geri uyum).
+const gateSend = (ch) => (deps.gate ? deps.gate(ch) : antiban.gate(deps.waStatus().me, null, ch));
+const noteSent = (ch) => {
+    try {
+        if (deps.recordSent) deps.recordSent(ch);
+        else antiban.recordSent(deps.waStatus().me, ch);
+    } catch { /* yok say */ }
+};
+
 let CONFIG_PATH = null;
 let STATE_PATH = null;
 let LOG_PATH = null;
@@ -193,7 +205,7 @@ async function tableExists(pool, name) {
 // Ban-şüphesi soğuması dışında tavan uygulamıyoruz (bkz. başlıktaki ANTI-BAN notu).
 function cooldownReason() {
     try {
-        const g = antiban.gate(deps.waStatus().me, null, 'siparis');
+        const g = gateSend('siparis');
         if (!g.ok && g.capType === 'cooldown') return g.reason;
     } catch { /* gate okunamazsa gönderime engel olma */ }
     return null;
@@ -222,7 +234,7 @@ async function sendOrQueue(entry, text) {
             simulateTyping: config.simulateTyping, typingMs: rand(900, 1800), channel: 'siparis',
         });
         if (res.success) {
-            try { antiban.recordSent(deps.waStatus().me, 'siparis'); } catch { /* yok say */ }
+            noteSent('siparis');
             recordSentDoc(entry, phone, res.id);
             pushLog({ ...entry, phone, status: entry.kind === 'cancel' ? 'cancelled' : 'sent', message: text });
             sent++;
@@ -255,7 +267,7 @@ async function processPending() {
             simulateTyping: config.simulateTyping, typingMs: rand(900, 1800), channel: 'siparis',
         });
         if (res.success) {
-            try { antiban.recordSent(deps.waStatus().me, 'siparis'); } catch { /* yok say */ }
+            noteSent('siparis');
             recordSentDoc(item, item.phone, res.id);
             pending = pending.filter(p => p !== item); savePending(); sent++;
             pushLog({ ...item, status: item.kind === 'cancel' ? 'cancelled' : 'sent', message: item.text });
@@ -573,7 +585,7 @@ async function sendTest() {
     for (const phone of phones) {
         const res = await deps.waSend(phone, text, null, { simulateTyping: false, channel: 'siparis' });
         if (res.success) {
-            try { antiban.recordSent(deps.waStatus().me, 'siparis'); } catch { /* yok say */ }
+            noteSent('siparis');
             pushLog({ key: 'test', kind: 'new', evrak: vars.evrak, firma: vars.firma, tutar: vars.tutar, phone, status: 'sent', message: text, error: 'Test mesajı' });
             ok++;
         } else {

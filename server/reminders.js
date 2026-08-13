@@ -23,6 +23,18 @@ const path = require('path');
 const antiban = require('./antiban');
 
 let deps = null;
+
+// Anti-ban kapısı/sayacı: çok numaralı kurulumda gönderen hat gönderim anında
+// seçilir → kapıyı server.js verir (accounts.gate), sayacı gönderim yolu işler.
+// deps.gate yoksa eski tekil davranış (geri uyum).
+const gateSend = (ch) => (deps.gate ? deps.gate(ch) : antiban.gate(deps.waStatus().me, null, ch));
+const noteSent = (ch) => {
+    try {
+        if (deps.recordSent) deps.recordSent(ch);
+        else antiban.recordSent(deps.waStatus().me, ch);
+    } catch { /* yok say */ }
+};
+
 let CONFIG_PATH = null;
 let LOG_PATH = null;
 let MANUAL_PHONES_PATH = null;
@@ -421,7 +433,7 @@ async function _runReminder(rem, opts = {}) {
         // Manuel "Şimdi gönder" baypas eder. lastRunAt ilerlemez → pencere açılınca sürer.
         if (!manual && antiban.inQuietHours()) { interrupted = true; stopReason = antiban.quietReason(); break; }
         // Anti-ban tavanı (warm-up/saatlik/günlük) doldu → turu kes; lastRunAt ilerlemez.
-        const gate = antiban.gate(deps.waStatus().me, null, 'reminder');
+        const gate = gateSend('reminder');
         if (!gate.ok) { interrupted = true; stopReason = gate.reason; break; }
 
         const contact = withManualPhone(firmaNo, c.IND, contacts.get(c.IND) || {});
@@ -489,7 +501,7 @@ async function _runReminder(rem, opts = {}) {
         }
         const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400), channel: 'reminder' });
         if (res.success) {
-            antiban.recordSent(deps.waStatus().me, 'reminder');
+            noteSent('reminder');
             sent++; rem.perCariLastSent[c.IND] = nowIso; delete rem.perCariTried[c.IND];
             pushLog({ ...logBase, gecikmeGun: ag ? ag.gecikmeGun : undefined, status: 'sent', message: text });
         } else {
@@ -639,7 +651,7 @@ async function sendOne(id, ind) {
     const media = loadMediaFromDescriptor(rem.media);
     const res = await deps.waSend(contact.phone, text, media, { simulateTyping: true, typingMs: rand(1200, 2400), channel: 'reminder' });
     if (res.success) {
-        antiban.recordSent(deps.waStatus().me, 'reminder');
+        noteSent('reminder');
         rem.perCariLastSent = rem.perCariLastSent || {}; rem.perCariTried = rem.perCariTried || {};
         rem.perCariLastSent[indNum] = new Date().toISOString();
         delete rem.perCariTried[indNum];   // elle gönderildi → "denendi" engeli kalksın

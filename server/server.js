@@ -25,11 +25,20 @@ const os = require('os');
 const crypto = require('crypto');
 const multer = require('multer');
 
-const {
-    initializeWhatsApp, refreshWhatsApp, logoutWhatsApp,
-    getStatus: waStatus, sendMessage: waSend, deleteMessage: waDelete, checkOnWhatsApp, getDailySent,
-    waitForReady: waWaitForReady, setIncomingHandler, setDisconnectHandler, setOpenHandler, setRevokedHandler,
-} = require('./whatsapp');
+// ÇOK HESAP: Baileys oturumları artık accounts.js havuzunda (2/3/4 telefon aynı
+// anda QR okutabilir). Aşağıdaki takma adlar eski tekil API'nin yerini tutar;
+// hepsi havuza gider — waStatus() "en az bir numara bağlı" der, waSend() gönderen
+// hattı seçer (yapışkan eşleme + en az yüklü), anti-ban sayacını havuz işler.
+const accounts = require('./accounts');
+const waStatus = () => accounts.status();
+const waSend = (phone, text, media, opts) => accounts.send(phone, text, media, opts);
+const waDelete = (phone, id) => accounts.deleteMessage(phone, id);
+const checkOnWhatsApp = (phone) => accounts.checkOnWhatsApp(phone);
+const getDailySent = () => accounts.totalDailySent();
+const waWaitForReady = (ms) => accounts.waitForReady(ms);
+const initializeWhatsApp = () => accounts.start();
+const refreshWhatsApp = () => accounts.refreshOne('main');
+const logoutWhatsApp = () => accounts.logoutAll();
 const { normalizePhone, isLikelyValid } = require('./phone');
 const watcher = require('./watcher');
 const siparis = require('./siparis');
@@ -40,6 +49,7 @@ const credits = require('./credits');
 const license = require('./license');
 const antiban = require('./antiban');
 const stats = require('./stats');
+const cloudapi = require('./cloudapi');
 const { buildExtrePdf } = require('./extre');
 
 const QRCode = require('qrcode');
@@ -209,8 +219,22 @@ function readStoredConfig() {
 //
 //   config.json → "wa": { "mode":"relay", "relayTarget":"http://PC1-IP:3100", "relayToken":"ORTAK-SIR" }
 //   mode yoksa "local" (PC1 varsayılanı). PC2'de mode=relay.
+//
+// ÜÇÜNCÜ MOD — cloud: Meta'nın RESMÎ WhatsApp Cloud API'si (bkz. cloudapi.js).
+// Baileys resmî olmayan istemci olduğu için rızasız ticari bildirimde hesap
+// kapatılabiliyor; cloud modunda o risk yoktur (karşılığı: mesaj ücreti + 24
+// saat penceresi dışında onaylı şablon zorunluluğu). VARSAYILAN DEĞİL —
+// kullanıcı Ayarlar'dan elle seçer, aksi halde 'local' (Baileys) çalışır.
+//
+//   config.json → "wa": { "mode":"cloud", "cloud": { phoneNumberId, token(şifreli), ... } }
 let waCfg = (loadConfigFile() || {}).wa || { mode: 'local' };
 const isRelay = () => !!waCfg && waCfg.mode === 'relay' && !!waCfg.relayTarget;
+const isCloud = () => !!waCfg && waCfg.mode === 'cloud';
+
+// Cloud modda Baileys'e özgü ban korumalarını (ısınma rampı, saatlik tavan, 403
+// soğuması) kapat. watcher/hatırlatma/sipariş antiban.gate'i DOĞRUDAN çağırıyor;
+// bayrak orada da geçerli olsun diye modüle kendisi sorulur.
+antiban.setBypass(isCloud);
 const relayUrl = (p) => String(waCfg.relayTarget || '').replace(/\/+$/, '') + p;
 const relayHeaders = () => ({ 'x-relay-token': waCfg.relayToken || '' });
 
@@ -255,13 +279,32 @@ async function pollRelayStatus() {
     }
 }
 
+// ─── Cloud API sürücüsünü config'ten besle ───────────────────────────────────
+// Token config.json'da makine anahtarıyla ŞİFRELİ durur (DB parolasıyla aynı
+// yöntem); cloudapi.js düz metin ister → burada çözülür, diske geri yazılmaz.
+cloudapi.configure({ stats, log: (m) => { try { console.log('[Cloud]', m); } catch { /* yok say */ } } });
+function applyCloudConfig() {
+    const c = (waCfg && waCfg.cloud) || null;
+    if (!c || !c.phoneNumberId || !c.token) { cloudapi.setConfig(null); return; }
+    let token = null;
+    try { token = decryptSecret(c.token); } catch { token = null; }
+    if (!token) { cloudapi.setConfig(null); console.error('[Cloud] Erişim anahtarı çözülemedi — Ayarlar\'dan yeniden girin.'); return; }
+    cloudapi.setConfig({ ...c, token });
+}
+applyCloudConfig();
+
 // ─── Mod-duyarlı WA sarmalayıcıları ──────────────────────────────────────────
-// Yerel modda gerçek Baileys fonksiyonları; relay modda PC1'e HTTP vekil.
-const waStatusX = () => isRelay()
-    ? { ready: relayStatus.ready, initializing: false, hasQr: false, qr: null, error: relayStatus.error, me: relayStatus.me }
-    : waStatus();
+// Yerel modda gerçek Baileys fonksiyonları; relay modda PC1'e HTTP vekil;
+// cloud modda Meta Cloud API. Aşağıdaki üç sarmalayıcı TEK geçiş noktasıdır —
+// watcher/hatırlatma/sipariş/ekstre hepsi bunlardan geçer.
+const waStatusX = () => {
+    if (isCloud()) return cloudapi.getStatus();
+    if (isRelay()) return { ready: relayStatus.ready, initializing: false, hasQr: false, qr: null, error: relayStatus.error, me: relayStatus.me };
+    return waStatus();
+};
 
 const waCheckX = async (phone) => {
+    if (isCloud()) return cloudapi.checkOnWhatsApp(phone);
     if (!isRelay()) return checkOnWhatsApp(phone);
     try {
         const r = await httpJson(relayUrl('/api/relay-check'), { body: { phone }, headers: relayHeaders() });
@@ -271,6 +314,7 @@ const waCheckX = async (phone) => {
 };
 
 const waSendX = async (phone, text, media = null, opts = {}) => {
+    if (isCloud()) return cloudapi.sendMessage(phone, text, media, opts);
     if (!isRelay()) return waSend(phone, text, media, opts);
     let m = null;
     if (media && media.buffer) m = { kind: media.kind, mimetype: media.mimetype, fileName: media.fileName, b64: Buffer.from(media.buffer).toString('base64') };
@@ -281,10 +325,21 @@ const waSendX = async (phone, text, media = null, opts = {}) => {
     } catch (e) { return { success: false, error: 'Ana PC erişilemiyor: ' + e.message }; }
 };
 
-// Anti-ban tek hesap = tek yer (PC1). Relay modda PC2 yerel gate/record YAPMAZ;
-// PC1'in /api/relay-send'i gate+record uygular (çift sayım olmasın).
-const gateX = (me, cap, ch) => isRelay() ? { ok: true } : antiban.gate(me, cap, ch);
-const recordSentX = (me, ch) => { if (!isRelay()) { try { antiban.recordSent(me, ch); } catch { /* yok say */ } } };
+// Mesaj geri çekme: Baileys'te var, Cloud API'de YOK (Meta desteklemiyor).
+// Watcher "belge silindi → mesajı geri çek" akışı cloud modda anlaşılır hata alır.
+const waDeleteX = async (phone, id) => {
+    if (isCloud()) return cloudapi.deleteMessage(phone, id);
+    return waDelete(phone, id);
+};
+
+// Anti-ban kapısı. Relay modda PC2 yerel gate/record YAPMAZ; PC1'in /api/relay-send'i
+// uygular (çift sayım olmasın). Cloud modda ISINMA RAMPI ANLAMSIZ: ban riski yok,
+// sınırı Meta'nın kademesi (1K/10K/100K per 24h) belirler.
+// Yerel modda kapı HAVUZA sorulur: numaralardan HERHANGİ BİRİ gönderebiliyorsa ok
+// (hangisinin göndereceği waSendX içinde, gönderim anında seçilir).
+const gateX = (ch, cap) => (isRelay() || isCloud()) ? { ok: true } : accounts.gate(ch, cap);
+// NOT: gönderim sayacı artık TEK yerde işler — yerelde accounts.send (hangi hat
+// gönderdiyse onun sayacı), relayde PC1, cloudda hiç. Çağıranlar ayrıca saymaz.
 
 // Relay modda otomasyonu (watcher/hatırlatma/aktif-cari) BAŞLATMA — belge bildirimi
 // + hatırlatma ana PC'nin işi; ikinci PC'de de çalışırsa çift mesaj gider.
@@ -443,7 +498,7 @@ app.get('/api/status', (req, res) => {
         success: true,
         dbConnected: !!(pool && pool.connected),
         isSetup: st.exists, needsReauth: !!st.needsReauth,
-        wa: waStatus(),
+        wa: waStatusX(),
     });
 });
 
@@ -530,16 +585,30 @@ app.post('/api/settings/context', (req, res) => {
     res.json({ success: true, context: ctx });
 });
 
-// ─── WhatsApp Modu (yerel / relay) ───────────────────────────────────────────
+// ─── WhatsApp Modu (yerel / relay / cloud) ───────────────────────────────────
 // Relay: bu PC kendi WhatsApp'ını açmaz; gönderimi ana PC'ye (relayTarget) yollar.
-// Token asla geri gönderilmez (yalnız var/yok bilgisi).
+// Cloud: Baileys hiç açılmaz; Meta'nın resmî Cloud API'sine gidilir (cloudapi.js).
+// Sırlar (relay token / Meta erişim anahtarı) asla geri gönderilmez — yalnız var/yok.
 app.get('/api/settings/wa', (req, res) => {
+    const cl = (waCfg && waCfg.cloud) || {};
     res.json({
         success: true,
         mode: (waCfg && waCfg.mode) || 'local',
         relayTarget: (waCfg && waCfg.relayTarget) || '',
         hasToken: !!(waCfg && waCfg.relayToken),
         relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null,
+        cloud: {
+            phoneNumberId: cl.phoneNumberId || '',
+            wabaId: cl.wabaId || '',
+            hasToken: !!cl.token,
+            apiVersion: cl.apiVersion || cloudapi.DEFAULT_API_VERSION,
+            templateName: cl.templateName || '',
+            templateLang: cl.templateLang || 'tr',
+            templateMode: cl.templateMode || 'auto',
+            templateParamCount: cl.templateParamCount != null ? cl.templateParamCount : 1,
+            templateDocHeader: !!cl.templateDocHeader,
+            status: isCloud() ? cloudapi.getStatus() : null,
+        },
     });
 });
 // Kullanıcı çoğunlukla yalnız IP yazıyor ("192.168.0.99"). Eksikleri tamamla:
@@ -556,9 +625,29 @@ function normalizeRelayTarget(value) {
     return u.origin;
 }
 
+// Cloud API alanlarını gövdeden derle. Erişim anahtarı boş bırakılırsa mevcut
+// (şifreli) korunur — kullanıcı 200 karakterlik token'ı her kayıtta yazmasın.
+function buildCloudCfg(b, prev) {
+    const p = prev || {};
+    const tokenPlain = (b.cloudToken != null && String(b.cloudToken).trim() !== '') ? String(b.cloudToken).trim() : null;
+    return {
+        phoneNumberId: b.cloudPhoneNumberId != null ? String(b.cloudPhoneNumberId).trim() : (p.phoneNumberId || ''),
+        wabaId: b.cloudWabaId != null ? String(b.cloudWabaId).trim() : (p.wabaId || ''),
+        token: tokenPlain ? encryptSecret(tokenPlain) : (p.token || ''),
+        apiVersion: (b.cloudApiVersion && String(b.cloudApiVersion).trim()) || p.apiVersion || cloudapi.DEFAULT_API_VERSION,
+        templateName: b.cloudTemplateName != null ? String(b.cloudTemplateName).trim() : (p.templateName || ''),
+        templateLang: (b.cloudTemplateLang && String(b.cloudTemplateLang).trim()) || p.templateLang || 'tr',
+        templateMode: ['auto', 'always', 'never'].includes(b.cloudTemplateMode) ? b.cloudTemplateMode : (p.templateMode || 'auto'),
+        templateParamCount: b.cloudTemplateParamCount != null
+            ? Math.max(0, parseInt(b.cloudTemplateParamCount, 10) || 0)
+            : (p.templateParamCount != null ? p.templateParamCount : 1),
+        templateDocHeader: b.cloudTemplateDocHeader != null ? !!b.cloudTemplateDocHeader : !!p.templateDocHeader,
+    };
+}
+
 app.post('/api/settings/wa', async (req, res) => {
     const b = req.body || {};
-    const mode = b.mode === 'relay' ? 'relay' : 'local';
+    const mode = ['relay', 'cloud'].includes(b.mode) ? b.mode : 'local';
     const relayTarget = normalizeRelayTarget(b.relayTarget);
     // Parola boş bırakılırsa mevcut korunur (yeniden yazmaya gerek kalmasın).
     const relayToken = (b.relayToken != null && b.relayToken !== '') ? String(b.relayToken) : (waCfg && waCfg.relayToken) || '';
@@ -567,18 +656,55 @@ app.post('/api/settings/wa', async (req, res) => {
         if (!relayTarget) return res.status(400).json({ success: false, message: 'Ana PC adresi gerekli (ör. 192.168.0.99).' });
         if (!relayToken) return res.status(400).json({ success: false, message: 'Relay parolası (token) gerekli — ana PC ile aynı olmalı.' });
     }
-    const next = { mode, relayTarget: relayTarget || '', relayToken };
+    const cloud = buildCloudCfg(b, (waCfg && waCfg.cloud) || null);
+    if (mode === 'cloud') {
+        if (!cloud.phoneNumberId) return res.status(400).json({ success: false, message: 'Telefon Numarası Kimliği (Phone Number ID) gerekli — Meta panelinde WhatsApp > API Kurulumu altında.' });
+        if (!cloud.token) return res.status(400).json({ success: false, message: 'Erişim anahtarı (Access Token) gerekli.' });
+    }
+    const next = { mode, relayTarget: relayTarget || '', relayToken, cloud };
     try {
         const existing = loadConfigFile() || {};
         existing.wa = next;
         fs.writeFileSync(CONFIG_PATH, JSON.stringify(existing, null, 2), 'utf8');
         waCfg = next;
+        applyCloudConfig();
     } catch (e) {
         return res.status(500).json({ success: false, message: 'Ayar kaydedilemedi: ' + e.message });
     }
     // Relay'e geçildiyse hemen durum çek + otomasyon zaten relay guard'ıyla susar.
     if (isRelay()) { try { await pollRelayStatus(); } catch { /* yok say */ } }
-    res.json({ success: true, mode, relayTarget: next.relayTarget, relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null });
+    let cloudStatus = null;
+    if (isCloud()) { try { cloudStatus = await cloudapi.refreshStatus(true); } catch { /* yok say */ } }
+    res.json({
+        success: true, mode, relayTarget: next.relayTarget,
+        relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null,
+        cloud: cloudStatus ? { ready: cloudStatus.ready, me: cloudStatus.me, error: cloudStatus.error, info: cloudStatus.cloud } : null,
+    });
+});
+
+// Cloud API kimlik/gönderim sınaması. testPhone verilirse tek test mesajı atar.
+// Kaydedilmemiş değerlerle de denenebilsin diye gövdedeki alanlar geçici uygulanır.
+app.post('/api/settings/wa/cloud-test', async (req, res) => {
+    const b = req.body || {};
+    const prev = (waCfg && waCfg.cloud) || null;
+    const draft = buildCloudCfg(b, prev);
+    if (!draft.phoneNumberId || !draft.token) {
+        return res.status(400).json({ success: false, message: 'Numara kimliği ve erişim anahtarı gerekli.' });
+    }
+    let token = null;
+    try { token = decryptSecret(draft.token); } catch { token = null; }
+    if (!token) return res.status(400).json({ success: false, message: 'Erişim anahtarı çözülemedi — yeniden girin.' });
+
+    // Geçici olarak taslağı uygula, sınadıktan sonra kayıtlı ayara geri dön.
+    cloudapi.setConfig({ ...draft, token });
+    try {
+        const r = await cloudapi.test((b.testPhone || '').trim() || null);
+        res.json(r);
+    } catch (e) {
+        res.status(500).json({ success: false, message: e.message });
+    } finally {
+        applyCloudConfig();
+    }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1174,6 +1300,8 @@ app.post('/api/aibot', (req, res) => {
         'dailyCap', 'minGapSec', 'onlySmsGonder', 'includeMovements',
         'chatMode', 'historyTurns', 'maxReplyTokens',
         'maxThreadReplies', 'threadWindowMin', 'closeCooldownHours', 'closingMessage',
+        // Nöbetçi (ack) modu: model çağrılmaz, alındı mesajı + iç bildirim.
+        'replyMode', 'ackMessage', 'ackCooldownHours', 'ackUnknown', 'notifyPhone', 'notifyGapMin',
     ];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
@@ -1454,11 +1582,25 @@ app.post('/api/send-window', (req, res) => {
 const SAVE_CONTACT_LINE = 'Bildirimlerimizin size düzenli ulaşabilmesi için lütfen numaramızı telefon rehberinize kaydediniz.';
 
 // ─── Anti-ban ayarları: günlük cap + soft uyarı eşiği + dönüş-budama (guard) ──
+// Çok hesapta anlık görüntü HESAP-BAŞINA anlamlı (her numaranın ısınma günü ve
+// tavanı ayrı). Tek alan bekleyen eski ekranlar için "en kritik" hesap (uyarı
+// bekleyen, yoksa ilk bağlı) döner; ayrıntı antibanAccounts dizisinde.
+function antibanSnapshots() {
+    if (isCloud() || isRelay()) return { primary: null, list: [] };
+    const list = [];
+    for (const a of accounts.list()) {
+        if (!a.ready || !a.me) continue;
+        try { list.push({ id: a.id, label: a.label, me: a.me, ...antiban.snapshot(a.me, DEFAULT_PACING.dailyCap) }); }
+        catch { /* yok say */ }
+    }
+    const primary = list.find((s) => s.warnPending) || list.find((s) => s.cooldownUntil) || list[0] || null;
+    return { primary, list };
+}
+
 app.get('/api/antiban', (req, res) => {
     try {
-        const st = waStatus();
-        const ab = st.ready ? antiban.snapshot(st.me, DEFAULT_PACING.dailyCap) : null;
-        res.json({ success: true, limits: antiban.getLimits(), guard: stats.guardConfig(), engage: stats.engageSummary(), antiban: ab });
+        const { primary, list } = antibanSnapshots();
+        res.json({ success: true, limits: antiban.getLimits(), guard: stats.guardConfig(), engage: stats.engageSummary(), antiban: primary, antibanAccounts: list });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 app.post('/api/antiban/limits', (req, res) => {
@@ -1472,9 +1614,16 @@ app.post('/api/antiban/guard', (req, res) => {
 // Kullanıcı "devam" onayı: o günkü uyarı katını onayla → sonraki kata kadar sormaz.
 app.post('/api/antiban/ack', (req, res) => {
     try {
-        const st = waStatus();
+        const st = waStatusX();
         if (!st.ready || !st.me) return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil.' });
-        res.json({ success: true, ...antiban.acknowledgeWarn(st.me) });
+        // Çok hesap: uyarı hangi numaradan geldiyse orada onaylanmalı. body.accountId
+        // verilirse o hesap, verilmezse uyarı bekleyen TÜM bağlı numaralar onaylanır
+        // (kullanıcı "devam" dediyse bir sonraki kata kadar hiçbiri sormasın).
+        const wantId = (req.body && req.body.accountId) || null;
+        const { list } = antibanSnapshots();
+        const targets = wantId ? list.filter((s) => s.id === wantId) : list.filter((s) => s.warnPending);
+        const acked = (targets.length ? targets : list).map((s) => antiban.acknowledgeWarn(s.me));
+        res.json({ success: true, acked: acked.length, results: acked });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 // Susturulan numarayı elle yeniden aç (dönüş-budama). phone boşsa hepsini.
@@ -1555,7 +1704,7 @@ app.get('/api/active-cari', async (req, res) => {
                 phone: c.phone, valid: !!c.valid, pasif: !!c.pasif,
                 bakiye: c.bakiye, durum,
                 message: renderBalanceMessage(ACTIVE_CARI_DEFAULT_TPL, c),
-                wa: waStatus().ready,
+                wa: waStatusX().ready,
             },
         });
     } catch (err) {
@@ -1574,8 +1723,8 @@ app.post('/api/active-cari/send', async (req, res) => {
     if (!firmaNo || !Number.isFinite(indNum)) {
         return res.status(400).json({ success: false, message: 'Açık cari tespit edilemedi.' });
     }
-    if (!waStatus().ready) {
-        return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil. Önce QR okutun.' });
+    if (!waStatusX().ready) {
+        return res.status(400).json({ success: false, message: isCloud() ? ('Cloud API hazır değil: ' + (waStatusX().error || '')) : 'WhatsApp bağlı değil. Önce QR okutun.' });
     }
     try {
         const map = await resolveCariContacts(firmaNo, [indNum]);
@@ -1599,12 +1748,12 @@ app.post('/api/active-cari/send', async (req, res) => {
             ? String(req.body.message)
             : renderBalanceMessage(ACTIVE_CARI_DEFAULT_TPL, c);
 
-        const chk = await checkOnWhatsApp(c.phone);
+        const chk = await waCheckX(c.phone);
         if (!chk.exists) {
             return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
         }
-        const result = await waSend(c.phone, text, null, { simulateTyping: true, typingMs: 1500, channel: 'manual' });
-        if (result.success) { antiban.recordSent(waStatus().me, 'manual'); return res.json({ success: true, message: 'Gönderildi.', phone: c.phone, name: c.name }); }
+        const result = await waSendX(c.phone, text, null, { simulateTyping: true, typingMs: 1500, channel: 'manual' });
+        if (result.success) return res.json({ success: true, message: 'Gönderildi.', phone: c.phone, name: c.name });
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -2041,8 +2190,7 @@ app.post('/api/extre/send', async (req, res) => {
     if (!firmaNo || !donemNo || !Number.isFinite(indNum))
         return res.status(400).json({ success: false, message: 'firma/dönem/cari gerekli.' });
     if (!waStatusX().ready) return res.status(400).json({ success: false, message: isRelay() ? 'Ana PC WhatsApp bağlı değil (relay).' : 'WhatsApp bağlı değil. Önce QR okutun.' });
-    const me = waStatusX().me;
-    const g = gateX(me, DEFAULT_PACING.dailyCap, 'manual');
+    const g = gateX('manual', DEFAULT_PACING.dailyCap);
     if (!g.ok) return res.status(429).json({ success: false, message: g.reason || 'Anti-ban: gönderim sınırına ulaşıldı.' });
     try {
         const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum);
@@ -2066,7 +2214,7 @@ app.post('/api/extre/send', async (req, res) => {
             : `Sayın ${c.firma || c.name}, hesap ekstreniz ektedir.`;
         const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
         const result = await waSendX(c.phone, caption, { kind: 'document', buffer: pdf, mimetype: 'application/pdf', fileName }, { simulateTyping: true, typingMs: 1200, channel: 'extre' });
-        if (result.success) { recordSentX(me, 'manual'); return res.json({ success: true, message: 'Ekstre gönderildi.', phone: c.phone, name: c.name }); }
+        if (result.success) return res.json({ success: true, message: 'Ekstre gönderildi.', phone: c.phone, name: c.name });
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -2173,6 +2321,7 @@ app.post('/api/license/activate', async (req, res) => {
         }
         // Lisans geldi → kilitliyken atlanan otomatik bağlantıyı şimdi kur.
         try { await autoConnectFromConfig(); } catch (e) { console.error('lisans sonrası oto-bağlantı:', e.message); }
+        try { startAccountsIfLocal(); } catch { /* yok say */ }
         // Dosyayla kurulan lisansı panele bildir → elle takip gerekmesin.
         lastReport = Date.now();
         license.reportRemote().catch(() => { });
@@ -2195,6 +2344,7 @@ app.post('/api/license/fetch', async (req, res) => {
             });
         }
         try { await autoConnectFromConfig(); } catch (e) { console.error('lisans sonrası oto-bağlantı:', e.message); }
+        try { startAccountsIfLocal(); } catch { /* yok say */ }
         res.json({ success: true, license: r.license });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -2206,7 +2356,7 @@ app.post('/api/license/recheck', async (req, res) => {
     try {
         license.invalidateCache();
         const st = license.getStatus();
-        if (st.valid) { try { await autoConnectFromConfig(); } catch { /* yok say */ } }
+        if (st.valid) { try { await autoConnectFromConfig(); startAccountsIfLocal(); } catch { /* yok say */ } }
         else stopAutomation('lisans geçersiz');
         res.json({ success: true, license: st });
     } catch (err) {
@@ -2226,28 +2376,105 @@ app.get('/api/wa/status', async (req, res) => {
             const s = waStatusX();
             return res.json({ success: true, ready: s.ready, initializing: false, hasQr: false, qrImage: null, me: s.me, error: s.error, antiban: null, relay: true, relayTarget: waCfg.relayTarget });
         }
+        // Cloud modu: Baileys oturumu AÇILMAZ (numara Meta'da kayıtlı, QR yok).
+        // Durum Meta'dan gelir; anti-ban rampası uygulanmadığı için snapshot yok.
+        if (isCloud()) {
+            const s = await cloudapi.refreshStatus();
+            return res.json({
+                success: true, ready: s.ready, initializing: false, hasQr: false, qrImage: null,
+                me: s.me, error: s.error, antiban: null, cloud: s.cloud || true,
+            });
+        }
         const s = waStatus();
         if (!s.initializing && !s.ready && !s.hasQr) {
             await initializeWhatsApp();
         }
+        // Çok hesap: her numaranın kendi QR'ı aynı anda üretilir (2/3/4 telefon
+        // birlikte okutulabilir). Eski tek-QR alanları "birincil" hesaptan doldurulur
+        // ki eski ekranlar kırılmasın; yeni UI accounts dizisini kullanır.
         const st = waStatus();
-        let qrImage = null;
-        if (st.qr) qrImage = await QRCode.toDataURL(st.qr, { margin: 2, width: 280 });
-        // Anti-ban: warm-up günü + saatlik/günlük tavan ve bugün gönderilen (UI uyarısı için).
-        const ab = st.ready ? antiban.snapshot(st.me, DEFAULT_PACING.dailyCap) : null;
-        res.json({ success: true, ready: st.ready, initializing: st.initializing, hasQr: st.hasQr, qrImage, me: st.me, error: st.error, antiban: ab });
+        const accs = [];
+        for (const a of st.accounts || []) {
+            accs.push({
+                id: a.id, label: a.label, ready: a.ready, initializing: a.initializing,
+                hasQr: a.hasQr, me: a.me, error: a.error, revoked: a.revoked, daySent: a.daySent,
+                qrImage: a.qr ? await QRCode.toDataURL(a.qr, { margin: 2, width: 240 }) : null,
+                // Hesap-başı anti-ban: ısınma günü, tavan doluluğu, soğuma.
+                antiban: a.ready && a.me ? antiban.snapshot(a.me, DEFAULT_PACING.dailyCap) : null,
+            });
+        }
+        const primary = accs.find((a) => a.ready) || accs.find((a) => a.hasQr) || accs[0] || null;
+        // Uyarı popup'ı için: eşiği aşan İLK hesabın anlık görüntüsü (yoksa birincil).
+        const warn = accs.find((a) => a.antiban && a.antiban.warnPending);
+        res.json({
+            success: true,
+            ready: st.ready, initializing: st.initializing, hasQr: st.hasQr,
+            qrImage: primary ? primary.qrImage : null,
+            me: st.me, error: st.error,
+            antiban: (warn && warn.antiban) || (primary && primary.antiban) || null,
+            accounts: accs, readyCount: st.readyCount, total: st.total,
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
+// ─── Hesap (numara) yönetimi ─────────────────────────────────────────────────
+// Ekle → yeni oturum hemen QR üretmeye başlar; diğer numaraların bağlantısı
+// BOZULMAZ (her hesabın auth klasörü ve soketi ayrıdır).
+app.get('/api/wa/accounts', (req, res) => {
+    res.json({ success: true, accounts: accounts.list(), max: accounts.MAX_ACCOUNTS });
+});
+
+app.post('/api/wa/accounts', (req, res) => {
+    if (isRelay() || isCloud()) {
+        return res.status(400).json({ success: false, message: 'Çok numara yalnız Yerel modda kullanılır (Ayarlar → WhatsApp Gönderim Modu).' });
+    }
+    const r = accounts.add((req.body || {}).label);
+    if (!r.success) return res.status(400).json(r);
+    res.json(r);
+});
+
+app.post('/api/wa/accounts/:id/refresh', async (req, res) => {
+    try { await accounts.refreshOne(req.params.id); res.json({ success: true }); }
+    catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+app.post('/api/wa/accounts/:id/logout', async (req, res) => {
+    try { await accounts.logoutOne(req.params.id); res.json({ success: true }); }
+    catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+app.post('/api/wa/accounts/:id/rename', (req, res) => {
+    const r = accounts.rename(req.params.id, (req.body || {}).label);
+    if (!r.success) return res.status(400).json(r);
+    res.json(r);
+});
+
+// Numarayı tamamen kaldır (oturum kapanır, auth silinir, eşlemeleri temizlenir).
+app.delete('/api/wa/accounts/:id', async (req, res) => {
+    try {
+        const r = await accounts.remove(req.params.id);
+        if (!r.success) return res.status(400).json(r);
+        res.json(r);
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
 app.post('/api/wa/refresh', async (req, res) => {
-    try { await refreshWhatsApp(); res.json({ success: true }); }
+    try {
+        if (isCloud()) { await cloudapi.refreshStatus(true); return res.json({ success: true }); }
+        // id verilirse o numara, verilmezse ilk numara sıfırlanır (eski davranış).
+        const id = (req.body && req.body.id) || 'main';
+        await accounts.refreshOne(id); res.json({ success: true });
+    }
     catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
 app.post('/api/wa/logout', async (req, res) => {
-    try { await logoutWhatsApp(); res.json({ success: true }); }
+    try {
+        if (isCloud()) return res.status(400).json({ success: false, message: 'Cloud modda oturum yok — çıkmak için Ayarlar\'dan modu Yerel yapın.' });
+        await logoutWhatsApp(); res.json({ success: true });
+    }
     catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
@@ -2288,16 +2515,15 @@ app.post('/api/relay-send', async (req, res) => {
     const { phone, text, media, opts } = req.body || {};
     if (!phone) return res.status(400).json({ success: false, error: 'telefon gerekli' });
     if (!waStatus().ready) return res.status(503).json({ success: false, error: 'Ana PC WhatsApp bağlı değil.' });
-    const me = waStatus().me;
     const ch = (opts && opts.channel) || 'relay';
-    const gateCh = ch === 'bulk' ? 'bulk' : 'manual';
-    const g = antiban.gate(me, DEFAULT_PACING.dailyCap, gateCh);
+    // Kapı + sayaç havuzda (hangi numara gönderecekse onun tavanı işler). PC2 saymaz;
+    // kanal adı PC2'den geldiği gibi korunur (kanal-başı tavan + istatistik ayrımı).
+    const g = accounts.gate(ch, DEFAULT_PACING.dailyCap);
     if (!g.ok) return res.status(429).json({ success: false, error: g.reason || 'Anti-ban: gönderim sınırına ulaşıldı.' });
     let m = null;
     if (media && media.b64) m = { kind: media.kind, mimetype: media.mimetype, fileName: media.fileName, buffer: Buffer.from(media.b64, 'base64') };
     try {
-        const result = await waSend(phone, text || '', m, opts || {});
-        if (result.success) { try { antiban.recordSent(me, gateCh); } catch { /* yok say */ } }
+        const result = await waSend(phone, text || '', m, { ...(opts || {}), channel: ch });
         res.json(result);
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
@@ -2309,9 +2535,10 @@ app.post('/api/relay-send', async (req, res) => {
 // günü / tavan doluluk / cooldown). Hepsi sayaç; AI yok.
 app.get('/api/stats', (req, res) => {
     try {
-        const st = waStatus();
-        const ab = st.ready ? antiban.snapshot(st.me, DEFAULT_PACING.dailyCap) : null;
-        res.json({ success: true, today: stats.today(), history: stats.history(7), antiban: ab });
+        // Cloud modda ısınma rampası/soğuma kavramı yok → anti-ban kartı gösterilmez.
+        // Çok hesapta kart en kritik numarayı gösterir, liste hepsini (Pano'da satır satır).
+        const { primary, list } = antibanSnapshots();
+        res.json({ success: true, today: stats.today(), history: stats.history(7), antiban: primary, antibanAccounts: list });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -2320,10 +2547,10 @@ app.get('/api/stats', (req, res) => {
 // Günlük özeti kendi WhatsApp numarana gönder (kendine mesaj). st.me = bağlı hesap.
 app.post('/api/stats/push-summary', async (req, res) => {
     try {
-        const st = waStatus();
+        const st = waStatusX();
         if (!st.ready || !st.me) return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil.' });
         const myPhone = String(st.me).split(':')[0].split('@')[0];
-        const result = await waSend(myPhone, stats.summaryText(), null, { channel: 'manual' });
+        const result = await waSendX(myPhone, stats.summaryText(), null, { channel: 'manual' });
         if (result.success) return res.json({ success: true });
         return res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
@@ -2374,10 +2601,12 @@ function renderMessage(template, recipient) {
 // kuyrukta birikir; bağlantı gelince kaldığı yerden devam eder. İptal edilirse
 // false döner. 2 sn'lik dilimlerle beklenir ki iptal gecikmeden işlesin.
 async function waitForWhatsApp(job) {
-    if (waStatus().ready) return true;
+    if (waStatusX().ready) return true;
     pushEvent(job, { type: 'waDisconnected', message: 'WhatsApp bağlantısı koptu, bağlanınca devam edilecek...' });
-    while (!job.cancelled && !waStatus().ready) {
-        await waWaitForReady(2000);
+    while (!job.cancelled && !waStatusX().ready) {
+        // Cloud modda Baileys olayı yok → Meta durumunu periyodik tazele.
+        if (isCloud()) { await sleep(5000); await cloudapi.refreshStatus(true); }
+        else await waWaitForReady(2000);
     }
     if (job.cancelled) return false;
     pushEvent(job, { type: 'waReconnected', message: 'WhatsApp yeniden bağlandı, gönderim sürüyor.' });
@@ -2396,7 +2625,7 @@ async function runJob(job) {
         // Anti-ban kapısı: warm-up rampı + saatlik + günlük tavan (hesap-başı).
         // Günlük dolduysa job biter; saatlik dolduysa sonraki saat başına kadar
         // (iptal edilebilir) bekleyip aynı alıcıdan devam eder.
-        const g = antiban.gate(waStatus().me, p.dailyCap, 'bulk');
+        const g = gateX('bulk', p.dailyCap);
         if (!g.ok) {
             if (g.capType === 'hourly') {
                 const waitMs = msUntilNextHour();
@@ -2424,11 +2653,11 @@ async function runJob(job) {
         if (!(await waitForWhatsApp(job))) { pushEvent(job, { type: 'cancelled', index: i }); break; }
 
         if (p.verifyOnWhatsApp) {
-            const chk = await checkOnWhatsApp(phone);
+            const chk = await waCheckX(phone);
             if (!chk.exists) {
                 // Kontrol sırasında bağlantı koptuysa alıcıyı "kayıtlı değil" sayma;
                 // bağlantıyı bekleyip aynı alıcıyı yeniden dene.
-                if (!waStatus().ready) { i--; continue; }
+                if (!waStatusX().ready) { i--; continue; }
                 pushEvent(job, { ...base, status: 'notOnWhatsApp', error: chk.error || 'WhatsApp kullanıcısı değil' });
                 job.results.push({ ...rcp, status: 'notOnWhatsApp' });
                 continue;
@@ -2436,27 +2665,29 @@ async function runJob(job) {
         }
 
         const text = renderMessage(job.message, rcp);
-        let result = await waSend(phone, text, job.media, {
+        let result = await waSendX(phone, text, job.media, {
             simulateTyping: p.simulateTyping,
             typingMs: rand(1200, 2600),
             channel: 'bulk',
+            dailyCap: p.dailyCap,   // hesap seçimi işin tavanına göre yapılsın
         });
 
         // Gönderim sırasında kopma: bağlantı gelene kadar bekle, aynı alıcıya
         // yeniden dene. Bağlıyken alınan hatalar (geçersiz numara vb.) yeniden
         // denenmez, normal "failed" akışına düşer.
-        while (!result.success && !waStatus().ready && !job.cancelled) {
+        while (!result.success && !waStatusX().ready && !job.cancelled) {
             if (!(await waitForWhatsApp(job))) break;
-            result = await waSend(phone, text, job.media, {
+            result = await waSendX(phone, text, job.media, {
                 simulateTyping: p.simulateTyping,
                 typingMs: rand(1200, 2600),
                 channel: 'bulk',
+                dailyCap: p.dailyCap,
             });
         }
         if (job.cancelled) { pushEvent(job, { type: 'cancelled', index: i }); break; }
 
         if (result.success) {
-            antiban.recordSent(waStatus().me, 'bulk'); // anti-ban saat/gün sayacı
+            // anti-ban saat/gün sayacı gönderim yolunda (accounts.send) işlendi
             job.sentCount++;
             sentInBatch++;
             pushEvent(job, { ...base, status: 'sent', sentCount: job.sentCount });
@@ -2498,8 +2729,8 @@ function finalizeJob(job) {
 }
 
 app.post('/api/send-bulk', upload.single('media'), async (req, res) => {
-    const st = waStatus();
-    if (!st.ready) return res.status(400).json({ success: false, message: 'WhatsApp bağlı değil. Önce QR okutun.' });
+    const st = waStatusX();
+    if (!st.ready) return res.status(400).json({ success: false, message: isCloud() ? ('Cloud API hazır değil: ' + (st.error || '')) : 'WhatsApp bağlı değil. Önce QR okutun.' });
 
     let recipients, pacing;
     try {
@@ -2662,6 +2893,8 @@ async function pollRemoteLicense() {
     if (r.ok) {
         console.log(`  ✓ Lisans sunucudan alındı: ${r.license.customerName || ''}`);
         try { await autoConnectFromConfig(); } catch (e) { console.error('lisans sonrası oto-bağlantı:', e.message); }
+        // Lisans geldiğinde WhatsApp oturumlarını da başlat (lisanssızken açılmazlar).
+        try { startAccountsIfLocal(); } catch (e) { console.error('lisans sonrası WA başlatma:', e.message); }
     }
     // NOT_FOUND / SAME / NETWORK sessizce geçilir — her 3 dakikada bir log basmasın.
 }
@@ -2670,37 +2903,23 @@ setTimeout(() => { pollRemoteLicense().catch(() => { }); }, 20_000).unref?.();
 setInterval(() => { pollRemoteLicense().catch(() => { }); }, LIC_POLL_UNLICENSED_MS).unref?.();
 
 // Anti-ban katmanı: warm-up rampı + saatlik/günlük tavan (hesap-başı sayaç).
+// ÇOK HESAPTA her numara kendi rampasını/tavanını taşır — bağlantı olayları
+// (403 soğuması, oturum iptali, açılış) accounts.js içinde hesap-başı bağlanır.
 antiban.configure(baseDir);
-// Ban-şüpheli bağlantı kapanışını anti-ban'a bildir: 403/401 veya reconnect
-// fırtınasında gate() gönderimi soğutur (flaglenen numarayı dövmeyi keser).
-setDisconnectHandler((code, accountId, errMsg, conflict) => {
-    try { antiban.noteDisconnect(accountId || waStatus().me, code, errMsg, conflict); } catch { /* yok say */ }
-});
-// Oturumu WhatsApp iptal etti (diskte bağlı kimlik varken QR isteniyor). Sebebi ne
-// olursa olsun gönderime devam etmek yanlış → 24 saat sticky soğuma + warm-up sıfır.
-setRevokedHandler((accountId) => {
-    try {
-        const r = antiban.noteSessionRevoked(accountId || waStatus().me);
-        if (r) console.warn(`[Antiban] Oturum iptali — gönderim durduruldu: ${r.reason}`);
-    } catch { /* yok say */ }
-});
-// Kimlik doğrulanmış açılış = numara kısıtlı değil → yanlış alarm soğumasını kaldır.
-setOpenHandler((accountId) => {
-    try {
-        const r = antiban.noteOpen(accountId);
-        if (r && r.cleared) console.log(`[Antiban] Bağlantı kuruldu — soğuma kaldırıldı (${r.cleared})`);
-    } catch { /* yok say */ }
-});
 
 // Watcher'ı bağımlılıklarıyla yapılandır (config/state data/ altına yazılır).
 watcher.configure({
     getPool: () => pool,
     sql,
     resolveCariContacts,
-    waSend,
-    waDelete,
-    checkOnWhatsApp,
-    waStatus,
+    // Mod-duyarlı sarmalayıcılar: yerel=Baileys, cloud=Meta Cloud API.
+    waSend: waSendX,
+    waDelete: waDeleteX,
+    checkOnWhatsApp: waCheckX,
+    waStatus: waStatusX,
+    // Anti-ban kapısı mod/hesap duyarlı (çok numarada "herhangi bir hat gönderebilir mi").
+    gate: (ch) => gateX(ch, null),
+    recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
     baseDir,
     // {firmaadi} imzası: Firma Bilgileri (TBLFIRMA + kullanıcı override) adı.
     getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
@@ -2718,8 +2937,10 @@ siparis.configure({
     getPool: () => pool,
     sql,
     resolveCariContacts,
-    waSend,
-    waStatus,
+    waSend: waSendX,
+    waStatus: waStatusX,
+    gate: (ch) => gateX(ch, null),
+    recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
     baseDir,
     getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
     buildSiparisContentText,
@@ -2733,9 +2954,11 @@ reminders.configure({
     reminderCandidateInds,
     activeCariInds,
     existingCariInds,
-    waSend,
-    checkOnWhatsApp,
-    waStatus,
+    waSend: waSendX,
+    checkOnWhatsApp: waCheckX,
+    waStatus: waStatusX,
+    gate: (ch) => gateX(ch, null),
+    recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
     baseDir,
     isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
     shouldAskSave: (phone) => { try { return stats.shouldAskSave(phone); } catch { return false; } },
@@ -2755,8 +2978,9 @@ aiBot.configure({
     fetchNetBalances,
     fetchRecentMovements,
     fetchLastSalesInvoice,
-    waSend,
-    waStatus,
+    // Mod-duyarlı gönderim: yanıt, mesajın GELDİĞİ hattan gider (opts.accountId).
+    waSend: waSendX,
+    waStatus: waStatusX,
     encryptSecret,
     decryptSecret,
     // Bot "borç sebebi / ekstre" sorusunda PDF hesap ekstresi üretir (manuel gönderimle aynı üretici).
@@ -2773,7 +2997,7 @@ aiBot.configure({
         const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
         return { buffer: pdf, fileName };
     },
-    recordSent: () => { try { antiban.recordSent(waStatus().me, 'aibot'); } catch { /* yok say */ } },
+    recordSent: () => { /* anti-ban sayacı gönderim yolunda (accounts.send) işlendi */ },
     // firma/dönem config'te boşsa uygulama bağlamına düş.
     getContext: () => {
         const c = loadConfigFile();
@@ -2782,14 +3006,36 @@ aiBot.configure({
     },
     baseDir,
 });
-// Baileys gelen-mesaj dinleyicisini bota bağla (her yeniden bağlanışta yeniden kurulur).
-setIncomingHandler(aiBot.handleIncoming);
+// Hesap havuzu: gelen mesajlar bota gider (hangi hattan geldiği accountId ile),
+// günlük tavan kullanıcı ayarından okunur. Yerel modda oturumlar burada açılır.
+accounts.configure({
+    onIncoming: aiBot.handleIncoming,
+    dailyCap: DEFAULT_PACING.dailyCap,
+});
+// Lisanssızken WhatsApp oturumu AÇILMAZ (eski davranış: WA yalnız lisanslı API
+// çağrısıyla başlıyordu). Lisans sonradan gelirse pollRemoteLicense başlatır,
+// arayüz açılışında /api/wa/status da tetikler.
+const startAccountsIfLocal = () => {
+    if (isRelay() || isCloud()) return;
+    if (!license.isAllowed()) return;
+    accounts.start();
+};
+startAccountsIfLocal();
 
 // Relay modunda ana PC durumunu düzenli yokla (UI + gönderim öncesi hazır-mı kararı).
 if (isRelay()) {
     console.log(`[Relay] İkinci PC (ekstre) modu — gönderim ana PC'ye vekil edilecek: ${waCfg.relayTarget}`);
     pollRelayStatus();
     setInterval(pollRelayStatus, 15000).unref?.();
+}
+
+// Cloud modunda Meta numara durumunu düzenli yokla (waStatusX senkron okuduğu için
+// önbellek taze kalmalı). Baileys AÇILMAZ — QR yok, oturum yok, cihaz fırtınası yok.
+if (isCloud()) {
+    console.log('[Cloud] Resmî WhatsApp Cloud API modu — Baileys oturumu açılmayacak.');
+    console.log('[Cloud] NOT: gelen mesaj/teslim bildirimi webhook ister → AI oto-yanıt ve teslim/okundu sayacı bu modda çalışmaz.');
+    cloudapi.refreshStatus(true).catch(() => { });
+    setInterval(() => { cloudapi.refreshStatus(true).catch(() => { }); }, 60000).unref?.();
 }
 
 app.listen(PORT, async () => {
