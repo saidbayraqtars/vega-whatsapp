@@ -1026,6 +1026,18 @@
     </div>
 </div>
 
+<!-- ─── METİN SORMA MODAL (Electron window.prompt() desteklemez) ─── -->
+<div id="askModal" class="overlay hidden">
+    <div class="modal" style="max-width:380px">
+        <h2 id="askTitle">Bilgi</h2>
+        <div class="field"><label id="askLabel">Değer</label><input id="askInput" type="text" autocomplete="off" /></div>
+        <div class="actions">
+            <button class="btn" id="askCancel">İptal</button>
+            <button class="btn green" id="askOk">Tamam</button>
+        </div>
+    </div>
+</div>
+
 <!-- ─── GÖNDERİM İLERLEME MODAL ─── -->
 <div id="sendModal" class="overlay hidden">
     <div class="modal">

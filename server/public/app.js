@@ -419,6 +419,32 @@ function renderWaModal(r) {
     c.innerHTML = `<div class="waCards">${accs.map(renderWaCard).join('')}</div>`;
 }
 
+// Electron'da window.prompt() YOKTUR — çağrılırsa hata atar ve düğme sessizce
+// ölür. Metin sormak için kendi modalımızı kullanırız. İptalde null döner.
+function askText(title, label, defVal) {
+    return new Promise((resolve) => {
+        const modal = $('askModal'), inp = $('askInput');
+        $('askTitle').textContent = title || 'Bilgi';
+        $('askLabel').textContent = label || 'Değer';
+        inp.value = defVal || '';
+        modal.classList.remove('hidden');
+        setTimeout(() => { inp.focus(); inp.select(); }, 50);
+        const okB = $('askOk'), cancelB = $('askCancel');
+        const cleanup = () => {
+            okB.removeEventListener('click', onOk);
+            cancelB.removeEventListener('click', onCancel);
+            inp.removeEventListener('keydown', onKey);
+        };
+        const finish = (v) => { modal.classList.add('hidden'); cleanup(); resolve(v); };
+        const onOk = () => finish(inp.value);
+        const onCancel = () => finish(null);
+        const onKey = (e) => { if (e.key === 'Enter') onOk(); else if (e.key === 'Escape') onCancel(); };
+        okB.addEventListener('click', onOk);
+        cancelB.addEventListener('click', onCancel);
+        inp.addEventListener('keydown', onKey);
+    });
+}
+
 // Tek hesap kartı: ad, durum, QR (bağlı değilse), gönderim sayacı, düğmeler.
 function renderWaCard(a) {
     const phone = a.me ? String(a.me).split(':')[0].split('@')[0] : '';
@@ -485,7 +511,7 @@ async function waRemoveAcc(id, label) {
 }
 
 async function waRenameAcc(id) {
-    const label = prompt('Numara adı (ör. Satış hattı):');
+    const label = await askText('Numara Adı', 'Ad (ör. Satış hattı)', '');
     if (label == null) return;
     try { await api(`/wa/accounts/${id}/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label }) }); }
     catch (e) { alert('Hata: ' + e.message); }
@@ -496,7 +522,7 @@ $('waBtn').onclick = () => { $('waModal').classList.remove('hidden'); pollWa(); 
 $('waClose').onclick = () => $('waModal').classList.add('hidden');
 // Yeni numara: hemen kendi QR'ını üretmeye başlar; mevcut bağlantılar bozulmaz.
 $('waAdd').onclick = async () => {
-    const label = prompt('Yeni numaranın adı (ör. 2. Numara / Satış hattı):', '');
+    const label = await askText('Yeni Numara', 'Numara adı (ör. 2. Numara / Satış hattı)', '');
     if (label == null) return;
     try {
         const r = await api('/wa/accounts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label }) });
