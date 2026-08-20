@@ -176,8 +176,16 @@ Bu kilit lisanstan **bağımsızdır**: lisans uygulamanın tamamını, erişim 
 - `release.bat` → sürümü artırır (varsayılan patch), derler ve
   [vega-whatsapp-releases](https://github.com/saidbayraqtars/vega-whatsapp-releases)
   deposuna yayınlar. GH token'ı git credential manager'dan otomatik alınır.
-- Kurulu uygulamalar açılışta + 4 saatte bir yeni sürüm denetler (electron-updater),
-  indirir; tray balonu/menüsünden hemen veya uygulama kapanışında sessiz kurulur.
+- Kurulu uygulamalar açılışta + 4 saatte bir yeni sürüm denetler (electron-updater)
+  ve indirir.
+- **Güncelleme zorunludur (v1.6.1+).** İndirme bitince sağ-altta geri sayım kartı
+  çıkar; **10 dakika** sonra kurulum kendiliğinden yapılır ve uygulama yeniden başlar.
+  "Gizle" yalnızca kartı kapatır, geri sayım arkada işler; erteleme yoktur.
+  Gerekçe: uygulama tray'de haftalarca açık kaldığı için eski davranıştaki
+  "çıkışta kur" hiç tetiklenmiyor, sahada 1.0.24 gibi çok eski sürümler kalıyordu.
+- Geri sayım biterken **toplu gönderim sürüyorsa kurulum ertelenir** (`GET /api/busy`
+  → `{ busy, remaining, reason }`); dakikada bir tekrar bakılır, en fazla 3 saat
+  beklenir, sonra yine de kurulur. Sunucu cevap vermezse meşgul sayılmaz.
 - Sidebar'daki sürüm etiketi kök `package.json`'dan çalışma anında okunur (`/api/check-setup`
   → `version`) — elle güncellenmez, release'te otomatik doğru gelir.
 - Kaynak kod: [vega-whatsapp](https://github.com/saidbayraqtars/vega-whatsapp) (private).

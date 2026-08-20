@@ -61,6 +61,9 @@
     .b-later:hover { color: #dbe2ec; background: rgba(148, 163, 184, .09); }
     .ready .bar, .ready .pct { display: none; }
     .ready .actions { display: flex; }
+    /* Zorunlu güncelleme geri sayımı */
+    .count { display: none; font-size: 11.5px; color: #fbbf24; margin-top: 9px; line-height: 1.35; }
+    .ready.forced .count { display: block; }
 </style>
 </head>
 <body>
@@ -74,9 +77,10 @@
     </div>
     <div class="bar indet" id="bar"><div id="fill"></div></div>
     <div class="pct" id="pct"></div>
+    <div class="count" id="count"></div>
     <div class="actions">
         <button class="b-install" id="bInstall">Şimdi Kur</button>
-        <button class="b-later" id="bLater">Sonra</button>
+        <button class="b-later" id="bLater">Gizle</button>
     </div>
 </div>
 <script>
@@ -84,11 +88,19 @@
     $('bInstall').onclick = () => window.vegaUpdater.install();
     $('bLater').onclick = () => window.vegaUpdater.later();
 
+    // Saniyeyi "1 dk 05 sn" gibi yaz.
+    const sure = (sn) => {
+        const n = Math.max(0, Math.round(sn || 0));
+        if (n < 60) return n + ' sn';
+        const d = Math.floor(n / 60), k = n % 60;
+        return d + ' dk ' + String(k).padStart(2, '0') + ' sn';
+    };
+
     window.vegaUpdater.onState((s) => {
         if (!s) return;
         const v = s.version ? ' (v' + s.version + ')' : '';
         if (s.phase === 'downloading') {
-            $('card').classList.remove('ready');
+            $('card').classList.remove('ready', 'forced');
             $('msg').textContent = 'Güncelleme yükleniyor...' + v;
             const p = Math.max(0, Math.min(100, Math.round(s.percent || 0)));
             if (p > 0) {
@@ -101,7 +113,16 @@
             }
         } else if (s.phase === 'ready') {
             $('card').classList.add('ready');
-            $('msg').textContent = 'Yeni sürüm hazır' + v + ' — kurulsun mu?';
+            if (s.forced) {
+                $('card').classList.add('forced');
+                $('msg').textContent = 'Zorunlu güncelleme' + v;
+                $('count').textContent = s.busyReason
+                    ? 'Gönderim sürüyor (' + s.busyReason + ') — bitince kurulacak.'
+                    : sure(s.secondsLeft) + ' içinde kendiliğinden kurulup uygulama yeniden başlayacak.';
+            } else {
+                $('card').classList.remove('forced');
+                $('msg').textContent = 'Yeni sürüm hazır' + v + ' — kurulsun mu?';
+            }
         }
     });
 </script>

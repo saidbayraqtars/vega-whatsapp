@@ -79,6 +79,7 @@ const LICENSE_OPEN_PATHS = new Set([
     '/api/license/activate',
     '/api/license/recheck',
     '/api/license/fetch',    // uzaktan lisans alma — lisanssızken de çalışmalı
+    '/api/busy',             // zorunlu güncelleme "gönderim sürüyor mu" diye sorar
 ]);
 app.use((req, res, next) => {
     if (!req.path.startsWith('/api/')) return next();
@@ -1320,6 +1321,22 @@ app.post('/api/vade/start', (req, res) => {
 app.post('/api/vade/stop', (req, res) => {
     vade.stop();
     res.json({ success: true, status: vade.getStatus() });
+});
+
+// Uygulama şu an kesilmemesi gereken bir iş yapıyor mu? Zorunlu güncelleme
+// (electron/main.js) bunu sorar: toplu gönderim sürüyorsa yeniden başlatmayı
+// erteler — aksi halde 500 kişilik gönderimin ortasında uygulama kapanırdı.
+app.get('/api/busy', (req, res) => {
+    const running = [...jobs.values()].filter(j => j.status === 'running');
+    const remaining = running.reduce((n, j) =>
+        n + Math.max(0, (j.recipients ? j.recipients.length : 0) - (j.results ? j.results.length : 0)), 0);
+    res.json({
+        success: true,
+        busy: running.length > 0,
+        jobs: running.length,
+        remaining,
+        reason: running.length ? `${running.length} toplu gönderim sürüyor (${remaining} alıcı kaldı)` : '',
+    });
 });
 
 app.get('/api/vade/log', (req, res) => {

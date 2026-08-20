@@ -9,6 +9,7 @@
 
 const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, safeStorage } = require('electron');
 const { autoUpdater } = require('electron-updater');
+const http = require('http');   // zorunlu güncelleme "meşgul mü" sorgusu
 const path = require('path');
 const fs = require('fs');
 
@@ -80,9 +81,68 @@ async function autoConnect() {
 let updateDownloaded = false;
 let updateVersion = null;
 
+// ─── ZORUNLU GÜNCELLEME ────────────────────────────────────────────────────
+// Uygulama tray'de haftalarca açık kalıyor. Eski davranışta indirilen sürüm
+// yalnızca kullanıcı "Şimdi Kur" derse ya da uygulamadan ÇIKINCA kuruluyordu
+// (autoInstallOnAppQuit). Çıkılmadığı için sahada 1.0.24 gibi çok eski sürümler
+// kaldı. Artık indirme bitince geri sayım başlıyor; süre dolunca kurulum
+// kendiliğinden yapılıp uygulama yeniden başlıyor. "Sonra" yok, yalnız "gizle".
+const FORCE_GRACE_MS = 10 * 60 * 1000;      // indirme bitti → kuruluma kalan süre
+const FORCE_BUSY_RETRY_MS = 60 * 1000;      // gönderim sürüyorsa bu aralıkla tekrar bak
+const FORCE_BUSY_MAX_MS = 3 * 60 * 60 * 1000; // meşgul diye en fazla bu kadar ertele
+let forceDeadline = null;   // kurulumun yapılacağı an (ms)
+let forceTimer = null;      // geri sayım/arayüz tazeleme zamanlayıcısı
+let forceBusyUntil = null;  // meşguliyet yüzünden erteleme tavanı
+
 function installUpdateNow() {
+    if (forceTimer) { clearInterval(forceTimer); forceTimer = null; }
     isQuitting = true; // tray'e gizlenme davranışını atla, gerçekten kapan
     autoUpdater.quitAndInstall(true, true); // sessiz kur + kurulunca yeniden başlat
+}
+
+// Sunucuya sor: şu an kesilmemesi gereken bir iş (toplu gönderim) var mı?
+// Sunucu cevap vermezse meşgul SAYMA — aksi halde sunucu çöktüğünde güncelleme
+// sonsuza kadar ertelenirdi.
+function isServerBusy() {
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (v) => { if (!done) { done = true; resolve(v); } };
+        try {
+            const req = http.get(`${URL}/api/busy`, { timeout: 4000 }, (res) => {
+                let body = '';
+                res.on('data', (c) => { body += c; });
+                res.on('end', () => {
+                    try { const j = JSON.parse(body); finish({ busy: !!j.busy, reason: j.reason || '' }); }
+                    catch { finish({ busy: false, reason: '' }); }
+                });
+            });
+            req.on('error', () => finish({ busy: false, reason: '' }));
+            req.on('timeout', () => { req.destroy(); finish({ busy: false, reason: '' }); });
+        } catch { finish({ busy: false, reason: '' }); }
+    });
+}
+
+// Geri sayım: her saniye arayüzü tazele, süre dolunca kur. Gönderim sürüyorsa
+// bekle (en fazla FORCE_BUSY_MAX_MS), sonra yine de kur.
+function startForcedInstall() {
+    if (forceTimer) return;
+    forceDeadline = Date.now() + FORCE_GRACE_MS;
+    forceBusyUntil = Date.now() + FORCE_BUSY_MAX_MS;
+    let checking = false;
+    forceTimer = setInterval(async () => {
+        const left = Math.max(0, forceDeadline - Date.now());
+        sendUpdateState({ phase: 'ready', version: updateVersion, forced: true, secondsLeft: Math.ceil(left / 1000) });
+        if (left > 0 || checking) return;
+        checking = true;
+        const { busy, reason } = await isServerBusy();
+        checking = false;
+        if (busy && Date.now() < forceBusyUntil) {
+            forceDeadline = Date.now() + FORCE_BUSY_RETRY_MS;
+            sendUpdateState({ phase: 'ready', version: updateVersion, forced: true, secondsLeft: Math.ceil(FORCE_BUSY_RETRY_MS / 1000), busyReason: reason });
+            return;
+        }
+        installUpdateNow();
+    }, 1000);
 }
 
 // ─── Güncelleme durum penceresi ────────────────────────────────────────────────
@@ -146,12 +206,19 @@ function setupAutoUpdater() {
         updateDownloaded = true;
         updateVersion = info.version;
         refreshTrayMenu();
-        // Aynı kartta "Şimdi Kur / Sonra" — native dialog yok.
+        // Zorunlu: kartı göster + geri sayımı başlat. Kullanıcı hemen kurabilir,
+        // erteleyemez — yalnızca kartı gizleyebilir (geri sayım arkada işler).
         createUpdateWindow();
-        sendUpdateState({ phase: 'ready', version: info.version });
+        sendUpdateState({ phase: 'ready', version: info.version, forced: true, secondsLeft: Math.ceil(FORCE_GRACE_MS / 1000) });
+        startForcedInstall();
     });
 
-    autoUpdater.on('error', (e) => { console.error('[Updater]', e?.message || e); closeUpdateWindow(); });
+    // İndirilmiş sürüm varken gelen hata (ör. sonraki denetleme ağ hatası) geri
+    // sayımı iptal etmemeli — kartı yalnız henüz hazır bir kurulum yokken kapat.
+    autoUpdater.on('error', (e) => {
+        console.error('[Updater]', (e && e.message) || e);
+        if (!updateDownloaded) closeUpdateWindow();
+    });
 
     // Açılışta + her 4 saatte bir denetle (uygulama tray'de uzun süre açık kalıyor).
     autoUpdater.checkForUpdates().catch(() => { /* ağ yoksa sessiz geç */ });
@@ -235,7 +302,7 @@ function refreshTrayMenu() {
         { type: 'separator' },
     ];
     if (updateDownloaded) {
-        items.push({ label: `Güncellemeyi Kur (v${updateVersion})`, click: installUpdateNow });
+        items.push({ label: `Güncellemeyi Şimdi Kur (v${updateVersion}) — zorunlu`, click: installUpdateNow });
     } else if (app.isPackaged) {
         items.push({ label: 'Güncellemeleri Denetle', click: () => autoUpdater.checkForUpdates().catch(() => { /* yok say */ }) });
     }
@@ -274,7 +341,10 @@ ipcMain.handle('autostart:set', (_e, on) => { app.setLoginItemSettings({ openAtL
 
 // Güncelleme penceresi butonları.
 ipcMain.on('updater:install', () => installUpdateNow());
-ipcMain.on('updater:later', () => closeUpdateWindow()); // çıkışta otomatik kurulur
+// "Gizle": kartı kapatır ama ZORUNLU geri sayım arkada işlemeye devam eder.
+// (Eskiden "Sonra" idi ve kurulum çıkışa kalıyordu — uygulama kapatılmadığı için
+//  sahada çok eski sürümler kalıyordu.)
+ipcMain.on('updater:later', () => closeUpdateWindow());
 
 // Yüzen buton: pencere boyutu (önizleme açılınca büyür) + gizle.
 ipcMain.on('float:size', (_e, { w, h } = {}) => {
