@@ -45,6 +45,34 @@ seçilenler oluştuğunda cariye şablon mesaj gönderilir (`{ad}` `{tutar}` `{k
   çekilir (~2 gün WhatsApp sınırı içinde).
 - Alacaklı olduğumuz (net bakiye negatif) cariye asla mesaj atılmaz.
 
+### Çek / Senet / Vadeli Visa (vade takibi)
+Portföydeki çek, senet ve vadeli kredi kartı belgelerinin **vadesine kaç gün kala**
+haber verileceği seçilir (ör. `7, 3, 1`); eşik dolunca sipariş bildirimi gibi cariye
+değil, **girilen sabit numaralara** WhatsApp mesajı gider.
+- Vade, belge tablosunda değil ödeme satırındadır: `F{firma}D{dönem}TBLCAR{GIR|CIK}HAREKET.VADE`.
+  `GIR` = müşteriden alınan (tahsilat), `CIK` = bizim verdiğimiz (ödeme); "Yön" ayarından seçilir.
+- Belge tipi IZAHAT koduyla değil **tablo üyeliğiyle** belirlenir:
+  `d.IND = h.BELGELINK AND d.EVRAKNO = h.EVRAKNO` → `TBLCEKGIRIS/CIKIS`,
+  `TBLSENETGIRIS/CIKIS`, `TBLVISAGIRIS`, `TBLTAKSITGIRIS`. Dönemde olmayan tablo atlanır.
+  Yalnız `BELGELINK` ile eşleştirmek gerçek veride %20 yanlış tip üretiyor — `EVRAKNO` şart.
+- Banka adı `h.BANKANO → F{firma}TBLBANKALAR.ADI` ile çözülür (ör. AKBANK); yoksa
+  belge tablosundaki şube/keşideci/kart adı kullanılır.
+- **Visa varsayılan KAPALI — Vega taksit takvimini bu satırda tutmuyor.** Ölçüm
+  (F0101D0017, 2240 satır): peşin çekimde (`TAKSITSAYISI=1`, 1.723 satır) vade =
+  işlem + 0–9 gün banka blokajı; taksitli çekimde (517 satır) vade = işlem tarihinin
+  aynısı. Yani visa açılırsa gerçek taksit vadesi değil kart çekim/blokaj tarihi
+  bildirilir. Açılırsa varsayılan olarak yalnız taksitli işlemler alınır
+  (`visaOnlyTaksit`; canlıda 30 günlük pencerede 735 → 190 satır). Çek ve senette
+  vade gerçektir. Gerçek taksit takvimi ayrı tabloda (`TBLWSTAKSITLISATIS`,
+  IZAHAT=100, taksit başına 1 satır) — bu modülün kapsamında değil.
+- Portföydeki müşteri çekinin **cirosu** bilerek kapsam dışı: o çek alınırken zaten
+  bildirildi, ciroyu eklemek aynı çeki ikinci kez haber vermek olurdu (~%1 satır).
+- Aynı belge + aynı eşik ikinci kez bildirilmez (`data/vade-sent.json`, 120 gün).
+  Program kapalıyken eşikler kaçtıysa **tek** mesaj gider (7/3/1 için üç tane değil).
+- Birden çok belge aynı anda düşerse tek mesajda toplanır; bildirim saati aralığı
+  (varsayılan 09–20) dışında gönderim yapılmaz.
+- "Yaklaşan vadeleri göster" düğmesi mesaj göndermeden okunan belgeleri listeler.
+
 ### Bakiye Hatırlatma
 Seçilen carilere periyodik bakiye hatırlatma mesajı; kendi zamanlayıcısı, son gönderim
 tarihini cari bazında tutar, kaldığı yerden devam eder.
@@ -161,6 +189,7 @@ Bu kilit lisanstan **bağımsızdır**: lisans uygulamanın tamamını, erişim 
   içinde aynı process'te çalışır.
 - Veriler: `%APPDATA%\vega-whatsapp-desktop\` (Electron userData) — `config.json`,
   `data/baileys-auth`, `data/watcher.json`, `data/antiban.json`, `data/stats.json`,
-  `data/reminders-log.json`, `data/aibot-state.json`. Geliştirmede `server/data/` altı.
+  `data/reminders-log.json`, `data/aibot-state.json`, `data/vade.json` +
+  `data/vade-sent.json`. Geliştirmede `server/data/` altı.
 - Telefon normalizasyonu TR odaklı (`server/phone.js`): `0xxx`/`5xxx` → `90...`,
   `905xxxxxxxxx` regex'i geçenler "geçerli" sayılır.

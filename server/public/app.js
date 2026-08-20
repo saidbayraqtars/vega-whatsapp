@@ -1149,10 +1149,12 @@ async function initWatcherView() {
     }
     await loadWatcherConfig();
     await loadSiparisConfig();
+    await loadVadeConfig();
     if (wcLogTimer) clearInterval(wcLogTimer);
     refreshWatcherLog();
     refreshSiparisLog();
-    wcLogTimer = setInterval(() => { refreshWatcherLog(); refreshSiparisLog(); }, 5000);
+    refreshVadeLog();
+    wcLogTimer = setInterval(() => { refreshWatcherLog(); refreshSiparisLog(); refreshVadeLog(); }, 5000);
 }
 
 async function loadWatcherDonemler(selectDonem) {
@@ -1596,6 +1598,205 @@ async function refreshSiparisLog() {
         box.querySelectorAll('.sp_msg').forEach(a => a.onclick = (ev) => {
             ev.preventDefault();
             showSentMessage(spLogEntries[+a.dataset.i]);
+        });
+    } catch { /* yok say */ }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  VADE TAKİBİ — çek / senet / vadeli visa (tek sabit numaraya bildirim)
+//  Sipariş kartıyla aynı desen: firma/dönem Belge Mesajları kartından alınır.
+// ═══════════════════════════════════════════════════════════════════════════
+function renderVadePhonePreview() {
+    const box = $('vd_phonePreview');
+    const parts = String($('vd_phone').value || '').split(/[,;\n\r/|]+/).map(s => s.trim()).filter(Boolean);
+    if (!parts.length) { box.textContent = ''; box.className = 'hint'; return; }
+    const ok = [], bad = [];
+    parts.forEach(p => {
+        const n = spNormalize(p);
+        if (/^905\d{9}$/.test(n) && !ok.includes(n)) ok.push(n);
+        else if (!/^905\d{9}$/.test(n)) bad.push(p);
+    });
+    const fmt = (n) => `0${n.slice(2, 5)} ${n.slice(5, 8)} ${n.slice(8, 10)} ${n.slice(10)}`;
+    const bits = [];
+    if (ok.length) bits.push(`✓ ${ok.length} numaraya gidecek: ${ok.map(fmt).join(', ')}`);
+    if (bad.length) bits.push(`⚠ anlaşılmadı: ${bad.join(', ')}`);
+    box.textContent = bits.join('  •  ');
+    box.className = 'hint' + (bad.length ? '' : ' ok');
+}
+
+async function loadVadeConfig() {
+    const r = await api('/vade');
+    if (!r.success) return;
+    const s = r.status;
+    $('vd_phone').value = s.phone || '';
+    $('vd_phone').oninput = renderVadePhonePreview;
+    renderVadePhonePreview();
+    $('vd_days').value = (s.days || []).join(', ');
+    $('vd_t_cek').checked = s.types?.cek !== false;
+    $('vd_t_senet').checked = s.types?.senet !== false;
+    $('vd_t_visa').checked = s.types?.visa === true;
+    $('vd_visaTaksit').checked = s.visaOnlyTaksit !== false;
+    $('vd_t_taksit').checked = s.types?.taksit === true;
+    $('vd_direction').value = s.direction || 'ikisi';
+    $('vd_min').value = s.minAmount || 0;
+    $('vd_group').checked = s.groupMessages !== false;
+    $('vd_template').value = s.template || '';
+    $('vd_headerTemplate').value = s.headerTemplate || '';
+    $('vd_lineTemplate').value = s.lineTemplate || '';
+    $('vd_fromHour').value = s.sendFromHour ?? 9;
+    $('vd_toHour').value = s.sendToHour ?? 20;
+    $('vd_interval').value = s.intervalSec || 900;
+    $('vd_respectWindow').checked = s.respectSendWindow === true;
+    $('vd_typing').checked = s.simulateTyping === true;
+    renderVadeState(s);
+}
+
+function renderVadeState(s) {
+    const on = s.running;
+    $('vdDot').className = 'dot ' + (on ? 'on' : '');
+    $('vdState').textContent = on ? 'Aktif' : 'Pasif';
+    $('vd_save').textContent = on ? 'Ayarları Kaydet' : 'Kaydet ve Başlat';
+    $('vd_stop').style.display = on ? '' : 'none';
+    const parts = [];
+    if (s.days?.length) parts.push(`Eşik: ${s.days.join(', ')} gün kala`);
+    if (s.phones?.length) parts.push(`${s.phones.length} numaraya bildiriliyor`);
+    if (s.invalidPhones?.length) parts.push(`⚠ geçersiz: ${s.invalidPhones.join(', ')}`);
+    if (s.lastResult?.found != null) parts.push(`${s.lastResult.found} belge izleniyor`);
+    if (s.pendingCount > 0) parts.push(`⏳ Kuyrukta ${s.pendingCount} bildirim`);
+    if (s.lastPollAt) parts.push(`Son tarama: ${new Date(s.lastPollAt).toLocaleTimeString('tr-TR')}`);
+    if (s.lastResult?.note) parts.push(s.lastResult.note);
+    if (s.lastError) parts.push(`⚠ ${s.lastError}`);
+    $('vd_status').textContent = parts.join('  •  ') || '—';
+    $('vd_info').textContent = on ? `Her ${Math.round((s.intervalSec || 900) / 60)} dk taranıyor` : '';
+}
+
+function collectVadeConfig() {
+    return {
+        firmaNo: $('wc_firma').value,      // firma/dönem Belge Mesajları kartından
+        donemNo: $('wc_donem').value,
+        phone: $('vd_phone').value.trim(),
+        days: $('vd_days').value,
+        types: {
+            cek: $('vd_t_cek').checked,
+            senet: $('vd_t_senet').checked,
+            visa: $('vd_t_visa').checked,
+            taksit: $('vd_t_taksit').checked,
+        },
+        visaOnlyTaksit: $('vd_visaTaksit').checked,
+        direction: $('vd_direction').value,
+        minAmount: Math.max(0, +$('vd_min').value || 0),
+        groupMessages: $('vd_group').checked,
+        template: $('vd_template').value,
+        headerTemplate: $('vd_headerTemplate').value,
+        lineTemplate: $('vd_lineTemplate').value,
+        sendFromHour: Math.min(23, Math.max(0, +$('vd_fromHour').value || 0)),
+        sendToHour: Math.min(23, Math.max(0, +$('vd_toHour').value || 23)),
+        intervalSec: Math.max(60, +$('vd_interval').value || 900),
+        respectSendWindow: $('vd_respectWindow').checked,
+        simulateTyping: $('vd_typing').checked,
+    };
+}
+
+function vadeValidate(cfg) {
+    if (!cfg.firmaNo || !cfg.donemNo) return 'Yukarıdan firma ve dönem seçin.';
+    if (!cfg.phone) return 'En az bir bildirim numarası girin.';
+    if (!/\d/.test(cfg.days)) return 'Kaç gün kala bildirileceğini girin (ör. 7, 3, 1).';
+    if (!Object.values(cfg.types).some(Boolean)) return 'En az bir belge tipi seçin (çek/senet/visa).';
+    if (!cfg.template.trim()) return 'Vade mesajı boş olamaz.';
+    return '';
+}
+
+$('vd_save').onclick = async () => {
+    $('vd_err').textContent = '';
+    const cfg = collectVadeConfig();
+    const err = vadeValidate(cfg);
+    if (err) { $('vd_err').textContent = err; return; }
+    $('vd_save').disabled = true;
+    try {
+        await api('/vade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+        const r = await api('/vade/start', { method: 'POST' });
+        if (!r.success) $('vd_err').textContent = r.message || 'Başlatılamadı.';
+        await loadVadeConfig();
+    } catch (e) { $('vd_err').textContent = 'Hata: ' + e.message; }
+    $('vd_save').disabled = false;
+};
+
+$('vd_stop').onclick = async () => {
+    const r = await api('/vade/stop', { method: 'POST' });
+    renderVadeState(r.status);
+};
+
+// Önizleme: hangi belgeleri okuduğumuzu göster (mesaj göndermez).
+$('vd_preview').onclick = async () => {
+    $('vd_err').textContent = '';
+    const cfg = collectVadeConfig();
+    if (!cfg.firmaNo || !cfg.donemNo) { $('vd_err').textContent = 'Yukarıdan firma ve dönem seçin.'; return; }
+    $('vd_preview').disabled = true;
+    const box = $('vd_upcoming');
+    box.style.display = '';
+    box.innerHTML = '<div class="muted" style="padding:10px">Aranıyor…</div>';
+    try {
+        await api('/vade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+        const r = await api('/vade/upcoming?days=60');
+        if (!r.success) { box.innerHTML = `<div class="muted" style="padding:10px">${esc(r.message || 'Okunamadı.')}</div>`; }
+        else if (!r.docs.length) { box.innerHTML = '<div class="muted" style="padding:10px">Önümüzdeki 60 günde vadesi gelen çek/senet/visa yok.</div>'; }
+        else {
+            box.innerHTML = r.docs.map(d => `
+                <div class="logline">
+                    <span>${esc(d.kalan)} — <b>${esc(d.turAdi)}</b> ${esc(d.belgeno || '')}
+                        <span class="muted">${esc(d.yonAdi)}</span>
+                        — ${esc(d.firma)} <b>${esc(d.tutarStr)} TL</b>
+                        <span class="muted">(${new Date(d.vade).toLocaleDateString('tr-TR')})</span>
+                    </span>
+                    <span class="st ${d.bildirildi ? 'sent' : 'info'}">${d.bildirildi ? 'Bildirildi' : 'Bekliyor'}</span>
+                </div>`).join('');
+        }
+    } catch (e) { box.innerHTML = `<div class="muted" style="padding:10px">Hata: ${esc(e.message)}</div>`; }
+    $('vd_preview').disabled = false;
+};
+
+$('vd_test').onclick = async () => {
+    $('vd_err').textContent = '';
+    const cfg = collectVadeConfig();
+    if (!cfg.phone) { $('vd_err').textContent = 'Önce bildirim numarası girin.'; return; }
+    $('vd_test').disabled = true;
+    try {
+        await api('/vade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+        const r = await api('/vade/test', { method: 'POST' });
+        $('vd_err').textContent = r.success ? '' : (r.message || 'Test gönderilemedi.');
+        if (r.success) $('vd_status').textContent = r.message || 'Test mesajı gönderildi.';
+        refreshVadeLog();
+    } catch (e) { $('vd_err').textContent = 'Hata: ' + e.message; }
+    $('vd_test').disabled = false;
+};
+
+let vdLogEntries = [];
+
+async function refreshVadeLog() {
+    try {
+        const r = await api('/vade/log');
+        if (!r.success) return;
+        renderVadeState(r.status);
+        const box = $('vd_log');
+        if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz vade bildirimi yok.</div>'; return; }
+        vdLogEntries = r.log;
+        const labels = { sent: 'Gönderildi', queued: 'Kuyrukta', failed: 'Başarısız', noPhone: 'Numara yok', skipped: 'Atlandı' };
+        box.innerHTML = r.log.map((e, i) => `
+            <div class="logline">
+                <span>${esc(e.firma || '')}
+                    ${e.tur ? `<span class="muted">${esc(e.tur)}</span>` : ''}
+                    ${e.tutar ? `<b>${esc(e.tutar)} TL</b>` : ''}
+                    ${e.kalan ? `<span class="muted">— ${esc(e.kalan)}</span>` : ''}
+                    ${e.evrak ? `<span class="muted">(${esc(e.evrak)})</span>` : ''}
+                    ${e.error ? `<span class="muted">— ${esc(e.error)}</span>` : ''}
+                    <span class="muted" style="font-size:11px">${e.at ? new Date(e.at).toLocaleTimeString('tr-TR') : ''}</span>
+                    ${e.message ? `<a href="#" class="vd_msg" data-i="${i}">mesajı gör</a>` : ''}
+                </span>
+                <span class="st ${e.status === 'sent' ? 'sent' : (e.status === 'failed' ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>
+            </div>`).join('');
+        box.querySelectorAll('.vd_msg').forEach(a => a.onclick = (ev) => {
+            ev.preventDefault();
+            showSentMessage(vdLogEntries[+a.dataset.i]);
         });
     } catch { /* yok say */ }
 }

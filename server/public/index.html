@@ -392,6 +392,102 @@
                 <div class="muted" id="sp_status" style="font-size:13px; margin-top:10px">—</div>
                 <div class="log" id="sp_log" style="max-height:260px; margin-top:8px"></div>
             </div>
+
+            <!-- ALT: Vade takibi (çek / senet / vadeli visa) — tam genişlik satır -->
+            <div class="card" style="grid-column: 1 / -1">
+                <h2>Çek / Senet / Vadeli Visa
+                    <span class="pill" style="margin-left:auto"><span class="dot" id="vdDot"></span> <span id="vdState">Pasif</span></span>
+                </h2>
+                <p class="sub">Portföydeki <b>çek, senet ve vadeli kredi kartı</b> belgesinin vadesine <b>kaç gün kala</b> haber verileceğini seç — sipariş bildirimi gibi aşağıdaki <b>numaralara</b> gider. Firma/dönem yukarıdaki seçimden alınır.</p>
+
+                <div class="row">
+                    <div class="field">
+                        <label>Bildirim numaraları</label>
+                        <input id="vd_phone" placeholder="05321234567, 05339876543" />
+                        <div class="hint">Vadeleri haber alacak numaralar — <b>virgülle</b> çoğalt.</div>
+                        <div class="hint" id="vd_phonePreview"></div>
+                    </div>
+                    <div class="field">
+                        <label>Kaç gün kala? (kalan gün)</label>
+                        <input id="vd_days" placeholder="7, 3, 1" />
+                        <div class="hint">Virgülle birden çok eşik yazılabilir. <b>0</b> = vade günü. Örn. <b>7, 3, 1</b> → üç kez hatırlatır.</div>
+                    </div>
+                </div>
+
+                <div class="field" style="margin-top:4px">
+                    <label>İzlenecek belgeler</label>
+                    <div>
+                        <label class="check" style="display:inline-flex; margin-right:14px"><input type="checkbox" id="vd_t_cek" checked /> Çek</label>
+                        <label class="check" style="display:inline-flex; margin-right:14px"><input type="checkbox" id="vd_t_senet" checked /> Senet</label>
+                        <label class="check" style="display:inline-flex; margin-right:14px"><input type="checkbox" id="vd_t_visa" /> Vadeli Visa (kredi kartı)</label>
+                        <label class="check" style="display:inline-flex"><input type="checkbox" id="vd_t_taksit" /> Taksit</label>
+                    </div>
+                    <label class="check" style="margin-top:6px"><input type="checkbox" id="vd_visaTaksit" checked /> Visa'da <b>yalnız taksitli</b> işlemleri al (peşin kart çekimini alma)</label>
+                    <div class="hint">⚠ <b>Vega, kredi kartı taksit takvimini bu satırda tutmuyor.</b> Peşin çekimde “vade” = banka blokajı (0–9 gün), taksitli çekimde ise vade = işlem tarihinin aynısı. Yani visa açılırsa <b>gerçek taksit vadesi değil</b>, kart çekim/blokaj tarihi bildirilir. Çek ve senette vade gerçektir; bu yüzden visa varsayılan <b>kapalı</b> gelir.</div>
+                </div>
+
+                <div class="row">
+                    <div class="field">
+                        <label>Yön</label>
+                        <select id="vd_direction">
+                            <option value="ikisi">İkisi de (alınan + verilen)</option>
+                            <option value="alinan">Yalnız alınan (müşteriden tahsilat)</option>
+                            <option value="verilen">Yalnız verilen (bizim ödemelerimiz)</option>
+                        </select>
+                        <div class="hint">Alınan = müşteriden aldığımız çek/senet. Verilen = bizim verdiğimiz.</div>
+                    </div>
+                    <div class="field">
+                        <label>Alt tutar sınırı (TL)</label>
+                        <input id="vd_min" type="number" min="0" value="0" />
+                        <div class="hint">0 = her belge bildirilir.</div>
+                    </div>
+                </div>
+
+                <label class="check"><input type="checkbox" id="vd_group" checked /> Aynı taramada birden çok belge çıkarsa <b>tek mesajda topla</b></label>
+
+                <div class="field" style="margin-top:10px">
+                    <label>Vade mesajı (tek belge)</label>
+                    <textarea id="vd_template" style="min-height:100px"></textarea>
+                    <div class="hint">{firma}=cari adı, {kod}=cari kodu, {tur}=Çek/Senet/Kredi Kartı, {yon}=Alınan/Verilen, {belgeno}=çek/senet no, {banka}=banka adı (ör. AKBANK), {taksit}=“3 taksit” (visa), {vade}=vade tarihi, {kalan}=“3 gün kaldı”, {gun}=kalan gün sayısı, {tutar}=tutar, {firmaadi}=kendi firma adın.</div>
+                </div>
+
+                <details class="adv">
+                    <summary>Gelişmiş ayarlar</summary>
+                    <div class="field" style="margin-top:4px">
+                        <label>Toplu mesaj başlığı</label>
+                        <textarea id="vd_headerTemplate" style="min-height:60px"></textarea>
+                        <div class="hint">{adet}=belge sayısı, {toplam}=toplam tutar.</div>
+                    </div>
+                    <div class="field" style="margin-top:8px">
+                        <label>Toplu mesaj satırı</label>
+                        <textarea id="vd_lineTemplate" style="min-height:50px"></textarea>
+                        <div class="hint">Her belge için bir satır. Tek belge değişkenlerinin hepsi geçerli.</div>
+                    </div>
+                    <div class="grid2" style="margin-top:10px">
+                        <div><label>Bildirim saati — başlangıç</label><input id="vd_fromHour" type="number" min="0" max="23" value="9" /></div>
+                        <div><label>Bildirim saati — bitiş</label><input id="vd_toHour" type="number" min="0" max="23" value="20" /></div>
+                    </div>
+                    <div class="hint">Vade hatırlatması bu saat aralığı dışında gönderilmez (gece bildirim gitmesin).</div>
+                    <div class="grid2" style="margin-top:10px">
+                        <div><label>Tarama sıklığı (sn)</label><input id="vd_interval" type="number" value="900" min="60" /></div>
+                    </div>
+                    <label class="check" style="margin-top:8px"><input type="checkbox" id="vd_respectWindow" /> <b>Gönderim saati/gün penceresine</b> uy</label>
+                    <label class="check"><input type="checkbox" id="vd_typing" /> "Yazıyor..." simülasyonu</label>
+                </details>
+
+                <div class="selbar" style="margin-top:14px">
+                    <button class="btn green sm" id="vd_save">Kaydet ve Başlat</button>
+                    <button class="btn danger sm" id="vd_stop" style="display:none">Durdur</button>
+                    <button class="btn ghost sm" id="vd_preview">Yaklaşan vadeleri göster</button>
+                    <button class="btn ghost sm" id="vd_test">Test mesajı gönder</button>
+                    <div class="spacer"></div>
+                    <span class="count" id="vd_info"></span>
+                </div>
+                <div class="err" id="vd_err"></div>
+                <div class="muted" id="vd_status" style="font-size:13px; margin-top:10px">—</div>
+                <div class="log" id="vd_upcoming" style="max-height:260px; margin-top:8px; display:none"></div>
+                <div class="log" id="vd_log" style="max-height:260px; margin-top:8px"></div>
+            </div>
         </div>
 
         <!-- ─── BAKİYE HATIRLATMA ─── -->

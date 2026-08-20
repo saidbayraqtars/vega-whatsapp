@@ -42,6 +42,7 @@ const logoutWhatsApp = () => accounts.logoutAll();
 const { normalizePhone, isLikelyValid } = require('./phone');
 const watcher = require('./watcher');
 const siparis = require('./siparis');
+const vade = require('./vade');
 const reminders = require('./reminders');
 const activeCari = require('./activeCari');
 const aiBot = require('./aiBot');
@@ -347,6 +348,7 @@ function startAutomationUnlessRelay() {
     if (isRelay()) { console.log('[Relay] İkinci PC (ekstre) modu — watcher/hatırlatma/aktif-cari BAŞLATILMADI (ana PC yürütür).'); return; }
     watcher.autoStart();
     try { siparis.autoStart(); } catch { /* yok say */ }
+    try { vade.autoStart(); } catch { /* yok say */ }
     try { reminders.autoStart(); } catch { /* Faz 6 */ }
     try { activeCari.autoStart(); } catch { /* yok say */ }
 }
@@ -484,6 +486,7 @@ app.post('/api/reset', async (req, res) => {
     try {
         watcher.stop(); // DB ayarları silinirken izleme açık kalmasın
         try { siparis.stop(); } catch { /* yok say */ }
+        try { vade.stop(); } catch { /* yok say */ }
         if (pool) { await pool.close(); pool = null; }
         if (fs.existsSync(CONFIG_PATH)) fs.unlinkSync(CONFIG_PATH);
         res.json({ success: true });
@@ -1283,6 +1286,55 @@ app.get('/api/siparis/log', (req, res) => {
 // Şablonu gerçek (son) siparişle deneyip bildirim numarasına tek mesaj atar.
 app.post('/api/siparis/test', async (req, res) => {
     try { res.json(await siparis.sendTest()); }
+    catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  VADE TAKİBİ — çek / senet / vadeli visa (tek sabit numaraya iç bildirim)
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/vade', (req, res) => {
+    res.json({ success: true, status: vade.getStatus() });
+});
+
+app.post('/api/vade', (req, res) => {
+    const allowed = ['firmaNo', 'donemNo', 'phone', 'days', 'types', 'visaOnlyTaksit', 'direction', 'minAmount',
+        'groupMessages', 'sendFromHour', 'sendToHour', 'intervalSec', 'respectSendWindow',
+        'simulateTyping', 'template', 'headerTemplate', 'lineTemplate'];
+    const patch = {};
+    for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    const prev = vade.getConfig();
+    vade.setConfig(patch);
+    // Firma/dönem değişince defter başka bir tabloyu işaret eder → sıfırla.
+    if (patch.firmaNo && (patch.firmaNo !== prev.firmaNo || patch.donemNo !== prev.donemNo)) {
+        vade.resetLedger();
+    }
+    res.json({ success: true, status: vade.getStatus() });
+});
+
+app.post('/api/vade/start', (req, res) => {
+    if (!requireDb(req, res)) return;
+    const ok = vade.start();
+    res.json({ success: ok, status: vade.getStatus(), message: ok ? '' : (vade.getStatus().lastError || 'Başlatılamadı.') });
+});
+
+app.post('/api/vade/stop', (req, res) => {
+    vade.stop();
+    res.json({ success: true, status: vade.getStatus() });
+});
+
+app.get('/api/vade/log', (req, res) => {
+    res.json({ success: true, log: vade.getLog(), status: vade.getStatus() });
+});
+
+// Önizleme: vadesi yaklaşan çek/senet/visa listesi — mesaj GÖNDERMEZ.
+app.get('/api/vade/upcoming', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    try { res.json({ success: true, docs: await vade.listUpcoming(req.query.days) }); }
+    catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+app.post('/api/vade/test', async (req, res) => {
+    try { res.json(await vade.sendTest()); }
     catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -2843,6 +2895,7 @@ credits.configure({
 function stopAutomation(sebep) {
     try { watcher.stop(); } catch { /* yok say */ }
     try { siparis.stop(); } catch { /* yok say */ }
+    try { vade.stop(); } catch { /* yok say */ }
     try { reminders.stop(); } catch { /* yok say */ }
     try { activeCari.stop(); } catch { /* yok say */ }
     console.warn(`[Lisans] Otomasyon durduruldu — ${sebep}`);
@@ -2944,6 +2997,20 @@ siparis.configure({
     baseDir,
     getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
     buildSiparisContentText,
+});
+
+// Vade takip: çek / senet / vadeli visa vadesine X gün kala TEK sabit numaraya haber ver.
+// (Vade cari giriş/çıkış fişinin ödeme satırındadır — TBLCAR{GIR|CIK}HAREKET.VADE.)
+vade.configure({
+    getPool: () => pool,
+    sql,
+    resolveCariContacts,
+    waSend: waSendX,
+    waStatus: waStatusX,
+    gate: (ch) => gateX(ch, null),
+    recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
+    baseDir,
+    getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
 });
 
 // Periyodik bakiye/borç hatırlatma zamanlayıcısı.
