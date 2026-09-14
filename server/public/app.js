@@ -666,6 +666,7 @@ async function openSettings() {
             $('set_cloudTplParams').value = (c.templateParamCount != null) ? c.templateParamCount : 1;
             $('set_cloudTplMode').value = c.templateMode || 'auto';
             $('set_cloudTplDoc').checked = !!c.templateDocHeader;
+            $('set_cloudUseStd').checked = c.useStandardTemplates !== false;
             toggleRelayFields();
             const wr = $('set_waResult');
             if (w.mode === 'cloud' && c.status) {
@@ -719,6 +720,7 @@ function cloudBody() {
         cloudTemplateParamCount: $('set_cloudTplParams').value,
         cloudTemplateMode: $('set_cloudTplMode').value,
         cloudTemplateDocHeader: $('set_cloudTplDoc').checked,
+        cloudUseStandard: $('set_cloudUseStd').checked,
     };
 }
 
@@ -765,10 +767,12 @@ async function loadCloudTemplates() {
         const r = await api('/cloud/templates');
         if (!r.success) { box.innerHTML = `<div class="err">${esc(r.message || 'Şablonlar alınamadı.')}</div>`; return; }
         cloudTemplates = r.templates || [];
+        const usedFor = Object.fromEntries((r.standard || []).map((s) => [s.name, s.label]));
         if (!cloudTemplates.length) { box.innerHTML = '<div class="muted" style="padding:6px 0">Bu hesapta henüz şablon yok.</div>'; return; }
         box.innerHTML = cloudTemplates.map((t, i) => `
             <div class="logline">
                 <span><b>${esc(t.name)}</b> <span class="muted">${esc(t.language)} · ${esc(t.category)}${t.header ? ' · başlık: ' + esc(t.header) : ''}</span>
+                    ${usedFor[t.name] ? `<br><span class="muted" style="font-size:12px">Kullanım: ${esc(usedFor[t.name])}</span>` : ''}
                     <br><span class="muted" style="font-size:12px">${esc(t.body)}</span>
                     ${t.rejected ? `<br><span class="err" style="font-size:12px">Red sebebi: ${esc(t.rejected)}</span>` : ''}</span>
                 <span style="white-space:nowrap; text-align:right">
@@ -779,6 +783,25 @@ async function loadCloudTemplates() {
     } catch (e) { box.innerHTML = `<div class="err">Hata: ${esc(e.message)}</div>`; }
 }
 $('set_tplRefresh').onclick = loadCloudTemplates;
+
+// Tüm mesaj türleri için standart şablonları bu WhatsApp hesabında tamamla.
+$('set_tplStandard').onclick = async () => {
+    const btn = $('set_tplStandard'), box = $('set_tplStdResult');
+    box.style.display = ''; box.className = 'hint'; box.textContent = 'Şablonlar hazırlanıyor ve Meta onayına gönderiliyor...';
+    btn.disabled = true;
+    try {
+        const r = await api('/cloud/templates/standard', { method: 'POST' });
+        if (!r.success) { box.className = 'err'; box.textContent = r.message || 'Şablonlar oluşturulamadı.'; return; }
+        box.innerHTML = r.results.map((x) => `• <b>${esc(x.name)}</b> <span class="muted">(${esc(x.label || '')})</span>: ` +
+            (x.error ? `<span class="err">${esc(x.error)}</span>`
+                : esc(x.existed ? `zaten var — ${TPL_STATUS[x.status] || x.status}` : `onaya gönderildi — ${TPL_STATUS[x.status] || x.status}`))).join('<br>');
+        loadCloudTemplates();
+    } catch (e) {
+        box.className = 'err'; box.textContent = 'Hata: ' + e.message;
+    } finally {
+        btn.disabled = false;
+    }
+};
 
 // "Kullan": şablon adını/dilini/değişken sayısını gönderim ayarına yaz (kaydetmek kullanıcıda).
 $('set_tplList').addEventListener('click', (e) => {

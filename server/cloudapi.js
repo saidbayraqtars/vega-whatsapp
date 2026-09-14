@@ -70,6 +70,9 @@ function setConfig(next) {
         templateMode: ['auto', 'always', 'never'].includes(next.templateMode) ? next.templateMode : 'auto',
         templateParamCount: Number(next.templateParamCount) >= 0 ? Math.floor(Number(next.templateParamCount)) : 1,
         templateDocHeader: !!next.templateDocHeader,
+        // Mesaj türüne (opts.channel) göre standart şablon seti (STANDARD_TEMPLATES).
+        // Kapalıysa ya da kanalın standart şablonu yoksa tek şablon (templateName) kullanılır.
+        useStandardTemplates: next.useStandardTemplates !== false,
     };
     statusCache = { ready: false, me: null, error: 'Durum sorgulanmadı.', ts: 0, info: null };
 }
@@ -153,6 +156,9 @@ const VEGA_ERR = {
     TOO_LARGE: 'Dosya çok büyük (en fazla 16 MB).',
     EMPTY_FILE: 'Dosya boş.',
     BAD_TEMPLATE: 'Şablon biçimi Vega sunucusunca reddedildi.',
+    BAD_TYPE: 'Örnek dosya türü desteklenmiyor (PDF, JPEG, PNG).',
+    NOT_FOUND: 'Vega sunucusu bu işlemi henüz desteklemiyor — sunucu güncellenmeli.',
+    SERVER_NOT_CONFIGURED: 'Vega sunucusunda Meta uygulama ayarı eksik — tedarikçinize bildirin.',
     NO_WABA: 'Numaranın WhatsApp Business hesabı (WABA) Vega sunucusunda tanımlı değil — tedarikçinize bildirin.',
 };
 
@@ -299,22 +305,87 @@ function buildMediaPayload(to, text, media, mediaId) {
     return { ...base, type: 'document', document: { id: mediaId, caption, filename: media.fileName || 'dosya.pdf' } };
 }
 
+// ─── Standart şablon seti (mesaj türü başına bir şablon) ─────────────────────
+// 24 saat penceresi kapalıyken serbest metin gidemez; her mesaj türü kendi ONAYLI
+// şablonuna düşer. Mesaj metnimiz (kullanıcının düzenlediği şablondan üretilen) tek
+// satıra indirilip {{1}}'e konur → uygulamadaki mesaj düzenleme ekranları aynen çalışır.
+// Sabit metin türe özgü tutuldu ki Meta "Hizmet (UTILITY)" sınıflandırsın; toplu mesaj
+// içeriği serbest olduğu için Pazarlama. Şablonlar WABA'ya özgüdür: her müşteri kendi
+// hesabında bir kez "Standart şablonları oluştur" der (ensureStandardTemplates).
+// Metin değişkenle başlayıp bitemez, {{1}} ≤ 900 karakter (toParam) + sabit metin < 1024.
+const STANDARD_TEMPLATES = [
+    {
+        channel: 'manual', name: 'hesap_bakiye_bildirimi', category: 'UTILITY', label: 'Bakiye bildirimi (tek cari)',
+        body: 'Sayın müşterimiz, hesap bilgilendirmeniz: {{1}} İyi çalışmalar dileriz.',
+        example: 'ABC Ltd. güncel hesap bakiyeniz 1.250,00 TL (borç).',
+    },
+    {
+        channel: 'belge', name: 'belge_bildirimi', category: 'UTILITY', label: 'Belge bildirimleri (fatura, irsaliye, tahsilat, ödeme, güncelleme)',
+        body: 'Cari hesabınızla ilgili belge bildirimi: {{1}} Bu mesaj bilgilendirme amaçlıdır.',
+        example: 'Sayın ABC Ltd., 14.09.2026 tarihli 12.500,00 TL tutarındaki satış faturanız düzenlenmiştir.',
+    },
+    {
+        channel: 'reminder', name: 'odeme_hatirlatma', category: 'UTILITY', label: 'Bakiye / ödeme hatırlatma',
+        body: 'Cari hesap ödeme hatırlatması: {{1}} Ödemenizi yaptıysanız bu mesajı dikkate almayınız.',
+        example: 'Sayın ABC Ltd., güncel borç bakiyeniz 8.400,00 TL.',
+    },
+    {
+        channel: 'vade', name: 'vade_hatirlatma', category: 'UTILITY', label: 'Çek / senet / vadeli ödeme hatırlatma',
+        body: 'Çek, senet ve vadeli ödeme hatırlatması: {{1}} Bilginize sunarız.',
+        example: '3 gün kaldı · Çek 000123 · Cari: ABC Ltd. · Tutar: 15.000,00 TL · Vade: 17.09.2026',
+    },
+    {
+        channel: 'siparis', name: 'siparis_bildirimi', category: 'UTILITY', label: 'Sipariş bildirimi (iç numara)',
+        body: 'Sipariş takip bildirimi: {{1}} Bu mesaj sipariş takip sistemince otomatik gönderilmiştir.',
+        example: 'Yeni Sipariş SP-2026-0412 · Cari: ABC Ltd. · Tarih: 14.09.2026 · Tutar: 23.750,00 TL',
+    },
+    {
+        channel: 'extre', name: 'hesap_ekstresi', category: 'UTILITY', header: 'DOCUMENT', label: 'Hesap ekstresi (PDF)',
+        body: 'Cari hesap ekstreniz ektedir. {{1}} Sorularınız için bu numaradan bize yazabilirsiniz.',
+        example: 'Sayın ABC Ltd., 01.01.2026 - 14.09.2026 dönemi hesap ekstreniz.',
+    },
+    {
+        channel: 'watcher', name: 'efatura_belgesi', category: 'UTILITY', header: 'DOCUMENT', label: 'e-Fatura / e-Arşiv PDF',
+        body: 'e-Fatura / e-Arşiv belgeniz ektedir. {{1}} İyi çalışmalar dileriz.',
+        example: 'Sayın ABC Ltd., 14.09.2026 tarihli ABC2026000000123 numaralı e-Fatura belgeniz.',
+    },
+    {
+        channel: 'bulk', name: 'genel_duyuru', category: 'MARKETING', label: 'Toplu mesaj / duyuru',
+        body: 'Değerli müşterimiz, {{1}} Bu tür mesajları almak istemiyorsanız bize DUR yazabilirsiniz.',
+        example: 'Eylül ayına özel tüm ürünlerde yüzde 10 indirim başladı.',
+    },
+];
+const STANDARD_BY_CHANNEL = Object.fromEntries(STANDARD_TEMPLATES.map((t) => [t.channel, t]));
+
+// Gönderimde kullanılacak şablon. Belge başlıklı şablon eksiz gönderilemez → eksiz
+// mesaj (ör. e-Fatura iptal bildirimi) belge bildirimine düşer.
+function templateFor(channel, media) {
+    if (!cfg || cfg.templateMode === 'never') return null;
+    if (cfg.useStandardTemplates) {
+        let std = STANDARD_BY_CHANNEL[channel] || null;
+        if (std && std.header === 'DOCUMENT' && !(media && media.kind === 'document')) std = STANDARD_BY_CHANNEL.belge;
+        if (std) return { name: std.name, lang: 'tr', paramCount: 1, docHeader: std.header === 'DOCUMENT' };
+    }
+    if (!cfg.templateName) return null;
+    return { name: cfg.templateName, lang: cfg.templateLang || 'tr', paramCount: cfg.templateParamCount, docHeader: cfg.templateDocHeader };
+}
+
 // Şablon gönderimi. Serbest metnimiz çok satırlı olduğu için tek satıra indirilip
-// gövde değişkenine konur ({{1}}). templateParamCount=0 ise sabit metinli şablon
+// gövde değişkenine konur ({{1}}). paramCount=0 ise sabit metinli şablon
 // varsayılır (değişken yollanmaz). opts.templateParams verilirse o kullanılır.
-function buildTemplatePayload(to, text, mediaId, media, opts) {
+function buildTemplatePayload(to, text, mediaId, media, opts, tpl) {
     const components = [];
-    if (cfg.templateDocHeader && mediaId) {
+    if (tpl.docHeader && mediaId) {
         const p = media.kind === 'image'
             ? { type: 'image', image: { id: mediaId } }
             : { type: 'document', document: { id: mediaId, filename: media.fileName || 'dosya.pdf' } };
         components.push({ type: 'header', parameters: [p] });
     }
     let params = Array.isArray(opts.templateParams) ? opts.templateParams.map(toParam) : null;
-    if (!params && cfg.templateParamCount > 0) {
+    if (!params && tpl.paramCount > 0) {
         params = [toParam(text)];
         // Şablon 1'den fazla değişken bekliyorsa kalanları boş bırakma (Meta reddeder) → tire koy.
-        while (params.length < cfg.templateParamCount) params.push('-');
+        while (params.length < tpl.paramCount) params.push('-');
     }
     if (params && params.length) {
         components.push({ type: 'body', parameters: params.map((t) => ({ type: 'text', text: t || '-' })) });
@@ -325,8 +396,8 @@ function buildTemplatePayload(to, text, mediaId, media, opts) {
         to,
         type: 'template',
         template: {
-            name: cfg.templateName,
-            language: { code: cfg.templateLang || 'tr' },
+            name: tpl.name,
+            language: { code: tpl.lang || 'tr' },
             ...(components.length ? { components } : {}),
         },
     };
@@ -353,23 +424,28 @@ async function sendMessage(phone, text, media = null, opts = {}) {
         mediaId = up.id;
     }
 
+    const tpl = templateFor(opts.channel, mediaId ? media : null);
     const wantTemplate = opts.forceTemplate || cfg.templateMode === 'always';
-    const canTemplate = !!cfg.templateName && cfg.templateMode !== 'never';
+    const canTemplate = !!tpl;
 
     const post = (payload) => (viaVega()
         ? vega('/v1/wa/send', { method: 'POST', json: { phoneNumberId: cfg.phoneNumberId || undefined, message: payload } })
         : graph(`/${cfg.apiVersion}/${encodeURIComponent(cfg.phoneNumberId)}/messages`, { method: 'POST', json: payload }));
+    const sendTemplate = () => {
+        if (mediaId && !tpl.docHeader) deps.log(`cloud: "${tpl.name}" şablonunda belge başlığı yok, ek gönderilmedi (${to})`);
+        return post(buildTemplatePayload(to, text, mediaId, media || {}, opts, tpl));
+    };
 
     try {
         let res;
         if (wantTemplate && canTemplate) {
-            res = await post(buildTemplatePayload(to, text, mediaId, media || {}, opts));
+            res = await sendTemplate();
         } else {
             res = await post(mediaId ? buildMediaPayload(to, text, media, mediaId) : buildTextPayload(to, text));
             // 24 saat penceresi kapalıysa serbest metin reddedilir → onaylı şablona düş.
             if (res.status !== 200 && isReengagementError(res) && canTemplate) {
-                deps.log(`cloud: 24s penceresi kapalı, şablona düşülüyor (${to})`);
-                res = await post(buildTemplatePayload(to, text, mediaId, media || {}, opts));
+                deps.log(`cloud: 24s penceresi kapalı, "${tpl.name}" şablonuna düşülüyor (${to})`);
+                res = await sendTemplate();
             }
         }
 
@@ -521,11 +597,76 @@ async function createTemplate(template) {
     } catch (e) { return { ok: false, error: unreachable() + e.message }; }
 }
 
+// Belge başlıklı şablonun Meta'ya gösterilecek örneği — bağımlılıksız, elle kurulmuş
+// tek sayfalık PDF (xref ofsetleri hesaplanır; yalnız ASCII).
+function samplePdf() {
+    const content = 'BT /F1 18 Tf 72 770 Td (Ornek belge - Vega WhatsApp) Tj ET';
+    const objs = [
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+        `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    ];
+    let out = '%PDF-1.4\n';
+    const offsets = objs.map((o, i) => {
+        const at = out.length;
+        out += `${i + 1} 0 obj\n${o}\nendobj\n`;
+        return at;
+    });
+    const xref = out.length;
+    out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n` +
+        offsets.map((n) => `${String(n).padStart(10, '0')} 00000 n \n`).join('') +
+        `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+    return Buffer.from(out, 'latin1');
+}
+
+async function uploadTemplateSample() {
+    try {
+        const r = await vega('/v1/wa/templates/sample' + pnidQuery(), {
+            method: 'POST', body: samplePdf(), contentType: 'application/pdf',
+            headers: { 'X-File-Name': 'ornek-belge.pdf' }, timeoutMs: 60_000,
+        });
+        if (r.status === 200 && r.json && r.json.handle) return { ok: true, handle: r.json.handle };
+        return { ok: false, error: templateError(r) };
+    } catch (e) { return { ok: false, error: unreachable() + e.message }; }
+}
+
+// Standart şablon setini bu WABA'da tamamla: olanlara dokunma, eksikleri Meta onayına
+// gönder. Müşteri numarasını bağladıktan sonra bir kez çalıştırılır; tekrar güvenli.
+async function ensureStandardTemplates() {
+    const l = await listTemplates();
+    if (!l.ok) return { ok: false, error: l.error };
+    const have = new Map(l.templates.map((t) => [`${t.name}|${t.language}`, t]));
+    const results = [];
+    for (const s of STANDARD_TEMPLATES) {
+        const ex = have.get(`${s.name}|tr`);
+        if (ex) { results.push({ name: s.name, label: s.label, status: ex.status, existed: true }); continue; }
+
+        const draft = buildTemplateDraft({ name: s.name, category: s.category, language: 'tr', body: s.body, examples: [s.example] });
+        if (draft.error) { results.push({ name: s.name, label: s.label, error: draft.error }); continue; }
+        if (s.header === 'DOCUMENT') {
+            const up = await uploadTemplateSample();
+            if (!up.ok) { results.push({ name: s.name, label: s.label, error: 'Örnek belge yüklenemedi: ' + up.error }); continue; }
+            draft.template.components.unshift({ type: 'HEADER', format: 'DOCUMENT', example: { header_handle: [up.handle] } });
+        }
+        const r = await createTemplate(draft.template);
+        results.push(r.ok
+            ? { name: s.name, label: s.label, status: r.status, category: r.category, created: true }
+            : { name: s.name, label: s.label, error: r.error });
+    }
+    return { ok: true, results };
+}
+
 module.exports = {
     configure,
     setConfig,
     isConfigured,
     viaVega,
+    STANDARD_TEMPLATES,
+    templateFor,
+    samplePdf,
+    ensureStandardTemplates,
     getStatus,
     refreshStatus,
     sendMessage,

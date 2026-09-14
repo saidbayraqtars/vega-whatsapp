@@ -622,6 +622,7 @@ app.get('/api/settings/wa', (req, res) => {
             templateMode: cl.templateMode || 'auto',
             templateParamCount: cl.templateParamCount != null ? cl.templateParamCount : 1,
             templateDocHeader: !!cl.templateDocHeader,
+            useStandardTemplates: cl.useStandardTemplates !== false,
             status: isCloud() ? cloudapi.getStatus() : null,
         },
     });
@@ -660,6 +661,7 @@ function buildCloudCfg(b, prev) {
             ? Math.max(0, parseInt(b.cloudTemplateParamCount, 10) || 0)
             : (p.templateParamCount != null ? p.templateParamCount : 1),
         templateDocHeader: b.cloudTemplateDocHeader != null ? !!b.cloudTemplateDocHeader : !!p.templateDocHeader,
+        useStandardTemplates: b.cloudUseStandard != null ? !!b.cloudUseStandard : (p.useStandardTemplates !== false),
     };
 }
 
@@ -764,7 +766,17 @@ app.get('/api/cloud/templates', async (req, res) => {
     if (!credits.hasIdentity()) return res.status(400).json({ success: false, message: 'Şablonlar için lisans gerekli.' });
     const r = await cloudapi.listTemplates();
     if (!r.ok) return res.status(400).json({ success: false, message: r.error });
-    res.json({ success: true, templates: r.templates });
+    const standard = cloudapi.STANDARD_TEMPLATES.map(({ channel, name, label, category, header }) => ({ channel, name, label, category, header: header || '' }));
+    res.json({ success: true, templates: r.templates, standard });
+});
+
+// Tüm mesaj türleri için standart şablon seti: eksikler Meta onayına gönderilir, var
+// olanlara dokunulmaz. Belge başlıklılar için örnek PDF Vega sunucusu üzerinden yüklenir.
+app.post('/api/cloud/templates/standard', async (req, res) => {
+    if (!credits.hasIdentity()) return res.status(400).json({ success: false, message: 'Şablon oluşturmak için lisans gerekli.' });
+    const r = await cloudapi.ensureStandardTemplates();
+    if (!r.ok) return res.status(400).json({ success: false, message: r.error });
+    res.json({ success: true, results: r.results });
 });
 
 app.post('/api/cloud/templates', async (req, res) => {

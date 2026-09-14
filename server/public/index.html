@@ -914,9 +914,13 @@
             <div class="hint">Mesaj metnimiz çok satırlı olduğu için şablona konurken tek satıra indirilir (satır sonları " · " olur) — şablonun gövdesi <code>{{1}}</code> içermelidir.</div>
             <details class="adv" id="set_cloudTplTools" style="margin-top:8px">
                 <summary>Şablonlar — listele / yeni şablon oluştur</summary>
-                <div class="row" style="margin-top:8px">
-                    <button class="btn ghost sm" id="set_tplRefresh" style="flex:1">Şablonları getir</button>
+                <label class="check" style="margin-top:8px"><input type="checkbox" id="set_cloudUseStd" checked /> Mesaj türüne göre standart şablonları kullan (belge, hatırlatma, vade, sipariş, ekstre, e-Fatura, toplu mesaj)</label>
+                <div class="row" style="margin-top:6px">
+                    <button class="btn green sm" id="set_tplStandard" style="flex:1">Standart şablonları oluştur (tüm mesaj türleri)</button>
+                    <button class="btn ghost sm" id="set_tplRefresh" style="flex:.6">Şablonları getir</button>
                 </div>
+                <div class="hint">Numara bağlandıktan sonra bir kez basın: eksik şablonlar Meta onayına gönderilir, var olanlara dokunulmaz. Onaylanana kadar müşteri son 24 saatte yazmadıysa mesaj gönderilemez.</div>
+                <div class="hint" id="set_tplStdResult" style="display:none"></div>
                 <div id="set_tplList"></div>
                 <div class="muted" style="font-weight:600; margin:12px 0 6px">Yeni şablon</div>
                 <div class="row">
