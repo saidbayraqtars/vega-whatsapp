@@ -1,6 +1,6 @@
 {
   "name": "vega-whatsapp-desktop",
-  "version": "1.6.1",
+  "version": "1.7.1",
   "description": "Vega WhatsApp — masaüstü (Electron). Toplu mesaj + otomatik tahsilat takibi.",
   "main": "electron/main.js",
   "author": "Vega",
@@ -11,7 +11,9 @@
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win",
-    "release": "electron-builder --win --publish always"
+    "release": "electron-builder --win --publish always",
+    "test:efatura": "node integrations/efatura/test/smoke.js",
+    "test:efatura-pdf": "electron integrations/efatura/test/electron-pdf-smoke.js"
   },
   "build": {
     "appId": "com.vega.whatsapp",
@@ -38,6 +40,15 @@
       "!server/server.log",
       "!server/_x/**"
     ],
+    "extraFiles": [
+      {
+        "from": "integrations",
+        "to": "integrations",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "win": {
       "target": "nsis",
       "icon": "electron/icon.png"
@@ -47,7 +58,8 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "shortcutName": "Vega WhatsApp"
+      "shortcutName": "Vega WhatsApp",
+      "include": "build/installer.nsh"
     }
   },
   "devDependencies": {

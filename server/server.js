@@ -51,6 +51,8 @@ const license = require('./license');
 const antiban = require('./antiban');
 const stats = require('./stats');
 const cloudapi = require('./cloudapi');
+const cloudinbox = require('./cloudinbox');
+const integrations = require('./integrations');
 const { buildExtrePdf } = require('./extre');
 
 const QRCode = require('qrcode');
@@ -284,9 +286,15 @@ async function pollRelayStatus() {
 // ─── Cloud API sürücüsünü config'ten besle ───────────────────────────────────
 // Token config.json'da makine anahtarıyla ŞİFRELİ durur (DB parolasıyla aynı
 // yöntem); cloudapi.js düz metin ister → burada çözülür, diske geri yazılmaz.
-cloudapi.configure({ stats, log: (m) => { try { console.log('[Cloud]', m); } catch { /* yok say */ } } });
+// 'vega' yolunda jeton yok: gönderim vega-kontor Worker'ına lisans imzasıyla gider.
+cloudapi.configure({
+    stats,
+    log: (m) => { try { console.log('[Cloud]', m); } catch { /* yok say */ } },
+    vega: { endpoint: () => credits.endpoint(), authHeaders: () => credits.authHeaders() },
+});
 function applyCloudConfig() {
     const c = (waCfg && waCfg.cloud) || null;
+    if (c && c.via === 'vega') { cloudapi.setConfig({ ...c, token: null }); return; }
     if (!c || !c.phoneNumberId || !c.token) { cloudapi.setConfig(null); return; }
     let token = null;
     try { token = decryptSecret(c.token); } catch { token = null; }
@@ -352,6 +360,7 @@ function startAutomationUnlessRelay() {
     try { vade.autoStart(); } catch { /* yok say */ }
     try { reminders.autoStart(); } catch { /* Faz 6 */ }
     try { activeCari.autoStart(); } catch { /* yok say */ }
+    try { integrations.autoStart(); } catch (e) { console.error('[Entegrasyon] otomatik baslatma:', e.message); }
 }
 
 // Kayıtlı config varsa PIN'siz otomatik bağlan (boot + /api/connect).
@@ -602,6 +611,8 @@ app.get('/api/settings/wa', (req, res) => {
         hasToken: !!(waCfg && waCfg.relayToken),
         relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null,
         cloud: {
+            via: cl.via || (cl.token ? 'direct' : 'vega'),
+            hasLicense: credits.hasIdentity(),
             phoneNumberId: cl.phoneNumberId || '',
             wabaId: cl.wabaId || '',
             hasToken: !!cl.token,
@@ -635,6 +646,9 @@ function buildCloudCfg(b, prev) {
     const p = prev || {};
     const tokenPlain = (b.cloudToken != null && String(b.cloudToken).trim() !== '') ? String(b.cloudToken).trim() : null;
     return {
+        // 'vega' = Worker üzerinden (jeton yok), 'direct' = kendi jetonu. Eski kurulum
+        // (jetonu olan) açıkça seçilene kadar 'direct' kalır, bozulmaz.
+        via: ['vega', 'direct'].includes(b.cloudVia) ? b.cloudVia : (p.via || (p.token ? 'direct' : 'vega')),
         phoneNumberId: b.cloudPhoneNumberId != null ? String(b.cloudPhoneNumberId).trim() : (p.phoneNumberId || ''),
         wabaId: b.cloudWabaId != null ? String(b.cloudWabaId).trim() : (p.wabaId || ''),
         token: tokenPlain ? encryptSecret(tokenPlain) : (p.token || ''),
@@ -661,7 +675,9 @@ app.post('/api/settings/wa', async (req, res) => {
         if (!relayToken) return res.status(400).json({ success: false, message: 'Relay parolası (token) gerekli — ana PC ile aynı olmalı.' });
     }
     const cloud = buildCloudCfg(b, (waCfg && waCfg.cloud) || null);
-    if (mode === 'cloud') {
+    if (mode === 'cloud' && cloud.via === 'vega') {
+        if (!credits.hasIdentity()) return res.status(400).json({ success: false, message: 'Vega sunucusu üzerinden gönderim için lisans gerekli (deneme sürümünde kapalıdır).' });
+    } else if (mode === 'cloud') {
         if (!cloud.phoneNumberId) return res.status(400).json({ success: false, message: 'Telefon Numarası Kimliği (Phone Number ID) gerekli — Meta panelinde WhatsApp > API Kurulumu altında.' });
         if (!cloud.token) return res.status(400).json({ success: false, message: 'Erişim anahtarı (Access Token) gerekli.' });
     }
@@ -672,6 +688,7 @@ app.post('/api/settings/wa', async (req, res) => {
         fs.writeFileSync(CONFIG_PATH, JSON.stringify(existing, null, 2), 'utf8');
         waCfg = next;
         applyCloudConfig();
+        syncCloudInbox();
     } catch (e) {
         return res.status(500).json({ success: false, message: 'Ayar kaydedilemedi: ' + e.message });
     }
@@ -692,12 +709,16 @@ app.post('/api/settings/wa/cloud-test', async (req, res) => {
     const b = req.body || {};
     const prev = (waCfg && waCfg.cloud) || null;
     const draft = buildCloudCfg(b, prev);
-    if (!draft.phoneNumberId || !draft.token) {
-        return res.status(400).json({ success: false, message: 'Numara kimliği ve erişim anahtarı gerekli.' });
-    }
     let token = null;
-    try { token = decryptSecret(draft.token); } catch { token = null; }
-    if (!token) return res.status(400).json({ success: false, message: 'Erişim anahtarı çözülemedi — yeniden girin.' });
+    if (draft.via === 'vega') {
+        if (!credits.hasIdentity()) return res.status(400).json({ success: false, message: 'Vega sunucusu üzerinden gönderim için lisans gerekli (deneme sürümünde kapalıdır).' });
+    } else {
+        if (!draft.phoneNumberId || !draft.token) {
+            return res.status(400).json({ success: false, message: 'Numara kimliği ve erişim anahtarı gerekli.' });
+        }
+        try { token = decryptSecret(draft.token); } catch { token = null; }
+        if (!token) return res.status(400).json({ success: false, message: 'Erişim anahtarı çözülemedi — yeniden girin.' });
+    }
 
     // Geçici olarak taslağı uygula, sınadıktan sonra kayıtlı ayara geri dön.
     cloudapi.setConfig({ ...draft, token });
@@ -709,6 +730,50 @@ app.post('/api/settings/wa/cloud-test', async (req, res) => {
     } finally {
         applyCloudConfig();
     }
+});
+
+// ─── Cloud API ('vega' yolu): gelen kutusu, numara bağlama, şablonlar ─────────
+// Gelen kutusu listesi — WhatsApp penceresinde gösterilir; yoklama durumu da döner.
+app.get('/api/cloud/inbox', (req, res) => {
+    syncCloudInbox();
+    res.json({ success: true, active: isCloud() && cloudapi.viaVega(), ...cloudinbox.getStatus(), messages: cloudinbox.list(100) });
+});
+
+// Embedded Signup: Vega sunucusundan 30 dk'lık bilet al, bağlama sayfasını varsayılan
+// tarayıcıda aç. Facebook girişi tarayıcıda olur; Meta anahtarı Worker'da kalır.
+const ONBOARD_URL_PREFIX = 'https://www.expertbilisim.com.tr/whatsapp-bagla.html?t=';
+app.post('/api/cloud/onboard', async (req, res) => {
+    if (!credits.hasIdentity()) return res.status(400).json({ success: false, message: 'Numara bağlamak için lisans gerekli (deneme sürümünde kapalıdır).' });
+    const r = await cloudapi.onboardTicket();
+    if (!r.ok) return res.status(502).json({ success: false, message: r.error });
+    // Adres işletim sistemine veriliyor → yalnız bilinen sayfa ve güvenli karakterler.
+    if (!r.url.startsWith(ONBOARD_URL_PREFIX) || !/^[A-Za-z0-9._~:/?=%-]+$/.test(r.url)) {
+        return res.status(502).json({ success: false, message: 'Vega sunucusu beklenmeyen bir bağlama adresi döndürdü.' });
+    }
+    let opened = false;
+    try {
+        const opener = process.platform === 'win32' ? 'explorer.exe' : (process.platform === 'darwin' ? 'open' : 'xdg-open');
+        // explorer.exe adres açınca da 1 ile çıkar — sonucu yok say.
+        require('child_process').execFile(opener, [r.url], () => { });
+        opened = true;
+    } catch { /* adres arayüzde gösterilir, kullanıcı elle açar */ }
+    res.json({ success: true, url: r.url, opened, expiresIn: r.expiresIn });
+});
+
+app.get('/api/cloud/templates', async (req, res) => {
+    if (!credits.hasIdentity()) return res.status(400).json({ success: false, message: 'Şablonlar için lisans gerekli.' });
+    const r = await cloudapi.listTemplates();
+    if (!r.ok) return res.status(400).json({ success: false, message: r.error });
+    res.json({ success: true, templates: r.templates });
+});
+
+app.post('/api/cloud/templates', async (req, res) => {
+    if (!credits.hasIdentity()) return res.status(400).json({ success: false, message: 'Şablon oluşturmak için lisans gerekli.' });
+    const draft = cloudapi.buildTemplateDraft(req.body || {});
+    if (draft.error) return res.status(400).json({ success: false, message: draft.error });
+    const r = await cloudapi.createTemplate(draft.template);
+    if (!r.ok) return res.status(400).json({ success: false, message: r.error });
+    res.json({ success: true, id: r.id, status: r.status, category: r.category, variableCount: draft.variableCount });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1248,6 +1313,44 @@ app.get('/api/watcher/log', (req, res) => {
     res.json({ success: true, log: watcher.getLog(), status: watcher.getStatus() });
 });
 
+// Program Files altindaki entegrasyonlar icin salt durum ve kontrollu elle
+// tarama uclari. Lisans kapisi yukarida tum /api isteklerine uygulanir.
+app.get('/api/integrations', (req, res) => {
+    res.json({ success: true, data: integrations.status() });
+});
+
+app.post('/api/integrations/:id/run', async (req, res) => {
+    try {
+        const result = await integrations.runNow(String(req.params.id || ''));
+        res.json({ success: true, result });
+    } catch (e) {
+        res.status(400).json({ success: false, message: e.message });
+    }
+});
+
+// Üç otomatik gönderim kaynağındaki birikmiş mesajları tek işlemle temizle.
+// UI'da yalnız bir adet "Birikmiş mesajları temizle" düğmesi vardır.
+function pendingSummary() {
+    const bySource = {
+        watcher: watcher.getStatus().pendingCount || 0,
+        siparis: siparis.getStatus().pendingCount || 0,
+        vade: vade.getStatus().pendingCount || 0,
+    };
+    return { total: Object.values(bySource).reduce((sum, n) => sum + n, 0), bySource };
+}
+
+app.post('/api/pending/clear', (req, res) => {
+    try {
+        const bySource = {
+            watcher: watcher.clearPending(),
+            siparis: siparis.clearPending(),
+            vade: vade.clearPending(),
+        };
+        const cleared = Object.values(bySource).reduce((sum, n) => sum + n, 0);
+        res.json({ success: true, cleared, bySource, pending: pendingSummary() });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  SİPARİŞ BİLDİRİMİ (tek sabit numaraya iç bildirim)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1693,6 +1796,19 @@ app.post('/api/antiban/ack', (req, res) => {
         const targets = wantId ? list.filter((s) => s.id === wantId) : list.filter((s) => s.warnPending);
         const acked = (targets.length ? targets : list).map((s) => antiban.acknowledgeWarn(s.me));
         res.json({ success: true, acked: acked.length, results: acked });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+// Ban-şüphesi soğumasını ELLE kaldır (403/401 sticky dahil). Kullanıcı riski
+// bilerek göze alıyor demektir — kaldırmak flag'i SİLMEZ, sadece uygulamanın
+// kendi gönderim frenini açar. body.accountId boşsa hangi hesap belirsiz → 400.
+app.post('/api/antiban/clear-cooldown', (req, res) => {
+    try {
+        const accountId = req.body && req.body.accountId;
+        if (!accountId) return res.status(400).json({ success: false, message: 'accountId gerekli.' });
+        const account = accounts.list().find((a) => a.id === accountId);
+        if (!account) return res.status(404).json({ success: false, message: 'WhatsApp hesabı bulunamadı.' });
+        if (!account.me) return res.status(409).json({ success: false, message: 'Numara kimliği henüz bilinmiyor; önce WhatsApp bağlantısını kurun.' });
+        res.json({ success: true, result: antiban.clearCooldown(account.me, req.body && req.body.note) });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 // Susturulan numarayı elle yeniden aç (dönüş-budama). phone boşsa hepsini.
@@ -2443,15 +2559,16 @@ app.get('/api/wa/status', async (req, res) => {
         if (isRelay()) {
             await pollRelayStatus();
             const s = waStatusX();
-            return res.json({ success: true, ready: s.ready, initializing: false, hasQr: false, qrImage: null, me: s.me, error: s.error, antiban: null, relay: true, relayTarget: waCfg.relayTarget });
+            return res.json({ success: true, ready: s.ready, initializing: false, hasQr: false, qrImage: null, me: s.me, error: s.error, antiban: null, relay: true, relayTarget: waCfg.relayTarget, pending: pendingSummary() });
         }
         // Cloud modu: Baileys oturumu AÇILMAZ (numara Meta'da kayıtlı, QR yok).
         // Durum Meta'dan gelir; anti-ban rampası uygulanmadığı için snapshot yok.
         if (isCloud()) {
+            syncCloudInbox(); // lisans sonradan geldiyse yoklama burada başlar
             const s = await cloudapi.refreshStatus();
             return res.json({
                 success: true, ready: s.ready, initializing: false, hasQr: false, qrImage: null,
-                me: s.me, error: s.error, antiban: null, cloud: s.cloud || true,
+                me: s.me, error: s.error, antiban: null, cloud: s.cloud || true, pending: pendingSummary(),
             });
         }
         const s = waStatus();
@@ -2469,7 +2586,7 @@ app.get('/api/wa/status', async (req, res) => {
                 hasQr: a.hasQr, me: a.me, error: a.error, revoked: a.revoked, daySent: a.daySent,
                 qrImage: a.qr ? await QRCode.toDataURL(a.qr, { margin: 2, width: 240 }) : null,
                 // Hesap-başı anti-ban: ısınma günü, tavan doluluğu, soğuma.
-                antiban: a.ready && a.me ? antiban.snapshot(a.me, DEFAULT_PACING.dailyCap) : null,
+                antiban: a.me ? antiban.snapshot(a.me, DEFAULT_PACING.dailyCap) : null,
             });
         }
         const primary = accs.find((a) => a.ready) || accs.find((a) => a.hasQr) || accs[0] || null;
@@ -2481,7 +2598,7 @@ app.get('/api/wa/status', async (req, res) => {
             qrImage: primary ? primary.qrImage : null,
             me: st.me, error: st.error,
             antiban: (warn && warn.antiban) || (primary && primary.antiban) || null,
-            accounts: accs, readyCount: st.readyCount, total: st.total,
+            accounts: accs, readyCount: st.readyCount, total: st.total, pending: pendingSummary(),
         });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -2915,6 +3032,7 @@ function stopAutomation(sebep) {
     try { vade.stop(); } catch { /* yok say */ }
     try { reminders.stop(); } catch { /* yok say */ }
     try { activeCari.stop(); } catch { /* yok say */ }
+    try { integrations.stopAll(); } catch { /* yok say */ }
     console.warn(`[Lisans] Otomasyon durduruldu — ${sebep}`);
 }
 
@@ -2990,6 +3108,7 @@ watcher.configure({
     // Anti-ban kapısı mod/hesap duyarlı (çok numarada "herhangi bir hat gönderebilir mi").
     gate: (ch) => gateX(ch, null),
     recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
+    isDocumentClaimed: item => integrations.claimsWatcherDocument(item),
     baseDir,
     // {firmaadi} imzası: Firma Bilgileri (TBLFIRMA + kullanıcı override) adı.
     getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
@@ -3052,6 +3171,31 @@ reminders.configure({
 // Arctos'ta o an açık cariyi plan cache'ten tespit eden izleyici (yüzen buton için).
 activeCari.configure({ getPool: () => pool, sql });
 
+// Program Files\Vega WhatsApp\integrations altindaki eklentiler. Kod/dizayn
+// kurulum klasorunde, degisen durum ve loglar C:\ProgramData\Vega WhatsApp'ta.
+integrations.configure({
+    getPool: () => pool,
+    sql,
+    resolveCariContacts,
+    waSend: waSendX,
+    waDelete: waDeleteX,
+    waStatus: waStatusX,
+    checkOnWhatsApp: waCheckX,
+    gate: (ch) => gateX(ch, null),
+    getContext: () => {
+        const c = loadConfigFile();
+        let w = null;
+        try { w = watcher.getConfig(); } catch { /* ayar henuz yok */ }
+        const ui = (c && c.uiContext) || {};
+        return {
+            firmaNo: ui.firmaNo || (w && w.firmaNo) || null,
+            donemNo: ui.donemNo || (w && w.donemNo) || null,
+        };
+    },
+    baseDir,
+    electron: (() => { try { return require('electron'); } catch { return null; } })(),
+});
+
 // AI oto-yanıt botu: gelen WA mesajlarına Claude Haiku ile SEÇMELİ cevap.
 // Anahtar config.json'daki DB parolasıyla aynı makine anahtarıyla şifrelenir.
 aiBot.configure({
@@ -3096,6 +3240,26 @@ accounts.configure({
     onIncoming: aiBot.handleIncoming,
     dailyCap: DEFAULT_PACING.dailyCap,
 });
+// Cloud API ('vega' yolu) gelen kutusu: Vega sunucusundaki olayları çekip Baileys
+// gelen mesajıyla aynı yola sokar. 10 dk'dan eski mesaja AI cevap yazmaz (cloudinbox.js).
+cloudinbox.configure({
+    dataDir: path.join(baseDir, 'data'),
+    pull: (limit) => cloudapi.pullInbox(limit),
+    ack: (ids) => cloudapi.ackInbox(ids),
+    onMessage: async (m) => {
+        if (m.phone) { try { stats.onIncoming(m.phone); } catch { /* yok say */ } }
+        if (!m.forAi) return;
+        await aiBot.handleIncoming({ phone: m.phone, text: m.text, jid: `${m.phone}@s.whatsapp.net`, id: m.id, accountId: null });
+    },
+    onStatus: (s) => { if (s.code) { try { stats.onAck(s.id, s.code); } catch { /* yok say */ } } },
+    log: (msg) => { try { console.log('[Cloud gelen]', msg); } catch { /* yok say */ } },
+});
+// Yoklama yalnız cloud modu + 'vega' yolu + lisans varken. Mod kaydında ve durum
+// sorgusunda tekrar çağrılır (idempotent) — lisans sonradan gelirse de başlar.
+function syncCloudInbox() {
+    if (isCloud() && cloudapi.viaVega() && credits.hasIdentity() && license.isAllowed()) cloudinbox.start();
+    else cloudinbox.stop();
+}
 // Lisanssızken WhatsApp oturumu AÇILMAZ (eski davranış: WA yalnız lisanslı API
 // çağrısıyla başlıyordu). Lisans sonradan gelirse pollRemoteLicense başlatır,
 // arayüz açılışında /api/wa/status da tetikler.
@@ -3117,9 +3281,10 @@ if (isRelay()) {
 // önbellek taze kalmalı). Baileys AÇILMAZ — QR yok, oturum yok, cihaz fırtınası yok.
 if (isCloud()) {
     console.log('[Cloud] Resmî WhatsApp Cloud API modu — Baileys oturumu açılmayacak.');
-    console.log('[Cloud] NOT: gelen mesaj/teslim bildirimi webhook ister → AI oto-yanıt ve teslim/okundu sayacı bu modda çalışmaz.');
+    if (!cloudapi.viaVega()) console.log('[Cloud] NOT: doğrudan bağlantıda gelen mesaj/teslim bildirimi alınmaz (webhook yok) → AI oto-yanıt ve teslim/okundu sayacı çalışmaz.');
     cloudapi.refreshStatus(true).catch(() => { });
     setInterval(() => { cloudapi.refreshStatus(true).catch(() => { }); }, 60000).unref?.();
+    syncCloudInbox();
 }
 
 app.listen(PORT, async () => {

@@ -874,12 +874,29 @@
                 yazmadıysa serbest metin gönderilemez — Meta'da <b>onaylı şablon</b> zorunludur.
                 Bilgiler: <i>developers.facebook.com → Uygulamanız → WhatsApp → API Kurulumu</i>.
             </div>
+            <div class="field">
+                <label>Bağlantı</label>
+                <select id="set_cloudVia">
+                    <option value="vega">Vega sunucusu üzerinden — anahtar gerekmez, numaranız tedarikçinizce tanımlanır (önerilen)</option>
+                    <option value="direct">Doğrudan — kendi Meta erişim anahtarımla</option>
+                </select>
+            </div>
             <div class="row">
                 <div class="field"><label>Telefon Numarası Kimliği (Phone Number ID)</label><input id="set_cloudPhoneId" placeholder="1234567890123456" /></div>
-                <div class="field" style="flex:.55"><label>API sürümü</label><input id="set_cloudApiVersion" placeholder="v21.0" /></div>
+                <div class="field" id="set_cloudApiVerWrap" style="flex:.55"><label>API sürümü</label><input id="set_cloudApiVersion" placeholder="v21.0" /></div>
             </div>
-            <div class="field"><label>Erişim anahtarı (Access Token)</label><input id="set_cloudToken" type="password" placeholder="(değişmeyecekse boş bırak)" /></div>
-            <div class="hint">Geçici (24 saatlik) test anahtarı yerine <b>System User</b> kalıcı anahtarı kullanın; aksi halde her gün gönderim durur.</div>
+            <div class="hint" id="set_cloudViaHint">Vega sunucusu yolunda numara kimliği <b>boş bırakılabilir</b> — lisansınıza bağlı ilk numara kullanılır. Kimlik doğrulaması lisansınızla yapılır, bu bilgisayarda Meta anahtarı tutulmaz.</div>
+            <div id="set_cloudVegaTools">
+                <div class="row" style="margin-top:6px">
+                    <button class="btn ghost sm" id="set_cloudOnboard" style="flex:1">Meta ile numara bağla</button>
+                </div>
+                <div class="hint">Tarayıcıda Facebook girişiyle işletmenizi, WhatsApp hesabınızı ve numaranızı seçersiniz; numara bu lisansa bağlanır. Numara Meta'da başka hesaba taşındıysa da buradan yeniden bağlayın.</div>
+                <div class="hint" id="set_cloudOnboardResult" style="display:none"></div>
+            </div>
+            <div id="set_cloudDirect">
+                <div class="field"><label>Erişim anahtarı (Access Token)</label><input id="set_cloudToken" type="password" placeholder="(değişmeyecekse boş bırak)" /></div>
+                <div class="hint">Geçici (24 saatlik) test anahtarı yerine <b>System User</b> kalıcı anahtarı kullanın; aksi halde her gün gönderim durur.</div>
+            </div>
             <div class="row">
                 <div class="field"><label>Şablon adı</label><input id="set_cloudTplName" placeholder="hesap_bakiye_bildirimi" /></div>
                 <div class="field" style="flex:.4"><label>Dil</label><input id="set_cloudTplLang" placeholder="tr" /></div>
@@ -895,11 +912,35 @@
             </div>
             <label class="check"><input type="checkbox" id="set_cloudTplDoc" /> Şablonun başlığı belge (PDF) — ekstre eki şablon başlığına konsun</label>
             <div class="hint">Mesaj metnimiz çok satırlı olduğu için şablona konurken tek satıra indirilir (satır sonları " · " olur) — şablonun gövdesi <code>{{1}}</code> içermelidir.</div>
+            <details class="adv" id="set_cloudTplTools" style="margin-top:8px">
+                <summary>Şablonlar — listele / yeni şablon oluştur</summary>
+                <div class="row" style="margin-top:8px">
+                    <button class="btn ghost sm" id="set_tplRefresh" style="flex:1">Şablonları getir</button>
+                </div>
+                <div id="set_tplList"></div>
+                <div class="muted" style="font-weight:600; margin:12px 0 6px">Yeni şablon</div>
+                <div class="row">
+                    <div class="field"><label>Ad</label><input id="set_tplNewName" placeholder="hesap_bakiye_bildirimi" /></div>
+                    <div class="field" style="flex:.6">
+                        <label>Kategori</label>
+                        <select id="set_tplNewCat">
+                            <option value="UTILITY">Hizmet (UTILITY)</option>
+                            <option value="MARKETING">Pazarlama (MARKETING)</option>
+                        </select>
+                    </div>
+                    <div class="field" style="flex:.3"><label>Dil</label><input id="set_tplNewLang" placeholder="tr" /></div>
+                </div>
+                <div class="field"><label>Metin</label><textarea id="set_tplNewBody" placeholder="Sayın müşterimiz, hesap bilgilendirmeniz: {{1}} İyi çalışmalar dileriz."></textarea></div>
+                <div class="field"><label>Örnek değerler (her {{n}} için bir tane, | ile ayırın)</label><input id="set_tplNewEx" placeholder="güncel bakiyeniz 1.250,00 TL" /></div>
+                <div class="hint">Metin değişkenle (<code>{{1}}</code>) başlayıp bitemez. Bakiye/ekstre bildirimi <b>Hizmet</b> kategorisidir. Belge (PDF) başlıklı şablonu Meta panelinden oluşturun.</div>
+                <div class="row"><button class="btn green sm" id="set_tplCreate" style="flex:1">Şablonu Meta onayına gönder</button></div>
+                <div class="hint" id="set_tplResult" style="display:none"></div>
+            </details>
             <div class="row" style="margin-top:6px">
                 <div class="field"><label>Test numarası (isteğe bağlı)</label><input id="set_cloudTestPhone" placeholder="5xx xxx xx xx — boşsa yalnız kimlik doğrulanır" /></div>
                 <div class="field" style="flex:.5; display:flex; align-items:flex-end"><button class="btn ghost sm" id="set_cloudTest" style="width:100%">Cloud API'yi Sına</button></div>
             </div>
-            <div class="hint" style="margin-top:6px">⚠ Bu modda <b>gelen mesaj alınamaz</b> (webhook gerekir): AI Oto-Yanıt çalışmaz, Pano'da teslim/okundu sayacı boş kalır, gönderilen mesaj <b>geri çekilemez</b>.</div>
+            <div class="hint" id="set_cloudLimitsHint" style="margin-top:6px"></div>
         </div>
         <div class="row">
             <button class="btn green sm" id="set_saveWa" style="flex:1">WhatsApp Modunu Kaydet</button>
@@ -954,6 +995,7 @@
         </div>
         <div class="actions">
             <button class="btn ghost" id="waAdd">+ Numara Ekle</button>
+            <button class="btn danger hidden" id="waClearPending">Birikmiş mesajları temizle</button>
             <button class="btn" id="waClose">Kapat</button>
         </div>
     </div>

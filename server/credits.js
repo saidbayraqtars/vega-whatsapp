@@ -293,5 +293,7 @@ module.exports = {
     configure, getConfig, setConfig, getStatus,
     refresh, chat, commit, release, test,
     likelyOutOfCredit, hasIdentity,
+    // cloudapi.js 'vega' yolu aynı sunucuya aynı lisans kimliğiyle konuşur.
+    endpoint, authHeaders,
     BUILTIN_ENDPOINT,
 };

@@ -384,6 +384,13 @@ $('warnStop').onclick = () => {
 
 function renderWaModal(r) {
     const c = $('waContent');
+    const pendingCount = Math.max(0, Number(r.pending && r.pending.total) || 0);
+    const clearPendingBtn = $('waClearPending');
+    clearPendingBtn.dataset.count = String(pendingCount);
+    clearPendingBtn.textContent = pendingCount
+        ? `Birikmiş mesajları temizle (${pendingCount})`
+        : 'Birikmiş mesajları temizle';
+    clearPendingBtn.classList.toggle('hidden', pendingCount === 0);
     // Numara ekleme/havuz açıklaması yalnız Yerel modda anlamlı (relay/cloud'da QR yok).
     $('waPoolHint').style.display = 'none';
     $('waAdd').style.display = 'none';
@@ -395,14 +402,24 @@ function renderWaModal(r) {
         return;
     }
     if (r.cloud) {
-        // Cloud API modu: Baileys yok, QR yok. Durum Meta'dan gelir.
+        // Cloud API modu: Baileys yok, QR yok. Durum Meta'dan gelir; gelen mesajlar
+        // ('vega' yolunda) Vega sunucusundan çekilip altta listelenir.
         const info = (r.cloud && typeof r.cloud === 'object') ? r.cloud : null;
-        c.innerHTML = r.ready
+        const head = r.ready
             ? `<p style="color:var(--primary); font-weight:600">✓ Cloud API bağlı (resmî kanal)</p>
                <p class="muted">${esc((info && info.displayPhone) || r.me || '')}${info && info.name ? ' · ' + esc(info.name) : ''}</p>
-               <p class="muted" style="margin-top:8px">${info && info.quality ? 'Kalite: ' + esc(info.quality) + ' · ' : ''}${info && info.tier ? 'Kademe: ' + esc(info.tier) : ''}</p>
-               <p class="muted" style="margin-top:8px">QR yok — numara Meta'da kayıtlı. Gelen mesaj ve teslim bildirimi bu modda alınmaz.</p>`
+               <p class="muted" style="margin-top:8px">${info && info.quality ? 'Kalite: ' + esc(info.quality) + ' · ' : ''}${info && info.tier ? 'Kademe: ' + esc(info.tier) : ''}</p>`
             : `<p class="nophone">${esc(r.error || 'Cloud API hazır değil')}</p><p class="muted" style="margin-top:8px">Ayarlar → WhatsApp Gönderim Modu → Cloud API alanlarını kontrol edin.</p>`;
+        // 4 sn'lik yoklamada yalnız başlık değişince yeniden çiz — liste kaydırması bozulmasın.
+        if (c.dataset.cloudHead !== head || !$('cloudInboxList')) {
+            c.innerHTML = `${head}
+                <div class="cloudInbox">
+                    <div class="cloudInboxTitle">Gelen mesajlar <span class="muted" id="cloudInboxState"></span></div>
+                    <div id="cloudInboxList" class="cloudInboxList"><div class="muted" style="padding:8px">Yükleniyor...</div></div>
+                </div>`;
+            c.dataset.cloudHead = head;
+        }
+        refreshCloudInbox();
         return;
     }
     // ─── Yerel mod: her numara için ayrı kart (QR'lar AYNI ANDA görünür) ───
@@ -417,6 +434,31 @@ function renderWaModal(r) {
         return;
     }
     c.innerHTML = `<div class="waCards">${accs.map(renderWaCard).join('')}</div>`;
+}
+
+// Cloud API gelen kutusu (Vega sunucusundan çekilen son mesajlar). Liste yalnız
+// içerik değişince yeniden çizilir; durum satırı her seferinde tazelenir.
+let cloudInboxBusy = false;
+async function refreshCloudInbox() {
+    if (cloudInboxBusy) return;
+    cloudInboxBusy = true;
+    try {
+        const r = await api('/cloud/inbox');
+        const list = $('cloudInboxList'), st = $('cloudInboxState');
+        if (!list || !st || !r || !r.success) return;
+        st.textContent = !r.active
+            ? '· yalnız "Vega sunucusu üzerinden" bağlantıda alınır'
+            : r.lastError ? `· ⚠ yoklanamadı: ${r.lastError}`
+                : r.lastPollAt ? `· son yoklama ${new Date(r.lastPollAt).toLocaleTimeString('tr-TR')}` : '· yoklama başlıyor';
+        const html = (r.messages || []).slice(0, 50).map((m) => `
+            <div class="logline">
+                <span><b>${esc(m.name || m.phone || '?')}</b> <span class="muted">${esc(m.name ? (m.phone || '') : '')}</span><br>${esc(m.text || '')}</span>
+                <span class="muted" style="white-space:nowrap; font-size:12px; text-align:right">${esc(new Date(m.at).toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }))}${m.ai ? `<br>${esc(m.ai)}` : ''}</span>
+            </div>`).join('') || '<div class="muted" style="padding:8px">Henüz gelen mesaj yok.</div>';
+        if (list.dataset.html !== html) { list.innerHTML = html; list.dataset.html = html; }
+    } catch { /* yok say */ } finally {
+        cloudInboxBusy = false;
+    }
 }
 
 // Electron'da window.prompt() YOKTUR — çağrılırsa hata atar ve düğme sessizce
@@ -448,15 +490,14 @@ function askText(title, label, defVal) {
 // Tek hesap kartı: ad, durum, QR (bağlı değilse), gönderim sayacı, düğmeler.
 function renderWaCard(a) {
     const phone = a.me ? String(a.me).split(':')[0].split('@')[0] : '';
+    const ab = a.antiban || null;
     let body, state, stateCls;
     if (a.ready) {
         state = '✓ Bağlı'; stateCls = 'ok';
-        const ab = a.antiban || null;
         const cap = ab && ab.dailyCap != null ? ` / ${ab.dailyCap}` : '';
         const sent = ab && ab.daySent != null ? ab.daySent : (a.daySent || 0);
         body = `<p class="waMe">${esc(phone)}</p>
-                <p class="muted" style="font-size:12px">Bugün: <b>${sent}</b>${cap} mesaj${ab && ab.warmup ? ` · ısınma günü ${ab.dayIndex + 1}` : ''}</p>
-                ${ab && ab.cooldownUntil ? `<p class="waState bad">⏸ Soğuma: ${esc(ab.cooldownReason || 'ban şüphesi')}</p>` : ''}`;
+                <p class="muted" style="font-size:12px">Bugün: <b>${sent}</b>${cap} mesaj${ab && ab.warmup ? ` · ısınma günü ${ab.dayIndex + 1}` : ''}</p>`;
     } else if (a.qrImage) {
         state = 'QR bekliyor'; stateCls = '';
         body = `<img src="${a.qrImage}" alt="QR" />
@@ -468,10 +509,15 @@ function renderWaCard(a) {
         state = 'Bağlanıyor...'; stateCls = '';
         body = `<p class="muted" style="font-size:12.5px">QR hazırlanıyor</p>`;
     }
+    const cooldown = ab && ab.cooldownUntil
+        ? `<p class="waState bad">⏸ Soğuma: ${esc(ab.cooldownReason || 'ban şüphesi')}</p>
+           <button class="btn ghost sm" data-wa="clearCooldown" data-id="${esc(a.id)}" style="margin-top:4px">Ban uyarısını kaldır (riski kabul et)</button>`
+        : '';
     return `<div class="waCard ${a.ready ? 'on' : ''}">
         <div class="waName"><span class="dot ${a.ready ? 'on' : 'wait'}"></span>${esc(a.label || a.id)}</div>
         <div class="waState ${stateCls}">${esc(state)}</div>
         ${body}
+        ${cooldown}
         <div class="waActs">
             <button class="btn ghost sm" data-wa="rename" data-id="${esc(a.id)}">Ad</button>
             <button class="btn ghost sm" data-wa="refresh" data-id="${esc(a.id)}">Sıfırla</button>
@@ -491,7 +537,38 @@ $('waContent').addEventListener('click', (e) => {
     if (btn.dataset.wa === 'rename') waRenameAcc(id);
     else if (btn.dataset.wa === 'refresh') waRefreshAcc(id);
     else if (btn.dataset.wa === 'remove') waRemoveAcc(id, label);
+    else if (btn.dataset.wa === 'clearCooldown') waClearCooldown(id, label);
 });
+
+// Ban-şüphesi soğumasını elle kaldır. WhatsApp numarayı flaglemişse mesajlar yine
+// reddedilebilir ya da hesap tamamen kapanabilir; onay metni bunu açıkça belirtir.
+async function waClearCooldown(id, label) {
+    if (!confirm(`"${label}" numarasında ban koruması ELLE kaldırılacak.\n\nWhatsApp bu numarayı gerçekten flaglemiş olabilir — devam edilirse hesap tamamen kapanabilir. Bu riski kabul ediyor musunuz?`)) return;
+    try {
+        const r = await api('/antiban/clear-cooldown', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountId: id }) });
+        if (!r.success) alert(r.message || 'Kaldırılamadı.');
+    } catch (e) { alert('Hata: ' + e.message); }
+    setTimeout(pollWa, 400);
+}
+
+// Üç otomatik gönderim kaynağındaki eski kuyrukları tek kullanıcı işlemiyle boşalt.
+$('waClearPending').onclick = async () => {
+    const btn = $('waClearPending');
+    const count = Math.max(0, Number(btn.dataset.count) || 0);
+    if (!count) return;
+    if (!confirm(`${count} adet geçmişte gönderilemeyen mesaj kalıcı olarak silinecek.\n\nBu işlem geri alınamaz. Devam edilsin mi?`)) return;
+    btn.disabled = true;
+    try {
+        const r = await api('/pending/clear', { method: 'POST' });
+        if (!r.success) alert(r.message || 'Birikmiş mesajlar temizlenemedi.');
+        else alert(`${r.cleared || 0} birikmiş mesaj temizlendi.`);
+        await Promise.allSettled([pollWa(), refreshWatcherLog(), refreshSiparisLog(), refreshVadeLog()]);
+    } catch (e) {
+        alert('Hata: ' + e.message);
+    } finally {
+        btn.disabled = false;
+    }
+};
 
 // Oturumu sıfırla: o numaranın auth'u silinir, yeni QR çıkar. Diğer numaralar etkilenmez.
 async function waRefreshAcc(id) {
@@ -579,6 +656,7 @@ async function openSettings() {
             $('set_relayToken').value = '';
             $('set_relayToken').placeholder = w.hasToken ? '(kayıtlı — değişmeyecekse boş bırak)' : 'ortak gizli parola';
             const c = w.cloud || {};
+            $('set_cloudVia').value = c.via || 'vega';
             $('set_cloudPhoneId').value = c.phoneNumberId || '';
             $('set_cloudApiVersion').value = c.apiVersion || 'v21.0';
             $('set_cloudToken').value = '';
@@ -614,12 +692,25 @@ function toggleRelayFields() {
     if (rel) rel.style.display = (mode === 'relay') ? '' : 'none';
     const cl = $('set_cloudFields');
     if (cl) cl.style.display = (mode === 'cloud') ? '' : 'none';
+    // Vega sunucusu yolunda anahtar/API sürümü alanları anlamsız → gizle.
+    const direct = $('set_cloudVia').value === 'direct';
+    $('set_cloudDirect').style.display = direct ? '' : 'none';
+    $('set_cloudApiVerWrap').style.display = direct ? '' : 'none';
+    $('set_cloudViaHint').style.display = direct ? 'none' : '';
+    // Numara bağlama, şablon araçları ve gelen mesaj yalnız Vega sunucusu yolunda.
+    $('set_cloudVegaTools').style.display = direct ? 'none' : '';
+    $('set_cloudTplTools').style.display = direct ? 'none' : '';
+    $('set_cloudLimitsHint').innerHTML = direct
+        ? '⚠ Doğrudan bağlantıda <b>gelen mesaj alınamaz</b> (webhook bu bilgisayara ulaşamaz): AI Oto-Yanıt çalışmaz, Pano\'da teslim/okundu sayacı boş kalır, gönderilen mesaj <b>geri çekilemez</b>.'
+        : 'Gelen mesajlar Vega sunucusundan <b>15 sn\'de bir</b> çekilir: AI Oto-Yanıt ve Pano teslim/okundu sayacı çalışır. <b>10 dakikadan eski</b> mesaja AI cevap yazmaz, yalnız listelenir. Gönderilen mesaj <b>geri çekilemez</b>.';
 }
 $('set_waMode').onchange = toggleRelayFields;
+$('set_cloudVia').onchange = toggleRelayFields;
 
 // Cloud API ayar alanlarını istek gövdesine çevir (kaydet + sına ortak kullanır).
 function cloudBody() {
     return {
+        cloudVia: $('set_cloudVia').value,
         cloudPhoneNumberId: $('set_cloudPhoneId').value.trim(),
         cloudApiVersion: $('set_cloudApiVersion').value.trim(),
         cloudToken: $('set_cloudToken').value,
@@ -640,6 +731,91 @@ $('set_cloudTest').onclick = async () => {
         const r = await api('/settings/wa/cloud-test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         box.className = r.success ? 'hint ok' : 'err';
         box.textContent = r.message || (r.success ? 'Tamam.' : 'Başarısız.');
+    } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
+};
+
+// ─── Cloud API: Meta ile numara bağla (Embedded Signup) ─────────────────────
+// Bilet Vega sunucusundan alınır, bağlama sayfası varsayılan tarayıcıda açılır.
+// Facebook girişi tarayıcıda olur; Meta anahtarı bu bilgisayara hiç gelmez.
+$('set_cloudOnboard').onclick = async () => {
+    const box = $('set_cloudOnboardResult');
+    box.style.display = ''; box.className = 'hint'; box.textContent = 'Bağlama sayfası hazırlanıyor...';
+    try {
+        const r = await api('/cloud/onboard', { method: 'POST' });
+        if (!r.success) { box.className = 'err'; box.textContent = r.message || 'Bağlama başlatılamadı.'; return; }
+        box.className = 'hint';
+        box.innerHTML = `${r.opened ? '✓ Bağlama sayfası tarayıcıda açıldı.' : 'Tarayıcı kendiliğinden açılamadı.'}
+            Açılmadıysa adresi kopyalayıp tarayıcıya yapıştırın (30 dk geçerli):
+            <input readonly value="${esc(r.url)}" style="width:100%; margin:6px 0" />
+            Meta penceresinde işletmenizi, WhatsApp hesabınızı ve numaranızı seçin; bitince <b>Cloud API'yi Sına</b> ile doğrulayın.`;
+        const inp = box.querySelector('input');
+        inp.onclick = () => inp.select();
+    } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
+};
+
+// ─── Cloud API: şablonlar (Meta onayı) ───────────────────────────────────────
+const TPL_STATUS = { APPROVED: 'Onaylı', PENDING: 'Onay bekliyor', REJECTED: 'Reddedildi', PAUSED: 'Duraklatıldı', DISABLED: 'Devre dışı', IN_APPEAL: 'İtirazda', PENDING_DELETION: 'Siliniyor' };
+let cloudTemplates = [];
+const tplVarCount = (body) => new Set(String(body || '').match(/\{\{\s*\d+\s*\}\}/g) || []).size;
+
+async function loadCloudTemplates() {
+    const box = $('set_tplList');
+    box.innerHTML = '<div class="muted" style="padding:6px 0">Yükleniyor...</div>';
+    try {
+        const r = await api('/cloud/templates');
+        if (!r.success) { box.innerHTML = `<div class="err">${esc(r.message || 'Şablonlar alınamadı.')}</div>`; return; }
+        cloudTemplates = r.templates || [];
+        if (!cloudTemplates.length) { box.innerHTML = '<div class="muted" style="padding:6px 0">Bu hesapta henüz şablon yok.</div>'; return; }
+        box.innerHTML = cloudTemplates.map((t, i) => `
+            <div class="logline">
+                <span><b>${esc(t.name)}</b> <span class="muted">${esc(t.language)} · ${esc(t.category)}${t.header ? ' · başlık: ' + esc(t.header) : ''}</span>
+                    <br><span class="muted" style="font-size:12px">${esc(t.body)}</span>
+                    ${t.rejected ? `<br><span class="err" style="font-size:12px">Red sebebi: ${esc(t.rejected)}</span>` : ''}</span>
+                <span style="white-space:nowrap; text-align:right">
+                    <span class="st" style="color:${t.status === 'APPROVED' ? 'var(--primary)' : 'inherit'}">${esc(TPL_STATUS[t.status] || t.status)}</span>
+                    ${t.status === 'APPROVED' ? `<br><button class="btn ghost sm" data-tpl-use="${i}" style="margin-top:4px">Kullan</button>` : ''}
+                </span>
+            </div>`).join('');
+    } catch (e) { box.innerHTML = `<div class="err">Hata: ${esc(e.message)}</div>`; }
+}
+$('set_tplRefresh').onclick = loadCloudTemplates;
+
+// "Kullan": şablon adını/dilini/değişken sayısını gönderim ayarına yaz (kaydetmek kullanıcıda).
+$('set_tplList').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-tpl-use]');
+    if (!btn) return;
+    const t = cloudTemplates[Number(btn.dataset.tplUse)];
+    if (!t) return;
+    $('set_cloudTplName').value = t.name;
+    $('set_cloudTplLang').value = t.language;
+    $('set_cloudTplParams').value = tplVarCount(t.body);
+    $('set_cloudTplDoc').checked = t.header === 'DOCUMENT';
+    const box = $('set_waResult');
+    box.style.display = ''; box.className = 'hint';
+    box.textContent = `"${t.name}" şablonu seçildi — "WhatsApp Modunu Kaydet" ile kaydedin.`;
+});
+
+$('set_tplCreate').onclick = async () => {
+    const box = $('set_tplResult');
+    box.style.display = ''; box.className = 'hint'; box.textContent = 'Meta\'ya gönderiliyor...';
+    const category = $('set_tplNewCat').value;
+    try {
+        const r = await api('/cloud/templates', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                name: $('set_tplNewName').value.trim(),
+                category,
+                language: $('set_tplNewLang').value.trim() || 'tr',
+                body: $('set_tplNewBody').value,
+                examples: $('set_tplNewEx').value.split('|').map((s) => s.trim()).filter(Boolean),
+            }),
+        });
+        if (!r.success) { box.className = 'err'; box.textContent = r.message || 'Şablon gönderilemedi.'; return; }
+        box.className = 'hint ok';
+        box.textContent = `✓ Şablon Meta onayına gönderildi (durum: ${TPL_STATUS[r.status] || r.status || 'bilinmiyor'}).` +
+            (r.category && r.category !== category ? ` Meta kategoriyi ${r.category} olarak değiştirdi.` : '') +
+            ' Onay genelde dakikalar ile birkaç saat arası sürer; "Şablonları getir" ile izleyin.';
+        loadCloudTemplates();
     } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
 };
 
@@ -1429,7 +1605,7 @@ async function refreshWatcherLog() {
         const box = $('wc_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz otomatik gönderim yok.</div>'; return; }
         wcLogEntries = r.log;
-        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', noSmsConsent: 'SMS izni yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta', pasif: 'Cari pasif', wrongType: 'Tip dışı', alacakli: 'Alacaklı (atlandı)', dropped: 'Düşürüldü', edited: 'Güncellendi', recalled: 'Geri çekildi', recallExpired: 'Geri çekilemedi (2 gün)', info: 'Bilgi' };
+        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', noSmsConsent: 'SMS izni yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta', pasif: 'Cari pasif', wrongType: 'Tip dışı', alacakli: 'Alacaklı (atlandı)', dropped: 'Düşürüldü', edited: 'Güncellendi', recalled: 'Geri çekildi', recallExpired: 'Geri çekilemedi (2 gün)', cleared: 'Temizlendi', info: 'Bilgi' };
         box.innerHTML = r.log.map((e, i) => `
             <div class="logline">
                 <span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
@@ -1583,7 +1759,7 @@ async function refreshSiparisLog() {
         const box = $('sp_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz sipariş bildirimi yok.</div>'; return; }
         spLogEntries = r.log;
-        const labels = { sent: 'Gönderildi', cancelled: 'İptal bildirildi', queued: 'Kuyrukta', failed: 'Başarısız', noPhone: 'Numara yok', skipped: 'Atlandı' };
+        const labels = { sent: 'Gönderildi', cancelled: 'İptal bildirildi', queued: 'Kuyrukta', failed: 'Başarısız', noPhone: 'Numara yok', skipped: 'Atlandı', cleared: 'Temizlendi' };
         box.innerHTML = r.log.map((e, i) => `
             <div class="logline">
                 <span>${esc(e.firma || '')}
@@ -1780,7 +1956,7 @@ async function refreshVadeLog() {
         const box = $('vd_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz vade bildirimi yok.</div>'; return; }
         vdLogEntries = r.log;
-        const labels = { sent: 'Gönderildi', queued: 'Kuyrukta', failed: 'Başarısız', noPhone: 'Numara yok', skipped: 'Atlandı' };
+        const labels = { sent: 'Gönderildi', queued: 'Kuyrukta', failed: 'Başarısız', noPhone: 'Numara yok', skipped: 'Atlandı', cleared: 'Temizlendi' };
         box.innerHTML = r.log.map((e, i) => `
             <div class="logline">
                 <span>${esc(e.firma || '')}

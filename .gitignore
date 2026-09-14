@@ -17,3 +17,6 @@ VegaWhatsApp.exe
 *.log
 server/_x/
 _dbcheck.js
+
+# AI devir notlari (sunucu/erisim bilgisi icerir)
+AI-DEVIR-NOTLARI.md

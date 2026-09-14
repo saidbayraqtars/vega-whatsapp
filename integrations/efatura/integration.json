@@ -1,0 +1,19 @@
+{
+  "id": "efatura",
+  "name": "Vega e-Fatura / e-Arsiv PDF",
+  "version": "1.1.1",
+  "entry": "index.js",
+  "enabled": true,
+  "dataDir": "efatura",
+  "settings": {
+    "pollSeconds": 30,
+    "batchLimit": 5,
+    "changeWindowDays": 7,
+    "consoleDir": "auto",
+    "taskName": "Vega WhatsApp e-Fatura Export",
+    "invoiceVkn": "",
+    "caption": "Sayin {unvan}, {tarih} tarihli {belgeno} numarali {belgeturu} belgeniz ektedir. Tutar: {tutar} {parabirimi}. Iyi calismalar dileriz.",
+    "updatedCaption": "Sayin {unvan}, {tarih} tarihli {belgeno} numarali {belgeturu} belgeniz guncellenmistir. Guncel PDF ektedir. Yeni tutar: {tutar} {parabirimi}.",
+    "cancelledCaption": "Sayin {unvan}, {tarih} tarihli {belgeno} numarali {belgeturu} belgeniz iptal edilmistir. Onceki PDF'i dikkate almayiniz."
+  }
+}

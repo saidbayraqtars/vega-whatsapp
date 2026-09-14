@@ -372,6 +372,16 @@ function savePending() {
     catch (e) { console.error('[Watcher] kuyruk yazılamadı:', e.message); }
 }
 
+// Kuyruğu elle boşalt: ban-şüpheli soğuma sonrası biriken eski bildirimleri toptan
+// atmak için (soğuma kalkınca hepsi birden gitmesin diye). Geri alınamaz.
+function clearPending() {
+    const n = pending.length;
+    if (n) pushLog({ status: 'cleared', error: `Kuyruk elle temizlendi (${n} bekleyen bildirim silindi)` });
+    pending = [];
+    savePending();
+    return n;
+}
+
 function loadLog() {
     try { if (fs.existsSync(LOG_PATH)) { const l = JSON.parse(fs.readFileSync(LOG_PATH, 'utf8')); if (Array.isArray(l)) log = l; } }
     catch (e) { console.error('[Watcher] günlük okunamadı:', e.message); }
@@ -506,6 +516,14 @@ async function processPending() {
     }
 
     for (const item of [...pending]) {
+        // Kullanıcı işlem sürerken kuyruğu temizlediyse snapshot'taki eski öğeyi
+        // göndermeye devam etme.
+        if (!pending.includes(item)) continue;
+        if (typeof deps.isDocumentClaimed === 'function' && deps.isDocumentClaimed(item)) {
+            pending = pending.filter(p => p !== item); savePending();
+            pushLog({ ...pendingBase(item), status: 'dropped', error: 'Belge PDF entegrasyonu tarafindan gonderilecek' });
+            continue;
+        }
         if (!deps.waStatus().ready) break;
         // Gece penceresi: gönderim saati dışında kuyrukta beklesin (gece mesaj atma).
         if (antiban.inQuietHours()) break;
@@ -528,6 +546,7 @@ async function processPending() {
         const media = loadMediaFromDescriptor(item.media);
         if (config.verifyOnWhatsApp) {
             const chk = await deps.checkOnWhatsApp(item.phone);
+            if (!pending.includes(item)) continue;
             if (!chk.exists) {
                 if (chk.transient) { item.lastError = chk.error || 'Doğrulama yapılamadı'; savePending(); continue; }
                 item.noWaCount = (item.noWaCount || 0) + 1;
@@ -1040,6 +1059,13 @@ async function pollOnce() {
         const bizFirma = await getBizFirma(); // {firmaadi} imzası (Firma Bilgileri)
 
         for (const { row, rule, amount } of matched) {
+            if (typeof deps.isDocumentClaimed === 'function' && deps.isDocumentClaimed({
+                docType: rule.docType, evrak: row.EVRAKNO || '', firmaNo: config.firmaNo, donemNo: config.donemNo,
+            })) {
+                skipped++;
+                pushLog({ ind: row.IND, cariInd: row.FIRMANO, name: String(row.FIRMANO), evrak: row.EVRAKNO || '', ruleName: rule.name, status: 'info', error: '16 haneli satis faturasi PDF entegrasyonu tarafindan gonderilecek' });
+                continue;
+            }
             // INSERT-guard: bu belge zaten bildirilmişse (sil+ekle ile gelen düzenleme)
             // yeni mesaj ATMA — düzenleme/silme taraması tutar farkını/kaybı yakalar.
             // Kimlik cari+tarih içerir: EVRAKNO tek başına tekil değil (bkz. docKeyOf).
@@ -1219,5 +1245,5 @@ function resetWatermark() {
 module.exports = {
     configure, autoStart, start, stop,
     getConfig, setConfig, getStatus, getLog, resetWatermark, pollOnce,
-    setRuleMedia, clearRuleMedia,
+    setRuleMedia, clearRuleMedia, clearPending,
 };

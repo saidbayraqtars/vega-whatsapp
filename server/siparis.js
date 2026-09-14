@@ -145,6 +145,15 @@ const saveState = () => writeJson(STATE_PATH, state);
 const saveSent = () => writeJson(SENT_PATH, sentDocs);
 const savePending = () => writeJson(path.join(path.dirname(CONFIG_PATH), 'siparis-pending.json'), pending);
 
+// Kuyruğu elle boşalt (ban-şüpheli soğuma sonrası biriken eski bildirimleri toptan atmak için).
+function clearPending() {
+    const n = pending.length;
+    if (n) pushLog({ status: 'cleared', error: `Kuyruk elle temizlendi (${n} bekleyen bildirim silindi)` });
+    pending = [];
+    savePending();
+    return n;
+}
+
 function pushLog(entry) {
     log.unshift({ ...entry, at: new Date().toISOString() });
     if (log.length > 200) log.length = 200;
@@ -262,6 +271,7 @@ async function processPending() {
     if (cooldownReason()) return 0;
     let sent = 0;
     for (const item of [...pending]) {
+        if (!pending.includes(item)) continue;
         if (!deps.waStatus().ready) break;
         const res = await deps.waSend(item.phone, item.text, null, {
             simulateTyping: config.simulateTyping, typingMs: rand(900, 1800), channel: 'siparis',
@@ -602,4 +612,5 @@ async function sendTest() {
 module.exports = {
     configure, autoStart, start, stop,
     getConfig, setConfig, getStatus, getLog, resetWatermark, pollOnce, sendTest,
+    clearPending,
 };

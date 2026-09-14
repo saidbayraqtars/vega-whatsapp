@@ -383,6 +383,24 @@ function noteOpen(accountId) {
     return null;
 }
 
+// Kullanıcı ELLE soğumayı kaldırır (403/401 sticky dahil). Müşteri riski bilerek
+// göze alıp devam etmek isteyince kullanılır — bu bir güvenlik açığı DEĞİL, kasıtlı
+// manuel override: buton arkasında açık onay ister (bkz. app.js). Numara gerçekten
+// flaglenmişse mesajlar yine gitmeyebilir/hesap kapanabilir; bunu kaldırmak riski
+// SİLMEZ, yalnız uygulamanın kendi frenini açar.
+function clearCooldown(accountId, note) {
+    if (!STATE_PATH) return null;
+    const { acc } = touch(resolveAccount(accountId));
+    const had = acc.cooldownUntil ? { reason: acc.cooldownReason, sticky: acc.cooldownSticky } : null;
+    delete acc.cooldownUntil;
+    delete acc.cooldownReason;
+    delete acc.cooldownSticky;
+    acc.overrideNote = note || 'kullanıcı elle kaldırdı (risk kabul edildi)';
+    acc.overrideAt = Date.now();
+    save();
+    return { cleared: had };
+}
+
 // ─── Gönderim saati + günü penceresi (gece/haftasonu gönderme koruması) ───────
 // Otomatik gönderimler (hatırlatma + belge watcher) yalnız SEÇİLİ GÜNLERDE ve
 // [start,end] saatleri arasında yapılır; dışında sırada bekler. Manuel gönderim
@@ -483,4 +501,4 @@ function snapshot(accountId, userDailyCap) {
     };
 }
 
-module.exports = { configure, setBypass, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, noteSessionRevoked, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };
+module.exports = { configure, setBypass, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, noteSessionRevoked, clearCooldown, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };
