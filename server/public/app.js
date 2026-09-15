@@ -2600,6 +2600,13 @@ function showLicenseGate(L) {
             ? `${L.trialDays} günlük ücretsiz deneme sona erdi. Kullanmaya devam etmek için lisansınızı tanımlatın.`
             : 'Devam etmek için lisansınızı tanımlatın.');
     $('lg_hwid').value = L.hardwareId || '';
+    // Donanım okunamadıysa kimlik geçicidir — elle iletilirse sonra değişebilir.
+    const hw = $('lg_hwWarn');
+    if (hw) {
+        hw.hidden = !L.hardwareIdWeak;
+        hw.textContent = '⚠ Bilgisayarın donanım bilgisi şu an okunamadı; bu kimlik geçici olabilir. '
+            + 'Birkaç dakika içinde kendiliğinden düzelir — kimliği iletmeden önce "Yeniden Denetle"ye basın.';
+    }
     // Lisans tanımlandığı an ekranın kendiliğinden açılması için arka plan yoklaması.
     startLicenseGatePolling();
 }
@@ -2677,11 +2684,22 @@ $('lg_activate').onclick = async () => {
         await boot();   // lisans geldi → normal açılış akışı (kurulum ya da uygulama)
     }
 };
+// Yeniden Denetle artık sunucuya da sorar (panelden yeni verilen lisansı indirir).
 $('lg_recheck').onclick = async () => {
+    const btn = $('lg_recheck'), old = btn.textContent;
     $('lg_err').textContent = '';
-    const r = await fetch('/api/license/recheck', { method: 'POST' }).then(x => x.json());
-    if (r.license && r.license.valid) await boot();
-    else showLicenseGate(r.license);
+    btn.disabled = true; btn.textContent = 'Denetleniyor...';
+    try {
+        const r = await fetch('/api/license/recheck', { method: 'POST' }).then(x => x.json());
+        if (r.license && r.license.valid) { await boot(); return; }
+        showLicenseGate(r.license);
+        const f = r.fetch;
+        $('lg_err').textContent = (f && (LG_FETCH_MSG[f.reason] || f.error)) || 'Lisans hâlâ geçersiz.';
+    } catch (e) {
+        $('lg_err').textContent = 'Denetlenemedi: ' + e.message;
+    } finally {
+        btn.disabled = false; btn.textContent = old;
+    }
 };
 
 // ─── Uzaktan lisans alma ───

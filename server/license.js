@@ -24,7 +24,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execSync, exec } = require('child_process');
 
 // RSA-2048 public key — derlemeye gömülü, değişmez.
 // Karşılığı: lisans/private.key (yalnızca satıcıda; scripts/lisans-uret.js kullanır).
@@ -66,6 +66,7 @@ let _cacheAt = 0;
 // server.js açılışta çağırır: baseDir = Electron userData (güncellemede silinmez).
 function configure(opts = {}) {
     baseDir = opts.baseDir || baseDir;
+    if (typeof opts.onHardwareIdChange === 'function') _onHardwareIdChange = opts.onHardwareIdChange;
     ensureDataDir();
     invalidateCache();
 }
@@ -95,72 +96,219 @@ function hideFile(filePath) {
 // Anakart seri no + sistem UUID (Windows), yoksa kalıcı MAC adresleri.
 // SHA-256 → 20 karakter, 4'erli 5 grup: XXXX-XXXX-XXXX-XXXX-XXXX. Aynı makinede sabit.
 
+//
+// ─── KİMLİK NEDEN DEĞİŞİYORDU (2026-09-15, sahada doğrulandı) ───────────────
+// PowerShell sorgusu 6 sn'de zaman aşımına uğrarsa (oturum açılışında soğuk
+// PowerShell, antivirüs taraması, PowerShell'i kısıtlayan kurumsal politika) ve
+// wmic de yoksa (Windows 11 24H2'de kaldırıldı) kimlik MAC listesinden hesaplanıyordu.
+// O liste yalnız O AN bağlı ağ kartlarını içerir → Wi-Fi kopunca / VPN açılınca
+// değişir. Sonuç: aynı PC farklı kimlik gösterir, şifreli lisans dosyası çözülemez,
+// panelde verilen lisans "bulunamadı" der. Panelde aynı bilgisayar adına iki ayrı
+// kimlikle verilmiş lisans (AYA055) bunun kanıtı.
+//
+// Çözüm:
+//   1. Sorgu zaman aşımı 15 sn.
+//   2. Donanım bir kez okununca kaynak metni ÖNBELLEĞE yazılır (dosya + registry),
+//      Windows MachineGuid'den türetilen anahtarla şifreli → başka makineye
+//      kopyalanırsa çözülmez. Sorgu sonradan başarısız olursa önbellek kullanılır.
+//   3. Hiç okunamadıysa zayıf (MAC) kimlik kullanılır ama arka planda periyodik
+//      yeniden denenir; bu sırada sunucu donmasın diye deneme ASENKRONDUR.
+//   4. Zayıf kimlikle verilmiş eski lisanslar, donanım okunduktan sonra da tanınır
+//      (candidateHardwareIds — hepsi bu makineden türetilir, başkasının lisansını açmaz).
+// BB:/UUID: kaynak metninin BİÇİMİ DEĞİŞMEMELİ — verilmiş tüm lisanslar onun özetine bağlı.
+
 let _hwId = null;
+let _hwInfo = { source: null, weak: false };   // source: donanim | onbellek | ag | ad
+let _hwRetryTimer = null;
+let _onHardwareIdChange = null;
+
+const PS_HW_CMD = 'powershell -NoProfile -NonInteractive -Command ' +
+    '"(Get-CimInstance Win32_BaseBoard).SerialNumber; (Get-CimInstance Win32_ComputerSystemProduct).UUID"';
+const PS_TIMEOUT_MS = 15000;            // açılıştaki senkron deneme (eskiden 6 sn)
+const PS_RETRY_TIMEOUT_MS = 30000;      // arka plan denemesi
+const HW_RETRY_MS = 2 * 60 * 1000;
+const REG_VAL_HWSRC = 'AppHw';
 
 function isJunkValue(v) {
     return !v || /^(none|to be filled|default|system serial number|0+|f+)$/i.test(String(v).trim());
 }
 
-function rawHardwareSources() {
+function runSync(cmd, timeout) {
+    try { return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout, windowsHide: true }); }
+    catch { return ''; }
+}
+function runAsync(cmd, timeout) {
+    return new Promise((resolve) => {
+        try { exec(cmd, { encoding: 'utf8', timeout, windowsHide: true }, (err, stdout) => resolve(err ? '' : String(stdout || ''))); }
+        catch { resolve(''); }
+    });
+}
+
+const outLines = (out) => String(out || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+const wmicValue = (out, header) => outLines(out).filter(s => !header.test(s))[0] || '';
+
+function composeStrong(board, uuid) {
     const parts = [];
-    if (process.platform === 'win32') {
-        const tryCmd = (cmd) => {
-            try {
-                return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 6000 });
-            } catch { return ''; }
-        };
-
-        let board = '';
-        let uuid = '';
-
-        // wmic yeni Windows sürümlerinde kaldırıldı → önce PowerShell CIM.
-        const ps = tryCmd(
-            'powershell -NoProfile -NonInteractive -Command ' +
-            '"(Get-CimInstance Win32_BaseBoard).SerialNumber; (Get-CimInstance Win32_ComputerSystemProduct).UUID"'
-        ).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-        if (ps.length >= 1) board = ps[0];
-        if (ps.length >= 2) uuid = ps[1];
-
-        if (isJunkValue(board)) {
-            board = tryCmd('wmic baseboard get serialnumber')
-                .split(/\r?\n/).map(s => s.trim()).filter(s => s && !/serialnumber/i.test(s))[0] || '';
-        }
-        if (isJunkValue(uuid)) {
-            uuid = tryCmd('wmic csproduct get uuid')
-                .split(/\r?\n/).map(s => s.trim()).filter(s => s && !/uuid/i.test(s))[0] || '';
-        }
-
-        if (!isJunkValue(board)) parts.push('BB:' + board.trim());
-        if (!isJunkValue(uuid)) parts.push('UUID:' + uuid.trim());
-    }
-    // Yedek kaynak: kalıcı (sanal olmayan) MAC adresleri.
-    if (parts.length === 0) {
-        const ifaces = os.networkInterfaces();
-        const macs = [];
-        for (const name of Object.keys(ifaces)) {
-            for (const net of ifaces[name] || []) {
-                if (net.mac && net.mac !== '00:00:00:00:00:00' && !net.internal) macs.push(net.mac.toLowerCase());
-            }
-        }
-        macs.sort();
-        if (macs.length) parts.push('MAC:' + macs.join(','));
-    }
+    if (!isJunkValue(board)) parts.push('BB:' + board.trim());
+    if (!isJunkValue(uuid)) parts.push('UUID:' + uuid.trim());
     return parts.join('|');
+}
+
+// Anakart seri + sistem UUID. Okunamazsa ''. (wmic yeni Windows'ta yok → önce PowerShell CIM.)
+function strongSourceSync() {
+    if (process.platform !== 'win32') return '';
+    const ps = outLines(runSync(PS_HW_CMD, PS_TIMEOUT_MS));
+    let board = ps[0] || '', uuid = ps[1] || '';
+    if (isJunkValue(board)) board = wmicValue(runSync('wmic baseboard get serialnumber', 6000), /serialnumber/i);
+    if (isJunkValue(uuid)) uuid = wmicValue(runSync('wmic csproduct get uuid', 6000), /uuid/i);
+    return composeStrong(board, uuid);
+}
+async function strongSourceAsync() {
+    if (process.platform !== 'win32') return '';
+    const ps = outLines(await runAsync(PS_HW_CMD, PS_RETRY_TIMEOUT_MS));
+    let board = ps[0] || '', uuid = ps[1] || '';
+    if (isJunkValue(board)) board = wmicValue(await runAsync('wmic baseboard get serialnumber', 6000), /serialnumber/i);
+    if (isJunkValue(uuid)) uuid = wmicValue(await runAsync('wmic csproduct get uuid', 6000), /uuid/i);
+    return composeStrong(board, uuid);
+}
+
+// Zayıf yedek: o an görünen (sanal olmayan) ağ kartlarının MAC adresleri.
+function macSource() {
+    const ifaces = os.networkInterfaces();
+    const macs = [];
+    for (const name of Object.keys(ifaces)) {
+        for (const net of ifaces[name] || []) {
+            if (net.mac && net.mac !== '00:00:00:00:00:00' && !net.internal) macs.push(net.mac.toLowerCase());
+        }
+    }
+    macs.sort();
+    return macs.length ? 'MAC:' + macs.join(',') : '';
+}
+
+function idFromSource(source) {
+    const hash = crypto.createHash('sha256').update('VEGA-HWID-v1::' + source).digest('hex').toUpperCase();
+    return hash.slice(0, 20).match(/.{1,4}/g).join('-');
+}
+
+// ─── Donanım kaynağı önbelleği (MachineGuid'e bağlı şifreli) ────────────────
+function machineGuid() {
+    if (process.platform !== 'win32') return '';
+    const m = runSync('reg query "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid', 3000)
+        .match(/MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]{36})/i);
+    return m ? m[1].toLowerCase() : '';
+}
+function hwCachePath() { return path.join(dataDir(), 'hs'); }
+const hwCacheKey = (guid) => crypto.createHash('sha256').update('VEGA-HWSRC-v1::' + guid).digest();
+
+function sealHwSource(source, guid) {
+    const iv = crypto.randomBytes(12);
+    const c = crypto.createCipheriv('aes-256-gcm', hwCacheKey(guid), iv);
+    const data = Buffer.concat([c.update(source, 'utf8'), c.final()]);
+    return Buffer.concat([iv, c.getAuthTag(), data]).toString('base64');
+}
+function openHwSource(b64, guid) {
+    try {
+        const buf = Buffer.from(String(b64 || '').trim(), 'base64');
+        if (buf.length < 29) return '';
+        const d = crypto.createDecipheriv('aes-256-gcm', hwCacheKey(guid), buf.subarray(0, 12));
+        d.setAuthTag(buf.subarray(12, 28));
+        const s = Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString('utf8');
+        return /^(BB|UUID):/.test(s) ? s : '';
+    } catch { return ''; }
+}
+function readHwCache(guid) {
+    if (!guid) return '';
+    try {
+        const v = openHwSource(fs.readFileSync(hwCachePath(), 'utf8'), guid);
+        if (v) return v;
+    } catch { /* dosya yok → registry */ }
+    if (process.platform !== 'win32') return '';
+    const m = runSync(`reg query "${REG_KEY}" /v "${REG_VAL_HWSRC}"`, 3000).match(/REG_SZ\s+(\S+)/i);
+    return m ? openHwSource(m[1], guid) : '';
+}
+function writeHwCache(source, guid) {
+    if (!guid || !source) return;
+    const sealed = sealHwSource(source, guid);
+    try {
+        ensureDataDir();
+        const p = hwCachePath();
+        try { fs.unlinkSync(p); } catch { /* yok */ }   // gizli dosyanın üstüne yazılamaz (EPERM)
+        fs.writeFileSync(p, sealed, 'utf8');
+        hideFile(p);
+    } catch { /* best-effort */ }
+    if (process.platform === 'win32') {
+        try {
+            execSync(`reg add "${REG_KEY}" /v "${REG_VAL_HWSRC}" /t REG_SZ /d "${sealed}" /f`, { stdio: 'ignore', timeout: 3000, windowsHide: true });
+        } catch { /* best-effort */ }
+    }
+}
+
+function resolveHardwareId() {
+    const guid = machineGuid();
+    const strong = strongSourceSync();
+    if (strong) {
+        if (guid && readHwCache(guid) !== strong) writeHwCache(strong, guid);
+        return { id: idFromSource(strong), source: 'donanim', weak: false };
+    }
+    const cached = readHwCache(guid);
+    if (cached) return { id: idFromSource(cached), source: 'onbellek', weak: false };
+    const mac = macSource();
+    if (mac) return { id: idFromSource(mac), source: 'ag', weak: true };
+    return { id: idFromSource('HOST:' + os.hostname()), source: 'ad', weak: true };
 }
 
 function getHardwareId() {
     if (_hwId) return _hwId;
-    let source = rawHardwareSources();
-    if (!source) source = 'HOST:' + os.hostname();   // son çare (zayıf ama hiç yoktan iyi)
-    const hash = crypto.createHash('sha256').update('VEGA-HWID-v1::' + source).digest('hex').toUpperCase();
-    _hwId = hash.slice(0, 20).match(/.{1,4}/g).join('-');
+    const r = resolveHardwareId();
+    _hwId = r.id;
+    _hwInfo = { source: r.source, weak: r.weak };
+    if (r.weak) scheduleHardwareRetry();
     return _hwId;
+}
+
+// Zayıf kimlikteyken donanımı arka planda yeniden dene. Okununca kimlik kalıcı
+// (güçlü) olana geçer, lisans önbelleği tazelenir, sunucu haberdar edilir.
+function scheduleHardwareRetry() {
+    if (_hwRetryTimer || process.platform !== 'win32') return;
+    _hwRetryTimer = setTimeout(async () => {
+        _hwRetryTimer = null;
+        let strong = '';
+        try { strong = await strongSourceAsync(); } catch { strong = ''; }
+        if (!strong) { if (_hwInfo.weak) scheduleHardwareRetry(); return; }
+        writeHwCache(strong, machineGuid());
+        const prev = _hwId;
+        _hwId = idFromSource(strong);
+        _hwInfo = { source: 'donanim', weak: false };
+        if (prev !== _hwId) {
+            invalidateCache();
+            if (typeof _onHardwareIdChange === 'function') { try { _onHardwareIdChange(_hwId, prev); } catch { /* yok say */ } }
+        }
+    }, HW_RETRY_MS);
+    if (_hwRetryTimer.unref) _hwRetryTimer.unref();
+}
+
+function getHardwareInfo() {
+    getHardwareId();
+    return { ..._hwInfo };
+}
+
+// Bu makinenin olası kimlikleri: şimdiki + ağ kartı ve bilgisayar adı tabanlı eskiler.
+// Donanımın okunamadığı bir gün zayıf kimlikle verilmiş lisans, donanım okununca da
+// tanınsın. Hepsi YALNIZ bu makineden türetilir → başka makinenin lisansını açmaz.
+function candidateHardwareIds() {
+    const ids = [getHardwareId()];
+    const add = (src) => { if (!src) return; const id = idFromSource(src); if (!ids.includes(id)) ids.push(id); };
+    add(macSource());
+    add('HOST:' + os.hostname());
+    return ids;
 }
 
 // ─── Lisans dosyası şifreleme (AES-256-GCM, donanıma bağlı anahtar) ─────────
 
+const keyForId = (id) => crypto.createHash('sha256').update('VEGA-LICENSE-AES-v1::' + id).digest();
+
 function encryptionKey() {
-    return crypto.createHash('sha256').update('VEGA-LICENSE-AES-v1::' + getHardwareId()).digest();
+    return keyForId(getHardwareId());
 }
 
 function encryptLicense(obj) {
@@ -171,21 +319,27 @@ function encryptLicense(obj) {
     return Buffer.concat([iv, tag, data]);   // [12 IV][16 TAG][n DATA]
 }
 
-function decryptLicense(buf) {
+function decryptLicense(buf, key) {
     const iv = buf.subarray(0, 12);
     const tag = buf.subarray(12, 28);
     const data = buf.subarray(28);
-    const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey(), iv);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key || encryptionKey(), iv);
     decipher.setAuthTag(tag);
     return JSON.parse(Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8'));
 }
 
 // Dönüş: { license } | null (dosya yok) | { decryptFailed:true } (yanlış makine/bozuk)
+// Dosya zayıf (MAC) kimlikle yazılmış olabilir → bu makinenin olası kimlikleriyle de dene.
 function readStoredLicense() {
     const p = licenseStorePath();
     if (!fs.existsSync(p)) return null;
-    try { return { license: decryptLicense(fs.readFileSync(p)) }; }
-    catch { return { decryptFailed: true }; }
+    let buf;
+    try { buf = fs.readFileSync(p); } catch { return { decryptFailed: true }; }
+    try { return { license: decryptLicense(buf) }; } catch { /* aşağıda diğer kimlikler */ }
+    for (const id of candidateHardwareIds().slice(1)) {
+        try { return { license: decryptLicense(buf, keyForId(id)) }; } catch { /* sıradaki */ }
+    }
+    return { decryptFailed: true };
 }
 
 function saveLicense(obj) {
@@ -387,8 +541,8 @@ function validateLicense() {
         };
     }
 
-    // 5. Donanım bağlama (ZORUNLU).
-    if (payload.hardwareId !== hwId) {
+    // 5. Donanım bağlama (ZORUNLU). Bu makinenin eski (zayıf) kimliğiyle verilmiş lisans da geçer.
+    if (payload.hardwareId !== hwId && !candidateHardwareIds().includes(payload.hardwareId)) {
         return {
             valid: false, reason: 'LICENSE_HARDWARE_MISMATCH', hardwareId: hwId,
             customerName: payload.customerName || null,
@@ -463,6 +617,9 @@ function getStatus() {
         reason: s.reason || null,
         detail: s.detail || null,
         hardwareId: s.hardwareId || getHardwareId(),
+        // 'ag'/'ad' = donanım okunamadı, kimlik geçici; arayüz uyarı gösterir.
+        hardwareIdSource: _hwInfo.source,
+        hardwareIdWeak: !!_hwInfo.weak,
         customerName: s.customerName || null,
         customerEmail: s.customerEmail || null,
         issuedAt: s.issuedAt || null,
@@ -496,7 +653,7 @@ function activate(content) {
     if (String(parsed.payload.product || '').toUpperCase() !== PRODUCT) {
         return { ok: false, error: 'Bu lisans başka bir ürün için üretilmiş.', reason: 'LICENSE_WRONG_PRODUCT' };
     }
-    if (parsed.payload.hardwareId !== hwId) {
+    if (parsed.payload.hardwareId !== hwId && !candidateHardwareIds().includes(parsed.payload.hardwareId)) {
         return {
             ok: false, reason: 'LICENSE_HARDWARE_MISMATCH',
             error: 'Bu lisans bu bilgisayar için üretilmemiş. Aşağıdaki Donanım Kimliği ile lisansınızı yeniden talep edin.',
@@ -545,8 +702,32 @@ function getLicenseProof() {
 // Bu YALNIZCA teslimi kolaylaştırır — doğrulama hâlâ %100 çevrimdışıdır:
 // gelen lisans aynı imza/donanım/ürün denetimlerinden geçer, sunucuya
 // "geçerli mi" diye sorulmaz. İnternet yoksa mevcut lisans çalışmaya devam eder.
-const REMOTE_BASE = 'https://vega-kontor.expertbilisim.workers.dev';
+// İKİ ADRES: *.workers.dev bazı Türk operatörlerinde DPI ile engelli — o müşteride
+// uygulama sunucuya hiç ulaşamıyor, cihaz panele düşmüyor, verilen lisansı da
+// indiremiyordu ("bazı müşterilerde oluyor"). Yedek adres aynı uçları kendi alan
+// adımızdan (Vercel vekili → aynı Worker) sunar. Çalışan adres hatırlanır.
+const REMOTE_BASES = [
+    'https://vega-kontor.expertbilisim.workers.dev',
+    'https://www.expertbilisim.com.tr/lisans-api',
+];
 const REMOTE_TIMEOUT_MS = 15000;
+let _remoteIdx = 0;
+
+// İstek ağ hatası/zaman aşımı ya da vekil hatası (5xx, JSON değil) verirse diğer
+// adresi dener. 4xx gibi gerçek cevaplar olduğu gibi döner.
+async function remoteCall(fn) {
+    let lastErr = null;
+    for (let i = 0; i < REMOTE_BASES.length; i++) {
+        const idx = (_remoteIdx + i) % REMOTE_BASES.length;
+        try {
+            const res = await fn(REMOTE_BASES[idx]);
+            if (res.statusCode >= 500) { lastErr = new Error(`Lisans sunucusu hatası (HTTP ${res.statusCode}).`); continue; }
+            _remoteIdx = idx;
+            return res;
+        } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error('Lisans sunucusuna ulaşılamadı.');
+}
 
 function httpsGetJson(urlStr) {
     return new Promise((resolve, reject) => {
@@ -598,6 +779,13 @@ function httpsPostJson(urlStr, bodyObj, headers = {}) {
     });
 }
 
+// Panelde bilgisayar adı yerine görünecek firma adı (server.js Vega'da en aktif firmayı
+// sorgulayıp verir). Sunucuya "FIRMA · BİLGİSAYAR" olarak gider; panel ikisini ayırır.
+let _machineLabel = '';
+function setMachineLabel(label) {
+    _machineLabel = String(label || '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').replace(/·/g, '-').trim().slice(0, 40);
+}
+
 // Bu makineyi tanıtan ipuçları — panelde "hangi müşteri?" ayırt edilsin diye.
 // Kimlik doğrulamada KULLANILMAZ, yalnız gösterim içindir.
 function machineHints() {
@@ -607,7 +795,8 @@ function machineHints() {
     let version = '';
     try { version = require(path.join(__dirname, '..', 'package.json')).version || ''; }
     catch { try { version = require('./package.json').version || ''; } catch { /* önemsiz */ } }
-    return { hostname: String(hostname).slice(0, 64), version: String(version).slice(0, 24) };
+    const label = _machineLabel ? `${_machineLabel} · ${hostname}` : hostname;
+    return { hostname: String(label).slice(0, 64), version: String(version).slice(0, 24) };
 }
 
 /**
@@ -625,9 +814,9 @@ async function reportRemote() {
 
     let res;
     try {
-        res = await httpsPostJson(`${REMOTE_BASE}/v1/license/register`, machineHints(), {
-            authorization: 'Vega ' + Buffer.from(JSON.stringify(proof), 'utf8').toString('base64'),
-        });
+        const hints = machineHints();
+        const auth = { authorization: 'Vega ' + Buffer.from(JSON.stringify(proof), 'utf8').toString('base64') };
+        res = await remoteCall(base => httpsPostJson(`${base}/v1/license/register`, hints, auth));
     } catch (e) {
         return { ok: false, reason: 'NETWORK', error: e.message };
     }
@@ -649,7 +838,7 @@ async function fetchRemote() {
         const qs = `hwid=${encodeURIComponent(hwId)}`
             + `&host=${encodeURIComponent(hints.hostname)}`
             + `&v=${encodeURIComponent(hints.version)}`;
-        res = await httpsGetJson(`${REMOTE_BASE}/v1/license?${qs}`);
+        res = await remoteCall(base => httpsGetJson(`${base}/v1/license?${qs}`));
     } catch (e) {
         return { ok: false, reason: 'NETWORK', error: e.message };
     }
@@ -691,6 +880,9 @@ module.exports = {
     isAllowed,
     getStatus,
     getHardwareId,
+    getHardwareInfo,
+    candidateHardwareIds,
+    setMachineLabel,
     getLicenseProof,
     activate,
     fetchRemote,

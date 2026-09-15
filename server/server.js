@@ -2547,14 +2547,21 @@ app.post('/api/license/fetch', async (req, res) => {
     }
 });
 
-// Yeniden denetle (ör. saat düzeltildi, süre doldu).
+// Yeniden denetle (ör. saat düzeltildi, süre doldu, panelde lisans yeni tanımlandı).
+// ÖNCE sunucuya sorar: eskiden yalnız yerel doğrulama yapıyordu → panelden lisans
+// verilmişken müşteri "Yeniden Denetle"ye basıp hiçbir şey olmadığını görüyordu.
 app.post('/api/license/recheck', async (req, res) => {
     try {
+        let fetched = null;
+        try { fetched = await license.fetchRemote(); } catch { /* ağ yoksa yerel denetim yeter */ }
         license.invalidateCache();
         const st = license.getStatus();
         if (st.valid) { try { await autoConnectFromConfig(); startAccountsIfLocal(); } catch { /* yok say */ } }
         else stopAutomation('lisans geçersiz');
-        res.json({ success: true, license: st });
+        res.json({
+            success: true, license: st,
+            fetch: fetched ? { ok: !!fetched.ok, reason: fetched.reason || null, error: fetched.error || null } : null,
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -3052,7 +3059,78 @@ app.get('*', (req, res) => {
 });
 
 // Çevrimdışı lisans: data/ altındaki şifreli lisans deposu + deneme sayacı.
-license.configure({ baseDir });
+license.configure({
+    baseDir,
+    // Donanım açılışta okunamayıp sonradan okunduysa kimlik değişti → hemen sunucuya sor.
+    onHardwareIdChange: (id, prev) => {
+        console.log(`[Lisans] donanım kimliği kesinleşti: ${prev} → ${id}`);
+        pollRemoteLicense().catch(() => { });
+    },
+});
+
+// ─── Panelde bilgisayar adı yerine firma adı ────────────────────────────────
+// Lisans bekleyen / lisanslı cihaz panelde "LENOVO" gibi anlamsız bir adla değil,
+// Vega'da EN AKTİF kullanılan firmanın adıyla görünsün. Lisanssız makinede ana
+// bağlantı açılmadığı için kayıtlı ayarlarla KISA ÖMÜRLÜ ayrı bir bağlantı kurulur.
+// Aktiflik: her firmanın en son dönemindeki cari hareket tablosunda son 90 günün
+// satır sayısı (eşitlikte en yeni hareket tarihi).
+const MACHINE_LABEL_FILE = () => path.join(baseDir, 'data', 'machine-label.json');
+const MACHINE_LABEL_REFRESH_MS = 12 * 60 * 60 * 1000;
+
+async function detectActiveFirma() {
+    let p = (pool && pool.connected) ? pool : null;
+    let temp = null;
+    if (!p) {
+        const st = readStoredConfig();
+        if (!st.exists || st.needsReauth || !st.password) return null;
+        const c = st.config;
+        temp = new sql.ConnectionPool({
+            user: c.username, password: st.password, database: c.database, server: c.server,
+            port: parseInt(c.port) || 1433,
+            options: { encrypt: false, trustServerCertificate: true, enableArithAbort: true },
+            connectionTimeout: 15000, requestTimeout: 60000, pool: { max: 1, min: 0 },
+        });
+        p = await temp.connect();
+    }
+    try {
+        const names = (await p.request().query(
+            "SELECT name FROM sys.tables WHERE name LIKE 'F[0-9][0-9][0-9][0-9]D[0-9][0-9][0-9][0-9]TBLCARIHAREKETLERI'"
+        )).recordset.map(r => r.name).sort();
+        const latest = new Map();                      // firma → en yüksek dönemin tablosu
+        for (const n of names) latest.set(n.slice(1, 5), n);
+        if (!latest.size) return null;
+        // Tablo adları yukarıdaki LIKE deseninden geliyor (yalnız rakam) → birleştirmek güvenli.
+        const parts = [...latest.entries()].slice(0, 50).map(([f, t]) =>
+            `SELECT ${parseInt(f, 10)} AS IND, SUM(CASE WHEN TARIH >= DATEADD(day, -90, GETDATE()) THEN 1 ELSE 0 END) AS N, MAX(TARIH) AS SON FROM [${t}]`);
+        const row = (await p.request().query(`
+            SELECT TOP 1 x.IND, x.N, f.KISAAD
+            FROM (${parts.join('\nUNION ALL\n')}) x
+            LEFT JOIN TBLFIRMA f ON f.IND = x.IND
+            ORDER BY x.N DESC, x.SON DESC`)).recordset[0];
+        if (!row) return null;
+        return { firmaNo: '0' + row.IND, name: String(row.KISAAD || '').trim() || `Firma ${row.IND}`, recent: row.N || 0 };
+    } finally {
+        if (temp) { try { await temp.close(); } catch { /* yok say */ } }
+    }
+}
+
+async function refreshMachineLabel() {
+    try {
+        const r = await detectActiveFirma();
+        if (!r) return;
+        license.setMachineLabel(r.name);
+        try { fs.writeFileSync(MACHINE_LABEL_FILE(), JSON.stringify({ label: r.name, firmaNo: r.firmaNo, at: new Date().toISOString() })); }
+        catch { /* önemsiz */ }
+    } catch (e) { console.error('[Lisans] en aktif firma okunamadı:', e.message); }
+}
+
+// Açılışta önce kayıtlı etiketi kullan (ağ sorgusu gecikmesin), sonra tazele.
+try {
+    const saved = JSON.parse(fs.readFileSync(MACHINE_LABEL_FILE(), 'utf8'));
+    if (saved && saved.label) license.setMachineLabel(saved.label);
+} catch { /* ilk açılış */ }
+setTimeout(() => { refreshMachineLabel(); }, 8000).unref?.();
+setInterval(() => { refreshMachineLabel(); }, MACHINE_LABEL_REFRESH_MS).unref?.();
 
 // Kontör istemcisi: kontörlü ("vega") AI sağlayıcısının bakiye/çağrı katmanı.
 // Kimlik olarak imzalı lisans kullanılır → ayrı parola/jeton dağıtılmaz.
@@ -3094,6 +3172,7 @@ setInterval(() => {
 //    lisanslar da panele kendiliğinden düşer; artık elle içe aktarma gerekmez.
 const LIC_POLL_UNLICENSED_MS = 3 * 60 * 1000;    // lisans bekleniyor
 const LIC_POLL_RENEWAL_MS = 6 * 60 * 60 * 1000;  // yenileme kollaması
+const LIC_POLL_TRIAL_MS = 30 * 60 * 1000;        // deneme sürümü: panelde görünsün
 const LIC_REPORT_MS = 24 * 60 * 60 * 1000;       // panele kendini bildirme
 let lastRenewalCheck = 0;
 let lastReport = 0;
@@ -3109,7 +3188,14 @@ async function pollRemoteLicense() {
         license.reportRemote().catch(() => { });
     }
 
-    if (st.valid) {
+    if (st.valid && st.trial) {
+        // DENEME SÜRÜMÜ de yoklar: eskiden yalnız deneme BİTİNCE sorulduğu için müşteri
+        // lisans almak için aradığında cihazı panelin "bekleyenler" listesinde yoktu
+        // (15 gün boyunca hiç görünmüyordu). Sorgu cihazı listeye yazar; lisans verilince
+        // deneme bitmeden kendiliğinden kurulur.
+        if (now - lastRenewalCheck < LIC_POLL_TRIAL_MS) return;
+        lastRenewalCheck = now;
+    } else if (st.valid) {
         // Süresiz lisansta yenileme aramaya gerek yok.
         if (st.daysLeft == null || st.daysLeft > 10) return;
         if (now - lastRenewalCheck < LIC_POLL_RENEWAL_MS) return;
