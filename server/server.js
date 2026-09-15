@@ -179,6 +179,7 @@ function persistConfig({ server, database, username, port, password, uiContext }
         uiContext: uiContext !== undefined ? uiContext : (existing.uiContext || null),
     };
     if (existing.wa) saved.wa = existing.wa;   // WA modu (relay) ayarını DB kaydında koru
+    if (existing.efatura) saved.efatura = existing.efatura; // e-Fatura PDF tuşu
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(saved, null, 2), 'utf8');
     return saved;
 }
@@ -1330,6 +1331,31 @@ app.get('/api/watcher/log', (req, res) => {
 // tarama uclari. Lisans kapisi yukarida tum /api isteklerine uygulanir.
 app.get('/api/integrations', (req, res) => {
     res.json({ success: true, data: integrations.status() });
+});
+
+// e-Fatura PDF tuşu (varsayılan kapalı). enabledAt = açıldığı an; entegrasyon
+// başlangıcı bu ana çeker, kapalıyken kesilen faturalar gönderilmez.
+app.post('/api/integrations/efatura/enabled', (req, res) => {
+    const existing = loadConfigFile();
+    if (!existing) return res.json({ success: false, message: 'Önce veritabanı bağlantısı kurulmalı.' });
+    const enabled = !!(req.body && req.body.enabled === true);
+    const prev = existing.efatura || {};
+    existing.efatura = { enabled, enabledAt: enabled ? ((prev.enabled && prev.enabledAt) || new Date().toISOString()) : null };
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(existing, null, 2), 'utf8');
+    res.json({ success: true, enabled });
+});
+
+// Dizayn (xslt) + log klasörünü Gezgin'de aç — ProgramData'yı elle aramaya gerek kalmasın.
+app.post('/api/integrations/efatura/open-folder', async (req, res) => {
+    const ef = integrations.status().find(x => x.id === 'efatura');
+    if (!ef || !ef.dataDir) return res.json({ success: false, message: 'e-Fatura entegrasyonu yüklü değil.' });
+    try {
+        const { shell } = require('electron');
+        const err = await shell.openPath(ef.dataDir);
+        res.json(err ? { success: false, message: err } : { success: true, path: ef.dataDir });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
 });
 
 app.post('/api/integrations/:id/run', async (req, res) => {
@@ -3307,6 +3333,7 @@ integrations.configure({
     waStatus: waStatusX,
     checkOnWhatsApp: waCheckX,
     gate: (ch) => gateX(ch, null),
+    getEnabled: () => { const c = loadConfigFile(); return (c && c.efatura) || null; },
     getContext: () => {
         const c = loadConfigFile();
         let w = null;

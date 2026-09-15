@@ -15,10 +15,25 @@ assert.throws(() => db.code('01x1', 'firma'));
 assert.equal(exporter.invoiceId(xml), 'TEST2026000000001');
 assert.equal(renderer.xmlValue(xml, 'ProfileID'), 'TEMELFATURA');
 assert.equal(renderer.supplierVkn(xml), '1234567890');
-const invoice = renderer.selectDesign({ designsDir: path.join(root, 'designs'), documentType: 'efatura', xml });
-const archive = renderer.selectDesign({ designsDir: path.join(root, 'designs'), documentType: 'earsiv', xml });
-assert.equal(path.basename(invoice.selected), 'invoice.xslt');
-assert.equal(path.basename(archive.selected), 'earchive.xslt');
+// Dizayn: once <tur>_<VKN>.xslt, sonra <tur>.xslt; hic yoksa hata (gonderilmez).
+const designDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vega-efatura-design-'));
+try {
+    assert.equal(renderer.hasAnyDesign(designDir, 'efatura'), false);
+    assert.throws(() => renderer.selectDesign({ designsDir: designDir, documentType: 'efatura', xml }), /dizayn bulunamadi/);
+    fs.writeFileSync(path.join(designDir, 'invoice.xslt'), '<x/>');
+    fs.writeFileSync(path.join(designDir, 'invoice_1234567890.xslt'), '<x/>');
+    fs.writeFileSync(path.join(designDir, 'earchive.xslt'), '<x/>');
+    const invoice = renderer.selectDesign({ designsDir: designDir, documentType: 'efatura', xml });
+    const archive = renderer.selectDesign({ designsDir: designDir, documentType: 'earsiv', xml });
+    assert.equal(path.basename(invoice.selected), 'invoice_1234567890.xslt');
+    assert.equal(path.basename(archive.selected), 'earchive.xslt');
+    fs.unlinkSync(path.join(designDir, 'earchive.xslt'));
+    fs.writeFileSync(path.join(designDir, 'earchive_9999999999.xslt'), '<x/>');   // baska firmanin
+    assert.equal(renderer.hasAnyDesign(designDir, 'earsiv'), true);
+    assert.throws(() => renderer.selectDesign({ designsDir: designDir, documentType: 'earsiv', xml }), /dizayn bulunamadi/);
+} finally {
+    fs.rmSync(designDir, { recursive: true, force: true });
+}
 
 async function main() {
     let sqlText = '';
@@ -90,12 +105,30 @@ async function main() {
             manifest: { settings: { batchLimit: 2 } }, dataDir: cursorDir, integrationDir: root,
             getPool: () => ({ connected: true }),
             getContext: () => ctx,
+            getEnabled: () => enabledSetting,
             waStatus: () => ({ ready: true }),
             gate: () => ({ ok: true }),
             waSend: async () => ({ success: true, id: 'msg' }),
         });
         integration.currentContext = async () => ctx;
-        integration.state.init('F0103D0015', 10);
+        const item = { docType: 'satisFaturasi', evrak: 'ODM2026000000001' };
+
+        // Varsayilan kapali: tarama yok, watcher metin mesajini engellemez.
+        let enabledSetting = null;
+        assert.equal((await integration.tick()).skipped, 'ayarlardan kapali');
+        assert.equal(integration.claimsWatcherDocument(item), false);
+
+        // Eski (kapaliyken/eski surumde) alinmis baslangic, tus acilinca yenilenir.
+        integration.state.init('F0103D0015', 3);
+        integration.state.data.contexts.F0103D0015.initializedAt = '2026-01-01T00:00:00.000Z';
+        enabledSetting = { enabled: true, enabledAt: new Date().toISOString() };
+        const origMax = db.maxInvoiceInd;
+        db.maxInvoiceInd = async () => 10;
+        const reinit = await integration.tick();
+        db.maxInvoiceInd = origMax;
+        assert.equal(reinit.initialized, true);
+        assert.equal(integration.state.context('F0103D0015').scanAfter, 10);
+        assert.equal(integration.claimsWatcherDocument(item), true);
         integration.reconcileSent = async () => [];
         const seen = [];
         integration.processOne = async (_ctx, row) => { seen.push(row.IND); return { sent: true, belgeNo: row.BELGENO }; };

@@ -95,7 +95,11 @@ class Integration {
         // TEST MODU: dolu ise butun PDF/iptal mesajlari cari yerine bu numaraya gider.
         this.testPhone = normalizeTestPhone(this.settings.testPhone);
         this.state = new State(path.join(host.dataDir, 'state.json'));
-        this.logFile = path.join(host.dataDir, 'efatura.log');
+        // Guncelleme Program Files'i sildigi icin musteri dosyalari ProgramData'da;
+        // Ayarlar > e-Fatura > "Klasoru ac" ile tek tikla ulasilir.
+        this.designsDir = path.join(host.dataDir, 'dizaynlar');
+        fs.mkdirSync(this.designsDir, { recursive: true });
+        this.logFile = path.join(host.dataDir, 'efatura-log.txt');
         this.timer = null;
         this.running = false;
         this.lastRun = null;
@@ -118,8 +122,17 @@ class Integration {
     key(ctx) { return `F${ctx.firmaNo}D${ctx.donemNo}`; }
     documentKey(ctx, row) { return `${this.key(ctx)}:${row.IND}`; }
 
+    // Ayarlardaki tus. Varsayilan KAPALI: guncellemeyle herkese dagitildigi icin
+    // musteri acmadikca hicbir sey yapilmaz. enabledAt, acildigi an baslangic icin.
+    enabledInfo() {
+        const e = this.host.getEnabled ? this.host.getEnabled() : null;
+        return { enabled: !!(e && e.enabled), enabledAt: (e && e.enabledAt) || null };
+    }
+
     claimsWatcherDocument(item) {
-        return !!item
+        // Kapaliyken belge mesajlari eskisi gibi metin olarak gitmeye devam eder.
+        return this.enabledInfo().enabled
+            && !!item
             && item.docType === 'satisFaturasi'
             && String(item.evrak || '').trim().length === 16;
     }
@@ -155,6 +168,11 @@ class Integration {
         const gate = this.host.gate ? this.host.gate('watcher') : { ok: true };
         if (gate && gate.ok === false) return { paused: gate.reason || 'gonderim limiti', belgeNo: row.BELGENO };
 
+        if (!renderer.hasAnyDesign(this.designsDir, row.DOCUMENT_TYPE)) {
+            const base = row.DOCUMENT_TYPE === 'earsiv' ? 'earchive' : 'invoice';
+            throw new Error(`dizayn yok, gonderilmedi: ${base}.xslt veya ${base}_<VKN>.xslt dizaynlar klasorune konmali`);
+        }
+
         const consoleDir = exporter.findConsoleDir(this.settings.consoleDir);
         const exported = await exporter.exportInvoice({
             ind: row.IND,
@@ -170,7 +188,7 @@ class Integration {
         try {
             const rendered = await renderer.render({
                 integrationDir: this.host.integrationDir,
-                designsDir: path.join(this.host.integrationDir, 'designs'),
+                designsDir: this.designsDir,
                 documentType: row.DOCUMENT_TYPE,
                 invoiceVkn: this.settings.invoiceVkn,
                 xml: exported.xml,
@@ -291,6 +309,8 @@ class Integration {
 
     async tick() {
         if (this.running) return { skipped: 'onceki tarama suruyor' };
+        const { enabled, enabledAt } = this.enabledInfo();
+        if (!enabled) return { skipped: 'ayarlardan kapali' };
         this.running = true;
         this.lastRun = new Date().toISOString();
         try {
@@ -300,10 +320,14 @@ class Integration {
             if (!ctx) return { skipped: 'firma secilmemis' };
             const ctxKey = this.key(ctx);
             let stateCtx = this.state.context(ctxKey);
-            if (!stateCtx) {
+            // Baslangic, tusun ACILDIGI an alinir: kapaliyken (ya da eski surumde) kesilen
+            // faturalar acildiktan sonra toplu gitmesin.
+            const staleBaseline = stateCtx && enabledAt
+                && !(Date.parse(stateCtx.initializedAt) >= Date.parse(enabledAt));
+            if (!stateCtx || staleBaseline) {
                 const max = await db.maxInvoiceInd(pool, ctx);
                 this.state.init(ctxKey, max);
-                this.log('INFO', `${ctxKey} ilk kurulum: mevcut faturalar atlandi, baslangic IND=${max}`);
+                this.log('INFO', `${ctxKey} gonderim acildi: mevcut faturalar atlandi, baslangic IND=${max}`);
                 return { initialized: true, context: ctxKey, baselineMax: max };
             }
 
@@ -343,7 +367,8 @@ class Integration {
                     const previous = this.state.doc(itemKey) || {};
                     this.state.setDoc(itemKey, { status: 'error', attempts: Number(previous.attempts || 0) + 1, lastError: e.message });
                     this.lastError = e.message;
-                    this.log('ERROR', `${row.BELGENO} islenemedi: ${e.message}`);
+                    // Ayni hata her taramada tekrarlanir (ornegin dizayn yok); log bir kez yazilsin.
+                    if (previous.lastError !== e.message) this.log('ERROR', `${row.BELGENO} islenemedi: ${e.message}`);
                     results.push({ belgeNo: row.BELGENO, error: e.message });
                     cursor = Number(row.IND);
                     break;
@@ -376,7 +401,7 @@ class Integration {
         run();
         this.timer = setInterval(run, Math.max(10, Number(this.settings.pollSeconds) || 30) * 1000);
         this.timer.unref && this.timer.unref();
-        this.log('INFO', `entegrasyon basladi; dizayn klasoru ${path.join(this.host.integrationDir, 'designs')}`);
+        this.log('INFO', `entegrasyon basladi (${this.enabledInfo().enabled ? 'acik' : 'ayarlardan kapali'}); dizayn klasoru ${this.designsDir}`);
     }
 
     stop() {
@@ -389,7 +414,12 @@ class Integration {
         this.refreshTaskState();
         if (this.taskReady === true) task = 'hazir';
         else if (this.taskReady === false) task = 'kurulum-gerekli';
+        let designs = [];
+        try { designs = fs.readdirSync(this.designsDir).filter(f => /\.xslt$/i.test(f)); } catch { /* klasor yok */ }
         return {
+            ...this.enabledInfo(),
+            designs,
+            logFile: this.logFile,
             running: !!this.timer,
             busy: this.running,
             lastRun: this.lastRun,
@@ -398,7 +428,7 @@ class Integration {
             task,
             testPhone: this.testPhone || null,
             dataDir: this.host.dataDir,
-            designsDir: path.join(this.host.integrationDir, 'designs'),
+            designsDir: this.designsDir,
         };
     }
 }

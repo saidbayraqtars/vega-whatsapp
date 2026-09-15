@@ -19,23 +19,36 @@ function supplierVkn(xml) {
     return value || '';
 }
 
+const designBase = documentType => (documentType === 'earsiv' ? 'earchive' : 'invoice');
+
+// Vega'nin kendi duzeni: e-Fatura invoice.xslt, e-Arsiv earchive.xslt. Birden
+// fazla firma varsa firmaya ozel invoice_<VKN/TCKN>.xslt once aranir. Kuruluma
+// gomulu yedek dizayn YOK: dosya bulunamazsa belge gonderilmez.
 function designCandidates(designsDir, documentType, xml, configuredVkn) {
-    const base = documentType === 'earsiv' ? 'earchive' : 'invoice';
-    const vkn = String(configuredVkn || supplierVkn(xml) || '').trim();
-    const profile = xmlValue(xml, 'ProfileID').replace(/[^A-Za-z0-9_-]/g, '');
+    const base = designBase(documentType);
+    const vkn = String(configuredVkn || supplierVkn(xml) || '').trim().replace(/[^0-9]/g, '');
     return [
-        vkn && path.join(designsDir, vkn, `${base}.xslt`),
         vkn && path.join(designsDir, `${base}_${vkn}.xslt`),
-        profile && path.join(designsDir, `${base}_${profile}.xslt`),
-        path.join(designsDir, 'default', `${base}.xslt`),
         path.join(designsDir, `${base}.xslt`),
     ].filter(Boolean);
+}
+
+// Disa aktarma (yonetici gorevi) calistirilmadan once ucuz on kontrol:
+// bu tur icin klasorde hic dizayn yoksa belgeyi hic isleme alma.
+function hasAnyDesign(designsDir, documentType) {
+    const base = designBase(documentType);
+    try {
+        return fs.readdirSync(designsDir).some(f => f.toLowerCase() === `${base}.xslt`
+            || (f.toLowerCase().startsWith(`${base}_`) && f.toLowerCase().endsWith('.xslt')));
+    } catch { return false; }
 }
 
 function selectDesign(opts) {
     const candidates = designCandidates(opts.designsDir, opts.documentType, opts.xml, opts.invoiceVkn);
     const selected = candidates.find(f => fs.existsSync(f));
-    if (!selected) throw new Error(`${opts.documentType} XSLT bulunamadi. Aranan yer: ${opts.designsDir}`);
+    if (!selected) {
+        throw new Error(`dizayn bulunamadi, gonderilmedi: ${candidates.map(f => path.basename(f)).join(' / ')} (${opts.designsDir})`);
+    }
     return { selected, candidates };
 }
 
@@ -92,4 +105,4 @@ async function render(opts) {
     return { pdf, design: path.relative(opts.designsDir, selected) };
 }
 
-module.exports = { render, selectDesign, designCandidates, supplierVkn, xmlValue, runXslt, htmlToPdf };
+module.exports = { render, selectDesign, designCandidates, hasAnyDesign, supplierVkn, xmlValue, runXslt, htmlToPdf };

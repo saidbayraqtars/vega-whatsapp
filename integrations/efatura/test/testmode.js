@@ -18,6 +18,8 @@ const { Integration } = require('../index');
         resolveCariContacts: async () => new Map(contact ? [[5, contact]] : []),
         waSend: async (phone, text, media) => { sends.push({ phone, text, media }); return { success: true, id: 'm' + sends.length }; },
     });
+    fs.mkdirSync(path.join(dir, 'dizaynlar'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'dizaynlar', 'earchive.xslt'), '<x/>');
     const row = { IND: 7, BELGENO: 'ODM2026000000706', TARIH: new Date(), TUTAR: 10, CARIIND: 5, DOCUMENT_TYPE: 'earsiv' };
     const ctx = { firmaNo: '0103', donemNo: '0015' };
 

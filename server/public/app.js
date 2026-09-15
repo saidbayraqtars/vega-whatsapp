@@ -806,9 +806,56 @@ async function openSettings() {
             } else { wr.style.display = 'none'; }
         }
     } catch { /* yok say */ }
+    await loadEfatura();
     await loadSettingsFirmalar();
     $('settingsModal').classList.remove('hidden');
 }
+
+// e-Fatura PDF: yalnız entegrasyon kuruluysa görünür; varsayılan kapalı.
+async function loadEfatura() {
+    $('ef_result').style.display = 'none';
+    try {
+        const r = await api('/integrations');
+        const ef = r.success && (r.data || []).find(x => x.id === 'efatura');
+        $('ef_wrap').classList.toggle('hidden', !ef);
+        if (!ef) return;
+        $('ef_enabled').checked = !!ef.enabled;
+        $('ef_sum').textContent = ef.enabled ? 'açık' : 'kapalı';
+        const d = ef.designs || [];
+        const lines = [
+            d.length ? 'Dizayn: ' + d.join(', ') : '⚠ Dizayn yok — klasöre invoice.xslt / earchive.xslt koyun, yoksa gönderilmez.',
+            'Birden fazla firma: invoice_<VKN>.xslt, earchive_<VKN>.xslt',
+        ];
+        if (ef.error) lines.push('⚠ ' + ef.error);
+        if (ef.task === 'kurulum-gerekli') lines.push('⚠ Yönetici görevi yok: integrations\\efatura\\tools\\setup-task.cmd');
+        if (ef.testPhone) lines.push('Test modu: tüm PDF\'ler ' + ef.testPhone + ' numarasına gider.');
+        if (ef.enabled && ef.lastError) lines.push('Son hata: ' + ef.lastError);
+        $('ef_info').textContent = lines.join('\n');
+    } catch { $('ef_wrap').classList.add('hidden'); }
+}
+
+$('ef_save').onclick = async () => {
+    const box = $('ef_result');
+    box.style.display = ''; box.className = 'hint'; box.textContent = 'Kaydediliyor...';
+    try {
+        const r = await api('/integrations/efatura/enabled', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: $('ef_enabled').checked }),
+        });
+        if (!r.success) { box.className = 'err'; box.textContent = r.message || 'Kaydedilemedi.'; return; }
+        await loadEfatura();
+        box.style.display = ''; box.className = 'hint ok';
+        box.textContent = r.enabled ? '✓ Açıldı. Bundan sonra kesilen faturalar gönderilir.' : '✓ Kapatıldı.';
+    } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
+};
+
+$('ef_open').onclick = async () => {
+    const box = $('ef_result');
+    try {
+        const r = await api('/integrations/efatura/open-folder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        if (!r.success) { box.style.display = ''; box.className = 'err'; box.textContent = r.message || 'Klasör açılamadı.'; }
+    } catch (e) { box.style.display = ''; box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
+};
 
 // WhatsApp Modu: seçime göre ilgili alan grubunu göster (relay adresi / Cloud API).
 function toggleRelayFields() {
