@@ -12,6 +12,22 @@ function atomicJson(file, value) {
     fs.renameSync(tmp, file);
 }
 
+// TR cep numarasi → 905xxxxxxxxx (bos/gecersizse '').
+function normalizeTestPhone(raw) {
+    let d = String(raw || '').replace(/\D/g, '');
+    if (d.startsWith('00')) d = d.slice(2);
+    if (d.startsWith('0')) d = '90' + d.slice(1);
+    else if (d.length === 10 && d.startsWith('5')) d = '90' + d;
+    return /^905\d{9}$/.test(d) ? d : '';
+}
+
+// Program Files'taki integration.json yonetici ister; makineye ozel ayarlar
+// ProgramData\...\efatura\settings.json ile ezilir (ornegin test numarasi).
+function readLocalSettings(dataDir) {
+    try { return JSON.parse(fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8')) || {}; }
+    catch { return {}; }
+}
+
 function formatMoney(value) {
     return (Number(value) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -71,8 +87,13 @@ class State {
 class Integration {
     constructor(host) {
         this.host = host;
-        this.settings = { pollSeconds: 30, batchLimit: 5, changeWindowDays: 7, ...(host.manifest.settings || {}) };
         fs.mkdirSync(host.dataDir, { recursive: true });
+        this.settings = {
+            pollSeconds: 30, batchLimit: 5, changeWindowDays: 7,
+            ...(host.manifest.settings || {}), ...readLocalSettings(host.dataDir),
+        };
+        // TEST MODU: dolu ise butun PDF/iptal mesajlari cari yerine bu numaraya gider.
+        this.testPhone = normalizeTestPhone(this.settings.testPhone);
         this.state = new State(path.join(host.dataDir, 'state.json'));
         this.logFile = path.join(host.dataDir, 'efatura.log');
         this.timer = null;
@@ -122,11 +143,11 @@ class Integration {
 
         const contacts = await this.host.resolveCariContacts(ctx.firmaNo, [Number(row.CARIIND)]);
         const contact = contacts.get(Number(row.CARIIND));
-        if (!contact || !contact.valid || !contact.phone) {
+        if (!this.testPhone && (!contact || !contact.valid || !contact.phone)) {
             this.state.setDoc(itemKey, { status: 'skipped', reason: 'gecerli cari cep telefonu yok', cariInd: row.CARIIND });
             return { skipped: 'telefon-yok', belgeNo: row.BELGENO };
         }
-        if (contact.pasif) {
+        if (contact && contact.pasif && !this.testPhone) {
             this.state.setDoc(itemKey, { status: 'skipped', reason: 'cari pasif', cariInd: row.CARIIND });
             return { skipped: 'cari-pasif', belgeNo: row.BELGENO };
         }
@@ -158,17 +179,19 @@ class Integration {
                 saxonDir: consoleDir,
                 electron: this.host.electron,
             });
-            const text = caption(mode === 'update' ? this.settings.updatedCaption : this.settings.caption, row, contact);
+            const who = contact || { name: '' };
+            const target = this.testTarget(who);
+            const text = target.prefix + caption(mode === 'update' ? this.settings.updatedCaption : this.settings.caption, row, who);
             const fileName = `${String(row.BELGENO).replace(/[^A-Za-z0-9._-]/g, '_')}.pdf`;
-            const result = await this.host.waSend(contact.phone, text, {
+            const result = await this.host.waSend(target.phone, text, {
                 kind: 'document', buffer: rendered.pdf, mimetype: 'application/pdf', fileName,
             }, { simulateTyping: true, typingMs: 1200, channel: 'watcher' });
             if (!result || result.success === false) throw new Error((result && (result.error || result.message)) || 'WhatsApp gonderimi basarisiz');
             this.state.setDoc(itemKey, {
                 status: 'sent', sentAt: new Date().toISOString(), type: row.DOCUMENT_TYPE,
                 contextKey: this.key(ctx), ind: Number(row.IND), belgeNo: row.BELGENO,
-                phone: contact.phone, cariInd: row.CARIIND, design: rendered.design,
-                contactName: contact.name || '', invoiceDate: row.TARIH, amount: row.TUTAR,
+                phone: target.phone, cariInd: row.CARIIND, design: rendered.design, testMode: !!this.testPhone,
+                contactName: who.name || '', invoiceDate: row.TARIH, amount: row.TUTAR,
                 currency: row.PARABIRIMI || 'TL', fingerprint: fingerprint(row),
                 waMessageId: result.id || (result.key && result.key.id) || null,
                 revision: mode === 'update' ? Number((old && old.revision) || 1) + 1 : 1,
@@ -179,12 +202,23 @@ class Integration {
                 recalled = await this.recallMessage(old);
                 this.state.setDoc(itemKey, { previousRecall: recalled, previousWaMessageId: old.waMessageId });
             }
-            this.log('INFO', `${row.BELGENO} ${row.DOCUMENT_TYPE} PDF ${mode === 'update' ? 'guncellenerek ' : ''}gonderildi (${rendered.design}, ${rendered.pdf.length} bayt)`);
+            this.log('INFO', `${row.BELGENO} ${row.DOCUMENT_TYPE} PDF ${mode === 'update' ? 'guncellenerek ' : ''}gonderildi (${rendered.design}, ${rendered.pdf.length} bayt)${this.testPhone ? ` [TEST → ${target.phone}]` : ''}`);
             return { sent: true, updated: mode === 'update', recalled, belgeNo: row.BELGENO, type: row.DOCUMENT_TYPE, design: rendered.design };
         } finally {
             try { fs.unlinkSync(htmlPath); } catch { /* gecici dosya yok */ }
             try { fs.unlinkSync(exported.xmlPath); } catch { /* Vega temp temizligi kritik degil */ }
         }
+    }
+
+    // Test modunda alici test numarasi olur; mesajin basina gercek alici yazilir ki
+    // testte kimin alacagi gorulsun.
+    testTarget(contact) {
+        if (!this.testPhone) return { phone: contact.phone, prefix: '' };
+        const real = contact && contact.phone ? contact.phone : 'telefon yok';
+        return {
+            phone: this.testPhone,
+            prefix: `🔔 TEST — gercek alici: ${(contact && contact.name) || '(cari adi yok)'} (${real})\n`,
+        };
     }
 
     async cancelOne(ctx, doc, row, reason) {
@@ -197,7 +231,9 @@ class Integration {
             BELGENO: doc.belgeNo, TARIH: doc.invoiceDate, TUTAR: doc.amount,
             PARABIRIMI: doc.currency, DOCUMENT_TYPE: doc.type,
         };
-        const text = caption(this.settings.cancelledCaption, invoice, { name: doc.contactName || '' });
+        // Test modunda gonderilen belge doc.phone'da zaten test numarasini tasir.
+        const prefix = (this.testPhone || doc.testMode) ? `🔔 TEST — gercek alici: ${doc.contactName || '(cari adi yok)'}\n` : '';
+        const text = prefix + caption(this.settings.cancelledCaption, invoice, { name: doc.contactName || '' });
         const result = await this.host.waSend(doc.phone, text, null, {
             simulateTyping: true, typingMs: 900, channel: 'watcher',
         });
@@ -360,6 +396,7 @@ class Integration {
             lastError: this.lastError,
             lastResult: this.lastResult,
             task,
+            testPhone: this.testPhone || null,
             dataDir: this.host.dataDir,
             designsDir: path.join(this.host.integrationDir, 'designs'),
         };
