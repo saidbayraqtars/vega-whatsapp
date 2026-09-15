@@ -160,11 +160,17 @@ const VEGA_ERR = {
     NOT_FOUND: 'Vega sunucusu bu işlemi henüz desteklemiyor — sunucu güncellenmeli.',
     SERVER_NOT_CONFIGURED: 'Vega sunucusunda Meta uygulama ayarı eksik — tedarikçinize bildirin.',
     NO_WABA: 'Numaranın WhatsApp Business hesabı (WABA) Vega sunucusunda tanımlı değil — tedarikçinize bildirin.',
+    NO_CREDIT: 'Kontör yetersiz — şablonlu WhatsApp mesajı gönderilemedi. Tedarikçinizden kontör yükletin.',
+    ACCOUNT_BLOCKED: 'Vega hesabınız kapatılmış — şablonlu WhatsApp mesajı gönderilemiyor. Tedarikçinize danışın.',
 };
 
 // Meta hata kodlarını kullanıcı diline indir; ham kodu da tut (destek için).
 function describeError(res) {
     const raw = res && res.json && res.json.error;
+    if (raw === 'NO_CREDIT' && res.json.cost != null) {
+        const j = res.json;
+        return `${VEGA_ERR.NO_CREDIT} (bakiye ${j.balance}, teslim bekleyen ${j.pending || 0}, gereken ${j.cost}) [Vega ${res.status}]`;
+    }
     if (typeof raw === 'string') return `${VEGA_ERR[raw] || raw} [Vega ${res.status}]`;
     const e = raw || null;
     if (!e) return `Sunucu yanıtı ${res?.status || '?'} (ayrıntı yok)`;

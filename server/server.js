@@ -52,6 +52,7 @@ const antiban = require('./antiban');
 const stats = require('./stats');
 const cloudapi = require('./cloudapi');
 const cloudinbox = require('./cloudinbox');
+const optout = require('./optout');
 const integrations = require('./integrations');
 const { buildExtrePdf } = require('./extre');
 
@@ -1418,12 +1419,10 @@ app.post('/api/vade', (req, res) => {
         'simulateTyping', 'template', 'headerTemplate', 'lineTemplate'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
-    const prev = vade.getConfig();
     vade.setConfig(patch);
-    // Firma/dönem değişince defter başka bir tabloyu işaret eder → sıfırla.
-    if (patch.firmaNo && (patch.firmaNo !== prev.firmaNo || patch.donemNo !== prev.donemNo)) {
-        vade.resetLedger();
-    }
+    // Defter firma/dönem değişince SİLİNMEZ: anahtar belgenin doğal kimliğidir (firma+cari+
+    // belge no+vade), dönemden bağımsız. Eskiden silinirdi ve önizle/test/kaydet her
+    // basıldığında seçim farklıysa bildirilmiş tüm çek/senetler yeniden gönderilirdi.
     res.json({ success: true, status: vade.getStatus() });
 });
 
@@ -2847,6 +2846,13 @@ async function runJob(job) {
             continue;
         }
 
+        // "DUR" yazmış kişiye toplu mesaj gitmez (BAŞLA yazana ya da listeden elle çıkarılana kadar).
+        if (optout.has(phone)) {
+            pushEvent(job, { ...base, status: 'optedOut', error: 'DUR yazdı — toplu mesaj istemiyor' });
+            job.results.push({ ...rcp, status: 'optedOut' });
+            continue;
+        }
+
         // Bağlantı yoksa burada bekle — alıcı atlanmaz, sırada bekler.
         if (!(await waitForWhatsApp(job))) { pushEvent(job, { type: 'cancelled', index: i }); break; }
 
@@ -2862,7 +2868,10 @@ async function runJob(job) {
             }
         }
 
-        const text = renderMessage(job.message, rcp);
+        let text = renderMessage(job.message, rcp);
+        // Baileys hattında çıkış yolu metne eklenir. Cloud modda toplu mesaj pencere dışında
+        // "genel_duyuru" şablonuna düşer, DUR cümlesi şablonda zaten var — iki kez yazılmasın.
+        if (job.optOutNote && !isCloud()) text = (text.trim() ? text.replace(/\s+$/, '') + '\n\n' : '') + optout.FOOTER;
         let result = await waSendX(phone, text, job.media, {
             simulateTyping: p.simulateTyping,
             typingMs: rand(1200, 2600),
@@ -2926,6 +2935,23 @@ function finalizeJob(job) {
     if (t.unref) t.unref();
 }
 
+// ─── DUR listesi (toplu mesajdan çıkanlar) ────────────────────────────────────
+app.get('/api/optout', (req, res) => {
+    res.json({ success: true, count: optout.count(), list: optout.list() });
+});
+
+app.post('/api/optout/remove', (req, res) => {
+    const removed = optout.remove(req.body && req.body.phone);
+    res.json({ success: removed, message: removed ? undefined : 'Numara listede yok.', count: optout.count() });
+});
+
+app.post('/api/optout/add', (req, res) => {
+    const phone = req.body && req.body.phone;
+    if (!normalizePhone(phone)) return res.status(400).json({ success: false, message: 'Geçersiz numara.' });
+    const added = optout.add(phone, { source: 'manual' });
+    res.json({ success: true, added, count: optout.count() });
+});
+
 app.post('/api/send-bulk', upload.single('media'), async (req, res) => {
     const st = waStatusX();
     if (!st.ready) return res.status(400).json({ success: false, message: isCloud() ? ('Cloud API hazır değil: ' + (st.error || '')) : 'WhatsApp bağlı değil. Önce QR okutun.' });
@@ -2964,6 +2990,7 @@ app.post('/api/send-bulk', upload.single('media'), async (req, res) => {
     const jobId = crypto.randomBytes(8).toString('hex');
     const job = {
         id: jobId, recipients, message, media, pacing,
+        optOutNote: req.body.optOutNote === '1',   // metin sonuna "DUR yazabilirsiniz" (yalnız Baileys)
         status: 'pending', cancelled: false,
         results: [], events: [], clients: new Set(),
         sentCount: 0, createdAt: Date.now(),
@@ -3248,8 +3275,23 @@ aiBot.configure({
 });
 // Hesap havuzu: gelen mesajlar bota gider (hangi hattan geldiği accountId ile),
 // günlük tavan kullanıcı ayarından okunur. Yerel modda oturumlar burada açılır.
+// DUR listesi: toplu mesajdan çıkmak isteyenler (data/optout.json).
+optout.configure({ dataDir: path.join(baseDir, 'data'), normalizePhone });
+
+// Gelen mesajın ilk durağı. Tek kelime "DUR"/"BAŞLA" listeyi günceller ve AI bota
+// GİTMEZ; onay yalnız liste gerçekten değiştiyse yazılır (tekrar "DUR" döngü açmasın).
+// Onay aynı hattan gider (accountId) — müşteri iki numaradan cevap görmesin.
+async function routeIncoming(m) {
+    const r = optout.handleIncoming(m.phone, m.text);
+    if (!r) return aiBot.handleIncoming(m);
+    console.log(`[DUR] ${m.phone} → ${r.action === 'stop' ? 'toplu listeden çıktı' : 'toplu listeye döndü'}${r.changed ? '' : ' (değişiklik yok)'}`);
+    if (!r.changed) return;
+    try { await waSendX(m.phone, optout.REPLY[r.action], null, { channel: 'aibot', accountId: m.accountId }); }
+    catch (e) { console.error('[DUR] onay gönderilemedi:', e.message); }
+}
+
 accounts.configure({
-    onIncoming: aiBot.handleIncoming,
+    onIncoming: routeIncoming,
     dailyCap: DEFAULT_PACING.dailyCap,
 });
 // Cloud API ('vega' yolu) gelen kutusu: Vega sunucusundaki olayları çekip Baileys
@@ -3260,8 +3302,9 @@ cloudinbox.configure({
     ack: (ids) => cloudapi.ackInbox(ids),
     onMessage: async (m) => {
         if (m.phone) { try { stats.onIncoming(m.phone); } catch { /* yok say */ } }
-        if (!m.forAi) return;
-        await aiBot.handleIncoming({ phone: m.phone, text: m.text, jid: `${m.phone}@s.whatsapp.net`, id: m.id, accountId: null });
+        // Eski mesaj: DUR yine listeye işlenir ama cevap yazılmaz.
+        if (!m.forAi) { optout.handleIncoming(m.phone, m.text); return; }
+        await routeIncoming({ phone: m.phone, text: m.text, jid: `${m.phone}@s.whatsapp.net`, id: m.id, accountId: null });
     },
     onStatus: (s) => { if (s.code) { try { stats.onAck(s.id, s.code); } catch { /* yok say */ } } },
     log: (msg) => { try { console.log('[Cloud gelen]', msg); } catch { /* yok say */ } },

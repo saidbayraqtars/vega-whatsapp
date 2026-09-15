@@ -240,14 +240,24 @@ function fmtAmount(n) {
     return num.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-// Yerel gün başlangıcı (UTC kayması vade gününü bir gün kaydırmasın).
-function dayStart(d) {
-    const x = new Date(d);
-    return new Date(x.getFullYear(), x.getMonth(), x.getDate());
+// ─── Tarih: yalnız 'YYYY-MM-DD' metniyle çalışılır ──────────────────────────
+// mssql sürücüsü DATETIME'ı UTC sanar (useUTC varsayılanı): Vega'nın yerel saatle
+// yazdığı '2026-09-20 22:30' JS'e 20T22:30Z gelir, TR'de (UTC+3) bu 21 Eylül 01:30'dur
+// → vade bir gün kayar, "kalan gün" ve mesajdaki tarih yanlış çıkar. Aynı kayma
+// @f/@t parametrelerinde ters yönde olur. Bu yüzden VADE SQL'de CONVERT(..., 23) ile
+// metne çevrilir, parametreler de metin gider; saat dilimi hesaba hiç girmez.
+const pad2 = (n) => String(n).padStart(2, '0');
+const localYmd = (d = new Date()) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+function ymdUtc(s) {
+    const [y, m, d] = String(s).split('-').map(Number);
+    return Date.UTC(y, m - 1, d);
 }
-function daysBetween(from, to) {
-    return Math.round((dayStart(to).getTime() - dayStart(from).getTime()) / 86400000);
+function addDaysYmd(s, n) {
+    const t = new Date(ymdUtc(s) + n * 86400000);
+    return `${t.getUTCFullYear()}-${pad2(t.getUTCMonth() + 1)}-${pad2(t.getUTCDate())}`;
 }
+const daysUntil = (ymd) => Math.round((ymdUtc(ymd) - ymdUtc(localYmd())) / 86400000);
+const trDate = (ymd) => { const [y, m, d] = String(ymd || '').split('-'); return d ? `${d}.${m}.${y}` : ''; };
 function kalanLabel(n) {
     if (n < 0) return `${Math.abs(n)} gün geçti`;
     if (n === 0) return 'Bugün vadesi';
@@ -293,8 +303,12 @@ function renderTemplate(tpl, vars) {
 }
 
 // Tarama seçenekleri tek yerden — üç çağıran (poll / önizleme / test) aynı filtreyi kullansın.
+// VİSA KAPALI (config'te açık olsa bile): satırdaki VADE taksit vadesi değil, peşinde banka
+// blokajı, taksitlide işlem tarihinin aynısı (başlıktaki VİSA notu). Açık bırakılan
+// kurulumlarda "yanlış tarihli" bildirim üretiyordu; gerçek taksit takvimi ayrı tabloda.
+const activeTypes = () => ({ ...config.types, visa: false });
 const scanOpts = () => ({
-    types: config.types,
+    types: activeTypes(),
     direction: config.direction,
     visaOnlyTaksit: config.visaOnlyTaksit !== false,
 });
@@ -362,7 +376,8 @@ async function buildQuery(pool, opts) {
             parts.push(`
                 SELECT '${t.id}' AS TUR, '${side === 'GIR' ? 'alinan' : 'verilen'}' AS YON,
                        h.IND AS HIND, h.BELGELINK AS DIND, h.EVRAKNO AS FISIND,
-                       h.VADE AS VADE, h.TUTAR AS TUTAR, h.PARABIRIMI AS PARABIRIMI,
+                       h.VADE AS VADE, CONVERT(char(10), h.VADE, 23) AS VADEYMD,
+                       h.TUTAR AS TUTAR, h.PARABIRIMI AS PARABIRIMI,
                        h.FIRMANO AS FIRMANO, h.BELGENO AS BELGENO,
                        CAST(${t.ek} AS nvarchar(120)) AS EK,
                        CAST(${t.taksit} AS decimal(18,2)) AS TAKSIT,
@@ -371,7 +386,8 @@ async function buildQuery(pool, opts) {
                 FROM [${harTbl}] h
                 JOIN [${full}] d ON d.IND = h.BELGELINK AND d.EVRAKNO = h.EVRAKNO
                 LEFT JOIN [${basTbl}] b ON b.IND = h.EVRAKNO${bankaJoin}
-                WHERE h.VADE >= @f AND h.VADE < @t AND ISNULL(b.IPTAL, 0) = 0${extra}`);
+                WHERE h.VADE >= CAST(@f AS date) AND h.VADE < DATEADD(day, 1, CAST(@t AS date))
+                  AND ISNULL(b.IPTAL, 0) = 0${extra}`);
         }
     }
     if (!parts.length) return { sql: null, missing };
@@ -384,14 +400,13 @@ async function fetchDueDocs(pool, maxDays, opts) {
     if (!q) throw new Error('Firma/dönem seçilmemiş.');
     if (!q.sql) throw new Error('İzlenecek belge tablosu bulunamadı (seçilen tipler bu dönemde yok).');
 
-    const from = dayStart(new Date());
-    const to = new Date(from.getTime() + (maxDays + 1) * 86400000);
+    const from = localYmd();
     const r = pool.request();
-    r.input('f', deps.sql.DateTime, from);
-    r.input('t', deps.sql.DateTime, to);
+    r.input('f', deps.sql.NVarChar, from);
+    r.input('t', deps.sql.NVarChar, addDaysYmd(from, maxDays));
     const rows = (await r.query(q.sql)).recordset;
 
-    return rows.map(row => ({
+    const docs = rows.map(row => ({
         tur: row.TUR,
         turAdi: typeLabel(row.TUR),
         yon: row.YON,
@@ -399,8 +414,8 @@ async function fetchDueDocs(pool, maxDays, opts) {
         hind: row.HIND,
         dind: row.DIND,
         fisInd: row.FISIND,
-        vade: row.VADE,
-        kalanGun: daysBetween(new Date(), row.VADE),
+        vade: row.VADEYMD,                       // 'YYYY-MM-DD' — saat dilimsiz
+        kalanGun: daysUntil(row.VADEYMD),
         tutar: Number(row.TUTAR) || 0,
         parabirimi: row.PARABIRIMI || 'TL',
         firmano: row.FIRMANO,
@@ -410,10 +425,33 @@ async function fetchDueDocs(pool, maxDays, opts) {
         taksit: row.TAKSIT == null ? null : Number(row.TAKSIT),
         fisno: row.FISNO || '',
     }));
+
+    // Aynı belge birden çok ödeme satırıyla gelebilir (fiş düzenlenip satırlar yeniden
+    // yazıldığında / aynı çek iki satıra bölündüğünde) → kimliğe göre tekille.
+    const seen = new Set();
+    return docs.filter(d => {
+        const id = docIdentity(d);
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+    });
 }
 
-// Defter anahtarı: aynı belge + aynı eşik ikinci kez bildirilmez.
-const docKey = (d, esik) => `${prefix()}:${d.yon}:${d.tur}:${d.dind}:${d.hind}:${esik}`;
+// ─── Defter anahtarı: aynı belge + aynı eşik ikinci kez bildirilmez ──────────
+// Kimlik DOĞAL alanlardan kurulur: firma + yön + tip + cari + belge no + vade.
+// ESKİDEN satır IND'leri (BELGELINK + hareket IND) kullanılıyordu; Vega fişi
+// düzenleyince ödeme satırlarını silip yeniden yazar → yeni IND → aynı çek "yeni
+// belge" sanılıp İKİNCİ kez bildiriliyordu. Dönem de anahtarda yok: firma/dönem
+// seçimi değişince defteri silmek gerekmez (eskiden siliniyordu → hepsi yeniden gidiyordu).
+// Vade değişirse kimlik değişir → yeni tarihle bir kez daha haber verilir (istenen).
+function docIdentity(d) {
+    const no = d.belgeno ? d.belgeno.toLocaleUpperCase('tr-TR') : `#${d.dind}`;
+    return `F${config.firmaNo}:${d.yon}:${d.tur}:${d.firmano}:${no}:${d.vade}`;
+}
+const docKey = (d, esik) => `${docIdentity(d)}:${esik}`;
+// Güncellemeden önce yazılmış defter kayıtları da saysın (geçişte ikinci mesaj gitmesin).
+const legacyKey = (d, esik) => `${prefix()}:${d.yon}:${d.tur}:${d.dind}:${d.hind}:${esik}`;
+const wasSent = (d, esik) => !!(sentKeys[docKey(d, esik)] || sentKeys[legacyKey(d, esik)]);
 
 function pruneSent() {
     const cut = Date.now() - SENT_WINDOW_MS;
@@ -432,13 +470,13 @@ function pickThreshold(d) {
     const cands = config.days.filter(t => d.kalanGun <= t);
     if (!cands.length) return null;
     const t0 = cands[0];                              // days küçükten büyüğe sıralı
-    if (sentKeys[docKey(d, t0)]) return null;         // bu belge zaten bildirildi
+    if (wasSent(d, t0)) return null;                  // bu belge zaten bildirildi
     return { esik: t0, alsoMark: cands.slice(1) };
 }
 
 function markSent(d, pick) {
     const at = new Date().toISOString();
-    const vade = d.vade ? new Date(d.vade).toISOString() : null;
+    const vade = d.vade || null;
     sentKeys[docKey(d, pick.esik)] = { at, vade };
     for (const t of pick.alsoMark) sentKeys[docKey(d, t)] = { at, vade, skipped: true };
     saveSent();
@@ -536,7 +574,7 @@ function docVars(d, bizFirma, contact) {
         belgeno: d.belgeno,
         banka: d.ek,
         taksit: d.taksit && d.taksit > 1 ? `${d.taksit} taksit` : '',
-        vade: d.vade ? new Date(d.vade).toLocaleDateString('tr-TR') : '',
+        vade: trDate(d.vade),
         kalan: kalanLabel(d.kalanGun),
         gun: d.kalanGun,
         tutar: fmtAmount(d.tutar),
@@ -653,7 +691,7 @@ function start() {
     if (!config.firmaNo || !config.donemNo) { lastError = 'Firma/dönem seçilmemiş.'; return false; }
     if (!targetPhones().length) { lastError = 'Geçerli bildirim numarası yok.'; return false; }
     if (!config.days.length) { lastError = 'Kalan gün eşiği girilmemiş.'; return false; }
-    if (!Object.values(config.types).some(Boolean)) { lastError = 'En az bir belge tipi seçin (çek/senet/visa).'; return false; }
+    if (!Object.values(activeTypes()).some(Boolean)) { lastError = 'En az bir belge tipi seçin (çek/senet).'; return false; }
     stop();
     running = true;
     config.enabled = true;
@@ -693,7 +731,7 @@ function getStatus() {
         firmaNo: config.firmaNo, donemNo: config.donemNo,
         prefix: prefix(),
         days: config.days,
-        types: { ...config.types },
+        types: activeTypes(),
         visaOnlyTaksit: config.visaOnlyTaksit !== false,
         direction: config.direction,
         minAmount: config.minAmount || 0,
@@ -737,9 +775,9 @@ async function listUpcoming(days) {
             tur: d.tur, turAdi: d.turAdi, yon: d.yon, yonAdi: d.yonAdi,
             belgeno: d.belgeno, banka: d.ek, taksit: d.taksit,
             firma: c.firma || c.name || String(d.firmano), kod: c.kod || '',
-            vade: d.vade, kalanGun: d.kalanGun, kalan: kalanLabel(d.kalanGun),
+            vade: d.vade, vadeStr: trDate(d.vade), kalanGun: d.kalanGun, kalan: kalanLabel(d.kalanGun),
             tutar: d.tutar, tutarStr: fmtAmount(d.tutar),
-            bildirildi: config.days.some(t => !!sentKeys[docKey(d, t)]),
+            bildirildi: config.days.some(t => wasSent(d, t)),
         };
     });
 }
@@ -753,7 +791,7 @@ async function sendTest() {
     const bizFirma = await getBizFirma();
     let vars = {
         firma: 'ÖRNEK MÜŞTERİ A.Ş.', kod: 'M00001', tur: 'Çek', yon: 'Alınan',
-        belgeno: '1234567', banka: 'ZİRAAT', taksit: '', vade: new Date(Date.now() + 3 * 86400000).toLocaleDateString('tr-TR'),
+        belgeno: '1234567', banka: 'ZİRAAT', taksit: '', vade: trDate(addDaysYmd(localYmd(), 3)),
         kalan: kalanLabel(3), gun: 3, tutar: fmtAmount(125000), fisno: 'A0000001', firmaadi: bizFirma,
     };
     try {
@@ -769,7 +807,9 @@ async function sendTest() {
         }
     } catch (e) { console.error('[Vade] test verisi okunamadı:', e.message); }
 
-    const text = '🔔 TEST\n' + renderTemplate(config.template || DEFAULT_TEMPLATE, vars);
+    // Test en yakın GERÇEK belgeyi kullanır → gerçek bildirimle karışıp "aynı çek iki kez
+    // geldi" sanılmasın diye başlık açıkça yazılır.
+    const text = '🔔 TEST MESAJI — gerçek bildirim değildir\n' + renderTemplate(config.template || DEFAULT_TEMPLATE, vars);
     let ok = 0; const errors = [];
     for (const phone of phones) {
         const res = await deps.waSend(phone, text, null, { simulateTyping: false, channel: 'vade' });

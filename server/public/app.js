@@ -140,6 +140,9 @@ async function enterApp() {
     await loadFirmalar();
     startWaPolling();
     loadLicense();
+    mountTemplateEditor($('msgText'), ['{firma}', '{unvan}', '{kod}']);
+    // Açılış ekranı Belge Mesajları (toplu mesaj artık varsayılan değil).
+    try { await initWatcherView(); } catch (e) { console.error('belge mesajları açılamadı:', e); }
 }
 
 async function loadFirmalar() {
@@ -266,15 +269,104 @@ function updateSelCount() {
 // ═══════════════════════════════════════════════════════════════════════════
 //  Mesaj / değişken / medya
 // ═══════════════════════════════════════════════════════════════════════════
-document.querySelectorAll('.chip').forEach(c => {
-    c.onclick = () => {
-        const ta = $('msgText');
-        const v = c.dataset.var;
+// ─── Mesaj taslağı editörü (tüm ekranlarda ortak) ────────────────────────────
+// Metin kutusunun altına: insan diliyle alan etiketleri (tıkla → {alan} eklenir),
+// isteğe bağlı "hazır metin" seçici ve WhatsApp balonu gibi canlı önizleme.
+// Kullanıcı {firma} gibi kodları ezberlemek zorunda kalmaz; ne gideceğini görür.
+const SAMPLE_TODAY = new Date().toLocaleDateString('tr-TR');
+const TPL_FIELDS = {
+    '{firma}': ['Müşteri adı', 'ÖRNEK TİCARET LTD.'],
+    '{ad}': ['Müşteri adı', 'ÖRNEK TİCARET LTD.'],
+    '{unvan}': ['Ünvan', 'ÖRNEK TİCARET LTD. ŞTİ.'],
+    '{kod}': ['Cari kodu', 'M0001'],
+    '{kodpar}': ['Cari kodu (parantezli)', ' (M0001)'],
+    '{tutar}': ['Tutar', '12.500,00'],
+    '{evrak}': ['Belge no', 'A-000123'],
+    '{tarih}': ['Tarih', SAMPLE_TODAY],
+    '{saat}': ['Saat', '14:30'],
+    '{bakiye}': ['Bakiye', '48.300,00'],
+    '{kalan}': ['Kalan', '48.300,00'],
+    '{durum}': ['Borç/Alacak', 'Borç'],
+    '{belge}': ['Belge türü', 'Satış Faturası'],
+    '{firmaadi}': ['Firmanızın adı', 'Firmanız'],
+    '{eskiTutar}': ['Eski tutar', '10.000,00'],
+    '{yeniTutar}': ['Yeni tutar', '12.500,00'],
+    '{gecikmeGun}': ['Gecikme günü', '15'],
+    '{enEskiVade}': ['En eski vade', SAMPLE_TODAY],
+    '{tur}': ['Çek/Senet', 'Çek'],
+    '{yon}': ['Alınan/Verilen', 'Alınan'],
+    '{belgeno}': ['Çek/senet no', '1234567'],
+    '{banka}': ['Banka', 'AKBANK'],
+    '{vade}': ['Vade tarihi', SAMPLE_TODAY],
+    '{gun}': ['Kalan gün', '3'],
+    '{adet}': ['Belge sayısı', '4'],
+    '{toplam}': ['Toplam tutar', '85.000,00'],
+};
+
+function renderSample(text, overrides) {
+    let s = String(text || '').replace(/\{[a-zA-Z]+\}/g, (tok) => {
+        const k = Object.keys(TPL_FIELDS).find(x => x.toLowerCase() === tok.toLowerCase());
+        if (overrides && k && overrides[k] != null) return overrides[k];
+        return k ? TPL_FIELDS[k][1] : tok;
+    });
+    // {a|b|c} spintax'ında ilk seçeneği göster.
+    s = s.replace(/\{([^{}]*\|[^{}]*)\}/g, (_m, g) => g.split('|')[0]);
+    return s;
+}
+
+// ta: textarea · fields: ['{firma}', ...]
+// opts: { presets: [{t, v}], overrides: {'{kalan}': '3 gün kaldı'}, labels: {'{kalan}': 'Kalan süre'}, caption }
+// Aynı kutuya ikinci kez çağrılırsa yalnız önizlemeyi tazeler (yükleme sonrası değer değişti).
+function mountTemplateEditor(ta, fields, opts) {
+    if (!ta) return;
+    if (ta._tplRefresh) { ta._tplRefresh(); return; }
+    opts = opts || {};
+    const labelOf = (f) => (opts.labels && opts.labels[f]) || TPL_FIELDS[f][0];
+
+    const tools = document.createElement('div');
+    tools.className = 'tpl-tools';
+    const seen = new Set();
+    tools.innerHTML = '<span class="tpl-label">Ekle:</span>' + fields
+        .filter(f => TPL_FIELDS[f] && !seen.has(labelOf(f)) && seen.add(labelOf(f)))
+        .map(f => `<span class="chip" data-tok="${f}" title="${f}">${esc(labelOf(f))}</span>`).join('');
+    if (opts.presets && opts.presets.length) {
+        const sel = document.createElement('select');
+        sel.className = 'tpl-preset';
+        sel.innerHTML = '<option value="">Hazır metin seç…</option>' +
+            opts.presets.map((p, i) => `<option value="${i}">${esc(p.t)}</option>`).join('');
+        sel.onchange = () => {
+            const p = opts.presets[+sel.value];
+            sel.value = '';
+            if (!p) return;
+            if (ta.value.trim() && !confirm('Mevcut metin hazır metinle değiştirilsin mi?')) return;
+            ta.value = p.v;
+            refresh();
+        };
+        tools.appendChild(sel);
+    }
+    const cap = document.createElement('div');
+    cap.className = 'bubble-cap';
+    cap.textContent = 'Müşteri böyle görecek';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+
+    const refresh = () => { bubble.textContent = renderSample(ta.value, opts.overrides); };
+    tools.addEventListener('click', (e) => {
+        const chip = e.target.closest('[data-tok]');
+        if (!chip) return;
         const pos = ta.selectionStart ?? ta.value.length;
-        ta.value = ta.value.slice(0, pos) + v + ta.value.slice(pos);
+        const tok = chip.dataset.tok;
+        ta.value = ta.value.slice(0, pos) + tok + ta.value.slice(ta.selectionEnd ?? pos);
         ta.focus();
-    };
-});
+        ta.selectionStart = ta.selectionEnd = pos + tok.length;
+        refresh();
+    });
+    ta.addEventListener('input', refresh);
+    ta._tplRefresh = refresh;
+    ta.after(tools, cap, bubble);
+    if (opts.caption) cap.textContent = opts.caption;
+    refresh();
+}
 
 $('mediaInput').onchange = () => {
     const f = $('mediaInput').files[0];
@@ -323,6 +415,38 @@ function updateEstimate() {
 }
 ['p_min', 'p_max', 'p_batch', 'p_cap', 'p_pmin', 'p_pmax'].forEach(id => $(id).oninput = updateEstimate);
 $('bulkAllPhones').onchange = updateEstimate;
+
+// ─── DUR listesi: toplu mesajdan çıkanlar ─────────────────────────────────────
+async function loadOptout() {
+    let r;
+    try { r = await api('/optout'); } catch { return; }
+    if (!r || !r.success) return;
+    const n = r.count || 0;
+    const list = $('optoutList');
+    list.innerHTML = (r.list || []).map(x => `<div class="logline">
+        <span>${esc(x.phone)} <span class="muted">— ${new Date(x.at).toLocaleString('tr-TR')}${x.source === 'manual' ? ' · elle eklendi' : ''}</span></span>
+        <button class="btn ghost sm" data-optout-remove="${esc(x.phone)}">Listeden çıkar</button>
+    </div>`).join('');
+    if (!n) list.classList.add('hidden');
+    $('optoutInfo').innerHTML = n
+        ? `DUR listesinde <b>${n}</b> kişi — toplu mesaj bu kişilere gitmez. <a href="#" id="optoutToggle">${list.classList.contains('hidden') ? 'Listeyi göster' : 'Gizle'}</a>`
+        : 'Müşteri tek kelime <b>DUR</b> yazarsa toplu mesaj listesinden çıkar, <b>BAŞLA</b> yazarsa geri döner.';
+    const toggle = $('optoutToggle');
+    if (toggle) toggle.onclick = (ev) => {
+        ev.preventDefault();
+        list.classList.toggle('hidden');
+        toggle.textContent = list.classList.contains('hidden') ? 'Listeyi göster' : 'Gizle';
+    };
+}
+
+$('optoutList').onclick = async (ev) => {
+    const phone = ev.target.dataset && ev.target.dataset.optoutRemove;
+    if (!phone) return;
+    if (!confirm(`${phone} DUR listesinden çıkarılsın mı?\nBu kişiye yeniden toplu mesaj gidebilir.`)) return;
+    await api('/optout/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }) });
+    loadOptout();
+};
+loadOptout();
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  WhatsApp durum / QR
@@ -639,7 +763,7 @@ async function openSettings() {
     try {
         const ab = await api('/antiban');
         if (ab.success) {
-            $('ab_dailyCap').value = ab.limits.userDailyCap || '';
+            $('abg_dailyCap').value = ab.limits.userDailyCap || '';
             $('ab_warnAt').value = (ab.limits.warnAt != null) ? ab.limits.warnAt : 120;
             $('ab_guardEnabled').checked = !!(ab.guard && ab.guard.enabled);
             $('ab_noReplyLimit').value = (ab.guard && ab.guard.noReplyLimit) || 6;
@@ -693,6 +817,9 @@ function toggleRelayFields() {
     if (rel) rel.style.display = (mode === 'relay') ? '' : 'none';
     const cl = $('set_cloudFields');
     if (cl) cl.style.display = (mode === 'cloud') ? '' : 'none';
+    // Relay parolası yerel (ana PC kabul eder) ve relay (ikinci PC bağlanır) içindir; Cloud'da anlamsız.
+    const tw = $('set_relayTokenWrap');
+    if (tw) tw.style.display = (mode === 'cloud') ? 'none' : '';
     // Vega sunucusu yolunda anahtar/API sürümü alanları anlamsız → gizle.
     const direct = $('set_cloudVia').value === 'direct';
     $('set_cloudDirect').style.display = direct ? '' : 'none';
@@ -702,8 +829,8 @@ function toggleRelayFields() {
     $('set_cloudVegaTools').style.display = direct ? 'none' : '';
     $('set_cloudTplTools').style.display = direct ? 'none' : '';
     $('set_cloudLimitsHint').innerHTML = direct
-        ? '⚠ Doğrudan bağlantıda <b>gelen mesaj alınamaz</b> (webhook bu bilgisayara ulaşamaz): AI Oto-Yanıt çalışmaz, Pano\'da teslim/okundu sayacı boş kalır, gönderilen mesaj <b>geri çekilemez</b>.'
-        : 'Gelen mesajlar Vega sunucusundan <b>15 sn\'de bir</b> çekilir: AI Oto-Yanıt ve Pano teslim/okundu sayacı çalışır. <b>10 dakikadan eski</b> mesaja AI cevap yazmaz, yalnız listelenir. Gönderilen mesaj <b>geri çekilemez</b>.';
+        ? '⚠ Doğrudan bağlantıda gelen mesaj alınamaz (AI Oto-Yanıt çalışmaz), gönderilen mesaj geri çekilemez.'
+        : 'Gönderilen mesaj geri çekilemez.';
 }
 $('set_waMode').onchange = toggleRelayFields;
 $('set_cloudVia').onchange = toggleRelayFields;
@@ -756,7 +883,10 @@ $('set_cloudOnboard').onclick = async () => {
 };
 
 // ─── Cloud API: şablonlar (Meta onayı) ───────────────────────────────────────
-const TPL_STATUS = { APPROVED: 'Onaylı', PENDING: 'Onay bekliyor', REJECTED: 'Reddedildi', PAUSED: 'Duraklatıldı', DISABLED: 'Devre dışı', IN_APPEAL: 'İtirazda', PENDING_DELETION: 'Siliniyor' };
+// Müşteri dili: teknik ad/kategori/Meta kodu yerine "hangi mesaj" + sade durum.
+// Onay takibi Expert Bilişim'dedir — müşteriden Meta paneline girmesi beklenmez.
+const TPL_STATUS = { APPROVED: 'Onaylandı', PENDING: 'Onay bekliyor', REJECTED: 'Reddedildi', PAUSED: 'Duraklatıldı', DISABLED: 'Kapalı', IN_APPEAL: 'İnceleniyor', PENDING_DELETION: 'Siliniyor' };
+const TPL_BADGE = { APPROVED: 'ok', PENDING: 'wait', IN_APPEAL: 'wait', REJECTED: 'bad', PAUSED: 'bad', DISABLED: 'bad' };
 let cloudTemplates = [];
 const tplVarCount = (body) => new Set(String(body || '').match(/\{\{\s*\d+\s*\}\}/g) || []).size;
 
@@ -765,36 +895,39 @@ async function loadCloudTemplates() {
     box.innerHTML = '<div class="muted" style="padding:6px 0">Yükleniyor...</div>';
     try {
         const r = await api('/cloud/templates');
-        if (!r.success) { box.innerHTML = `<div class="err">${esc(r.message || 'Şablonlar alınamadı.')}</div>`; return; }
+        if (!r.success) { box.innerHTML = `<div class="err">${esc(r.message || 'Taslak durumu alınamadı.')}</div>`; return; }
         cloudTemplates = r.templates || [];
         const usedFor = Object.fromEntries((r.standard || []).map((s) => [s.name, s.label]));
-        if (!cloudTemplates.length) { box.innerHTML = '<div class="muted" style="padding:6px 0">Bu hesapta henüz şablon yok.</div>'; return; }
-        box.innerHTML = cloudTemplates.map((t, i) => `
-            <div class="logline">
-                <span><b>${esc(t.name)}</b> <span class="muted">${esc(t.language)} · ${esc(t.category)}${t.header ? ' · başlık: ' + esc(t.header) : ''}</span>
-                    ${usedFor[t.name] ? `<br><span class="muted" style="font-size:12px">Kullanım: ${esc(usedFor[t.name])}</span>` : ''}
-                    <br><span class="muted" style="font-size:12px">${esc(t.body)}</span>
-                    ${t.rejected ? `<br><span class="err" style="font-size:12px">Red sebebi: ${esc(t.rejected)}</span>` : ''}</span>
-                <span style="white-space:nowrap; text-align:right">
-                    <span class="st" style="color:${t.status === 'APPROVED' ? 'var(--primary)' : 'inherit'}">${esc(TPL_STATUS[t.status] || t.status)}</span>
-                    ${t.status === 'APPROVED' ? `<br><button class="btn ghost sm" data-tpl-use="${i}" style="margin-top:4px">Kullan</button>` : ''}
-                </span>
-            </div>`).join('');
+        if (!cloudTemplates.length) { box.innerHTML = '<div class="muted" style="padding:6px 0">Henüz onaya gönderilmiş taslak yok.</div>'; return; }
+        box.innerHTML = cloudTemplates.map((t, i) => {
+            const note = t.status === 'PENDING' ? 'Meta inceliyor — onaylanınca kendiliğinden kullanılır'
+                : t.status === 'REJECTED' ? 'Düzeltilmesi için Expert Bilişim ile görüşün'
+                : t.status === 'APPROVED' ? 'Kullanımda' : '';
+            return `<div class="tpl-row">
+                <span class="tpl-name"><b>${esc(usedFor[t.name] || t.name)}</b>${note ? `<br><span class="muted" style="font-size:12.5px">${esc(note)}</span>` : ''}</span>
+                <span class="tpl-badge ${TPL_BADGE[t.status] || ''}" title="${esc(t.name)}${t.rejected ? ' — ' + esc(t.rejected) : ''}">${esc(TPL_STATUS[t.status] || t.status)}</span>
+                ${t.status === 'APPROVED' && !usedFor[t.name] ? `<button class="btn ghost xs" data-tpl-use="${i}" title="Varsayılan taslak yap (uzman)">Kullan</button>` : ''}
+            </div>`;
+        }).join('');
     } catch (e) { box.innerHTML = `<div class="err">Hata: ${esc(e.message)}</div>`; }
 }
 $('set_tplRefresh').onclick = loadCloudTemplates;
 
-// Tüm mesaj türleri için standart şablonları bu WhatsApp hesabında tamamla.
+// Tüm mesaj türleri için standart taslakları bu WhatsApp hesabında tamamla.
 $('set_tplStandard').onclick = async () => {
     const btn = $('set_tplStandard'), box = $('set_tplStdResult');
-    box.style.display = ''; box.className = 'hint'; box.textContent = 'Şablonlar hazırlanıyor ve Meta onayına gönderiliyor...';
+    box.className = 'notice'; box.textContent = 'Taslaklar hazırlanıyor...';
     btn.disabled = true;
     try {
         const r = await api('/cloud/templates/standard', { method: 'POST' });
-        if (!r.success) { box.className = 'err'; box.textContent = r.message || 'Şablonlar oluşturulamadı.'; return; }
-        box.innerHTML = r.results.map((x) => `• <b>${esc(x.name)}</b> <span class="muted">(${esc(x.label || '')})</span>: ` +
-            (x.error ? `<span class="err">${esc(x.error)}</span>`
-                : esc(x.existed ? `zaten var — ${TPL_STATUS[x.status] || x.status}` : `onaya gönderildi — ${TPL_STATUS[x.status] || x.status}`))).join('<br>');
+        if (!r.success) { box.className = 'err'; box.textContent = r.message || 'Taslaklar gönderilemedi.'; return; }
+        const errs = r.results.filter(x => x.error);
+        const fresh = r.results.filter(x => !x.error && !x.existed).length;
+        box.className = errs.length ? 'notice' : 'notice ok';
+        box.innerHTML = (fresh
+            ? `✓ <b>Mesajlarınız onaya gönderildi.</b> Meta incelemesi genelde birkaç saat sürer; onaylanınca kendiliğinden kullanılır. Süreci Expert Bilişim takip eder.`
+            : `✓ Tüm taslaklar zaten onaya gönderilmiş.`) +
+            (errs.length ? '<br>' + errs.map(x => `⚠ ${esc(x.label || x.name)}: ${esc(x.error)}`).join('<br>') : '');
         loadCloudTemplates();
     } catch (e) {
         box.className = 'err'; box.textContent = 'Hata: ' + e.message;
@@ -880,11 +1013,13 @@ $('set_saveWa').onclick = async () => {
 };
 
 // Ban Koruması ayarlarını kaydet (günlük cap + uyarı eşiği + dönüş-budama + kaydet-opt-in).
-$('ab_save').onclick = async () => {
+// NOT: kimlikler "abg_" — eskiden AI ekranıyla aynı "ab_save/ab_dailyCap" idi; getElementById
+// ilkini (AI ekranını) döndürdüğü için buradaki Kaydet hiç çalışmıyordu.
+$('abg_save').onclick = async () => {
     const box = $('ab_result');
     box.style.display = ''; box.className = 'hint'; box.textContent = 'Kaydediliyor...';
     try {
-        const capVal = $('ab_dailyCap').value.trim();
+        const capVal = $('abg_dailyCap').value.trim();
         const warnVal = $('ab_warnAt').value.trim();
         const lr = await api('/antiban/limits', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1031,6 +1166,7 @@ $('sendBtn').onclick = async () => {
     fd.append('recipients', JSON.stringify(recipients));
     fd.append('message', message);
     fd.append('pacing', JSON.stringify(pacing));
+    fd.append('optOutNote', $('p_optout').checked ? '1' : '0');
     if (media) fd.append('media', media);
 
     $('sendBtn').disabled = true;
@@ -1091,6 +1227,7 @@ function openSendModal(jobId, total) {
             addLogRaw('Kullanıcı durdurdu', 'info');
         } else if (d.type === 'done') {
             $('s_status').textContent = `Tamamlandı. Gönderildi: ${d.sentCount}`;
+            loadOptout();   // gönderim sürerken DUR yazan olduysa sayı güncellensin
             finishModal();
             es.close();
         } else if (d.type === 'error') {
@@ -1114,7 +1251,7 @@ $('s_cancel').onclick = async () => {
 $('s_done').onclick = () => { $('sendModal').classList.add('hidden'); if (state.sse) state.sse.close(); };
 
 function addLog(name, phone, status, error) {
-    const labels = { sent: 'Gönderildi', failed: 'Başarısız', invalid: 'Geçersiz no', notOnWhatsApp: 'WA yok' };
+    const labels = { sent: 'Gönderildi', failed: 'Başarısız', invalid: 'Geçersiz no', notOnWhatsApp: 'WA yok', optedOut: 'DUR listesinde' };
     const rcp = state.jobRecipients ? state.jobRecipients[String(phone)] : null;
     const canShow = rcp && (state.jobMessage || '').trim();
     const div = document.createElement('div');
@@ -1185,9 +1322,8 @@ document.querySelectorAll('.tab').forEach(t => {
         document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
         t.classList.add('active');
         const v = t.dataset.view;
-        ['viewDashboard', 'viewBulk', 'viewWatcher', 'viewReminders', 'viewExtre', 'viewAiBot', 'viewFirma'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
+        ['viewBulk', 'viewWatcher', 'viewReminders', 'viewExtre', 'viewAiBot', 'viewFirma'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
         const at = $('appbarTitle'); if (at) at.textContent = t.dataset.title || t.textContent.trim();
-        if (v === 'viewDashboard') initDashboardView();
         if (v === 'viewWatcher') initWatcherView();
         if (v === 'viewReminders' && typeof initRemindersView === 'function') initRemindersView();
         if (v === 'viewExtre' && typeof initExtreView === 'function') initExtreView();
@@ -1195,121 +1331,6 @@ document.querySelectorAll('.tab').forEach(t => {
         if (v === 'viewFirma' && typeof initFirmaView === 'function') initFirmaView();
     };
 });
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  PANO (güven paneli) — gönderim/teslim/okundu/yanıt + anti-ban durumu
-// ═══════════════════════════════════════════════════════════════════════════
-let panoTimer = null;
-let panoWired = false;
-
-function initDashboardView() {
-    if (!panoWired) {
-        $('pn_refresh').onclick = () => refreshDashboard();
-        $('pn_push').onclick = async () => {
-            const b = $('pn_push'); const old = b.textContent;
-            b.disabled = true; b.textContent = 'Gönderiliyor...';
-            try {
-                const r = await api('/stats/push-summary', { method: 'POST' });
-                b.textContent = r.success ? '✓ Gönderildi' : (r.message || 'Hata');
-            } catch { b.textContent = 'Hata'; }
-            setTimeout(() => { b.disabled = false; b.textContent = old; }, 2500);
-        };
-        panoWired = true;
-    }
-    refreshDashboard();
-    if (panoTimer) clearInterval(panoTimer);
-    // Görünürken 6 sn'de bir tazele; sekme değişince dur (boşa istek atma).
-    panoTimer = setInterval(() => {
-        if ($('viewDashboard').style.display !== 'none') refreshDashboard();
-        else { clearInterval(panoTimer); panoTimer = null; }
-    }, 6000);
-}
-
-async function refreshDashboard() {
-    try {
-        const r = await api('/stats');
-        if (!r.success) return;
-        renderDashboard(r);
-    } catch { /* yok say */ }
-}
-
-function renderDashboard(r) {
-    const t = r.today || {};
-    $('pn_date').textContent = t.date || '';
-    $('pn_sent').textContent = t.sent ?? 0;
-    $('pn_delivered').textContent = t.delivered ?? 0;
-    $('pn_read').textContent = t.read ?? 0;
-    $('pn_replies').textContent = t.replies ?? 0;
-    $('pn_failed').textContent = t.failed ?? 0;
-    $('pn_deliveredRate').textContent = `%${t.deliveredRate ?? 0}`;
-    $('pn_readRate').textContent = `%${t.readRate ?? 0}`;
-
-    $('pn_dr_txt').textContent = `%${t.deliveredRate ?? 0}`;
-    $('pn_dr_bar').style.width = `${t.deliveredRate ?? 0}%`;
-    $('pn_rr_txt').textContent = `%${t.readRate ?? 0}`;
-    $('pn_rr_bar').style.width = `${t.readRate ?? 0}%`;
-
-    // Anti-ban
-    const ab = r.antiban;
-    if (ab) {
-        $('pn_ab_body').style.display = '';
-        $('pn_ab_off').style.display = 'none';
-        const warmTxt = ab.warmup ? `Isınma günü ${(ab.dayIndex ?? 0) + 1} · günlük tavan` : 'Günlük tavan';
-        $('pn_warm').textContent = warmTxt;
-        const dcap = ab.dailyCap || 0, dsent = ab.daySent || 0;
-        $('pn_daycap_txt').textContent = `${dsent}/${dcap}`;
-        $('pn_daycap_bar').style.width = `${dcap ? Math.min(100, Math.round(dsent / dcap * 100)) : 0}%`;
-        const hcap = ab.hourCap || 0, hsent = ab.hourSent || 0;
-        $('pn_hourcap_txt').textContent = `${hsent}/${hcap}`;
-        $('pn_hourcap_bar').style.width = `${hcap ? Math.min(100, Math.round(hsent / hcap * 100)) : 0}%`;
-        const cd = $('pn_cooldown');
-        if (ab.cooldownUntil) {
-            const mins = Math.max(1, Math.ceil((ab.cooldownUntil - Date.now()) / 60000));
-            cd.classList.remove('hidden');
-            cd.textContent = `⚠ Ban koruması aktif: gönderim durduruldu (~${mins} dk) — ${ab.cooldownReason || 'anormal kopma'}`;
-        } else cd.classList.add('hidden');
-    } else {
-        $('pn_ab_body').style.display = 'none';
-        $('pn_ab_off').style.display = '';
-    }
-    // Çok numara: hat hat doluluk (kart yalnız en kritik hattı gösteriyor).
-    const abAccs = Array.isArray(r.antibanAccounts) ? r.antibanAccounts : [];
-    const accBox = $('pn_ab_accs');
-    if (accBox) {
-        if (abAccs.length > 1) {
-            accBox.style.display = '';
-            accBox.innerHTML = abAccs.map((a) => {
-                const phone = a.me ? String(a.me).split(':')[0].split('@')[0] : '';
-                return `<div>• <b>${esc(a.label || a.id)}</b> ${esc(phone)} — bugün ${a.daySent || 0}/${a.dailyCap || 0}` +
-                    `${a.cooldownUntil ? ' · ⏸ soğumada' : ''}</div>`;
-            }).join('');
-        } else accBox.style.display = 'none';
-    }
-
-    // 7 günlük mini grafik
-    const hist = r.history || [];
-    const max = Math.max(1, ...hist.map(d => d.sent || 0));
-    const H = 84;
-    $('pn_spark').innerHTML = hist.map(d => {
-        const day = (d.date || '').slice(5); // MM-DD
-        const bh = v => Math.round((v || 0) / max * H);
-        return `<div class="spark-col" title="${esc(d.date)} — gönderildi ${d.sent || 0}, ulaştı ${d.delivered || 0}, okundu ${d.read || 0}, yanıt ${d.replies || 0}">
-            <div class="spark-bars">
-                <i class="sw-sent" style="height:${bh(d.sent)}px"></i>
-                <i class="sw-del" style="height:${bh(d.delivered)}px"></i>
-                <i class="sw-read" style="height:${bh(d.read)}px"></i>
-            </div>
-            <span>${esc(day)}</span>
-        </div>`;
-    }).join('');
-
-    // Kanal kırılımı
-    const CH_TR = { bulk: 'Toplu', reminder: 'Hatırlatma', belge: 'Belge', manual: 'Manuel', extre: 'Ekstre', aibot: 'AI Yanıt', other: 'Diğer' };
-    const rows = t.byChannel || [];
-    $('pn_chBody').innerHTML = rows.length
-        ? rows.map(c => `<tr><td>${esc(CH_TR[c.ch] || c.ch)}</td><td class="r">${c.sent}</td><td class="r">${c.delivered}</td><td class="r">${c.read}</td></tr>`).join('')
-        : '<tr><td colspan="4" class="muted" style="padding:14px">Bugün gönderim yok.</td></tr>';
-}
 
 // Belge tipi şablonunda kullanılabilir değişkenler (kart başına chip).
 const WC_VARS = ['{firma}', '{ad}', '{tutar}', '{kod}', '{evrak}', '{tarih}', '{bakiye}', '{durum}', '{belge}', '{firmaadi}'];
@@ -1340,9 +1361,39 @@ async function initWatcherView() {
             sel.appendChild(o);
         });
         sel.onchange = () => loadWatcherDonemler();
+        // "Mesaj ekle" → henüz eklenmemiş türleri listele, kullanıcı seçsin.
         $('wc_addRule').onclick = () => {
+            const menu = $('wc_addMenu');
+            if (!menu.classList.contains('hidden')) { menu.classList.add('hidden'); return; }
+            const used = new Set([...document.querySelectorAll('#wc_rules .rc_docType')].map(s => s.value));
+            const free = WC_DOCTYPES.filter(d => d.v === 'custom' || !used.has(d.v));
+            menu.innerHTML = '<div class="add-menu-t">Hangi durumda mesaj gitsin?</div>' + free.map(d => `
+                <button type="button" class="add-opt" data-doc="${d.v}">
+                    <span class="acc-t">${esc(WC_DOC_WHEN[d.v] || d.t)}</span>
+                    <span class="acc-s">${esc(d.v === 'custom' ? 'Vega IZAHAT kodlarıyla kendi kuralınız' : d.t)}</span>
+                </button>`).join('') +
+                (free.length === 1 ? '<div class="hint" style="padding:4px 14px 10px">Hazır türlerin hepsi zaten ekli.</div>' : '');
+            menu.classList.remove('hidden');
+        };
+        $('wc_addMenu').onclick = (e) => {
+            const opt = e.target.closest('[data-doc]');
+            if (!opt) return;
+            const docType = opt.dataset.doc;
             const empty = $('wc_rules').querySelector('.muted'); if (empty) empty.remove();
-            $('wc_rules').appendChild(createRuleCard({ enabled: true, docType: 'custom', direction: 'alacak', excludeFatura: true }));
+            const t = WC_DOCTYPES.find(d => d.v === docType);
+            const card = createRuleCard({
+                enabled: true, docType,
+                name: docType === 'custom' ? '' : (t ? t.t : ''),
+                direction: WC_DOC_DIR[docType] || 'alacak',
+                excludeFatura: docType === 'custom',
+                template: WC_DOC_PRESET[docType] != null ? WC_PRESETS[WC_DOC_PRESET[docType]].v : '',
+            }, true);
+            // Açık diğer satırları kapat → yeni eklenen öne çıksın.
+            document.querySelectorAll('#wc_rules .rule-card.open').forEach(c => c.classList.remove('open'));
+            card.classList.add('open');
+            $('wc_rules').appendChild(card);
+            $('wc_addMenu').classList.add('hidden');
+            card.scrollIntoView({ behavior: 'smooth', block: 'start' });
         };
         wcLoaded = true;
     }
@@ -1393,6 +1444,7 @@ async function loadWatcherConfig() {
     $('wc_watchEdits').checked = s.watchEdits === true;
     $('wc_watchDeletes').checked = s.watchDeletes === true;
     $('wc_editTemplate').value = s.editTemplate || '';
+    mountTemplateEditor($('wc_editTemplate'), ['{firma}', '{evrak}', '{eskiTutar}', '{yeniTutar}', '{tarih}', '{bakiye}', '{durum}']);
     renderWatcherRules(s.rules || []);
     renderWatcherState(s);
 }
@@ -1401,101 +1453,141 @@ function renderWatcherRules(rules) {
     const box = $('wc_rules');
     box.innerHTML = '';
     if (!rules.length) {
-        box.innerHTML = '<div class="muted" style="padding:10px 0">Henüz mesaj türü yok. <b>+ Yeni mesaj türü ekle</b> ile başlayın.</div>';
+        box.innerHTML = '<div class="muted" style="padding:10px 0">Henüz mesaj yok. <b>+ Mesaj ekle</b> ile başlayın.</div>';
         return;
     }
     rules.forEach(r => box.appendChild(createRuleCard(r)));
 }
 
-// Bir belge tipi kuralının kartını oluşturur (DOM + olaylar).
-function createRuleCard(rule) {
+// Hazır metinler — kullanıcı sıfırdan yazmak zorunda kalmasın (backend PRESET_RULES diliyle).
+const WC_PRESETS = [
+    { t: 'Fatura kesildi', v: 'Sayın {firma}, {tarih} tarihli {tutar} TL tutarındaki faturanız düzenlenmiştir. Güncel bakiyeniz: {bakiye} TL ({durum}).\n{firmaadi}' },
+    { t: 'Ödeme alındı', v: 'Sayın {firma}, {tarih} tarihinde {tutar} TL tutarındaki ödemeniz alınmıştır, teşekkür ederiz. Güncel bakiyeniz: {bakiye} TL ({durum}).\n{firmaadi}' },
+    { t: 'Sevkiyat yapıldı', v: 'Sayın {firma}, {tarih} tarihli {tutar} TL tutarındaki sevkiyatınız yapılmıştır. Bilginize sunarız.\n{firmaadi}' },
+    { t: 'Tedarikçiye ödeme yapıldı', v: 'Sayın {firma}, {tarih} tarihinde tarafınıza {tutar} TL ödeme yapılmıştır. Güncel bakiye: {bakiye} TL ({durum}).\n{firmaadi}' },
+];
+
+// Yeni eklenen türün başlangıç metni (WC_PRESETS sırası) ve yönü.
+const WC_DOC_PRESET = { satisFaturasi: 0, alisFaturasi: 0, cariGiris: 1, satisIrsaliyesi: 2, stokCikis: 2, stokGiris: 2, cariCikis: 3 };
+const WC_DOC_DIR = { satisFaturasi: 'borc', satisIrsaliyesi: 'borc', stokCikis: 'borc', cariGiris: 'alacak', cariCikis: 'borc', alisFaturasi: 'alacak', stokGiris: 'alacak' };
+
+// Satır başlığında "ne zaman gider" — belge türü kodu yerine düz cümle.
+const WC_DOC_WHEN = {
+    satisFaturasi: 'Satış faturası kesilince',
+    satisIrsaliyesi: 'Satış irsaliyesi kesilince',
+    stokCikis: 'Stok çıkışı yapılınca',
+    cariGiris: 'Tahsilat / havale alınınca',
+    cariCikis: 'Tedarikçiye ödeme yapılınca',
+    alisFaturasi: 'Alış faturası girilince',
+    stokGiris: 'Stok girişi yapılınca',
+    custom: 'Özel kural (IZAHAT kodu)',
+};
+
+// Akordeon satırı: kapalıyken tek satır (aç/kapa kutusu + ad + mesajın başı),
+// tıklayınca ayarlar açılır. Sınıf adları collectRules ile sözleşmelidir.
+function createRuleCard(rule, open) {
     rule = rule || {};
     const id = rule.id || `rule-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
     const dir = rule.direction || 'alacak';
     const docType = rule.docType || 'custom';
     const card = document.createElement('div');
-    card.className = 'rule-card';
+    card.className = 'rule-card acc-item' + (open ? ' open' : '') + (rule.enabled ? '' : ' off');
     card.dataset.id = id;
     const mediaInfo = (rule.media && rule.media.name)
         ? `Kayıtlı: <b>${esc(rule.media.name)}</b>${rule.media.kind ? ` (${esc(rule.media.kind)})` : ''} <a href="#" class="rc_mediaClear">Kaldır</a>` : '';
     card.innerHTML = `
-        <div class="rule-head">
-            <label class="check"><input type="checkbox" class="rc_enabled" ${rule.enabled ? 'checked' : ''} /> <b>Etkin</b></label>
-            <input class="rc_name" placeholder="Tür adı (örn: Satış Faturası)" value="${esc(rule.name || '')}" />
-            <button class="btn ghost xs rc_del" title="Bu türü sil">✕</button>
+        <div class="acc-head">
+            <input type="checkbox" class="rc_enabled" title="Açık / kapalı" ${rule.enabled ? 'checked' : ''} />
+            <div class="acc-head-txt">
+                <span class="acc-t rc_title"></span>
+                <span class="acc-s rc_sum"></span>
+            </div>
         </div>
-        <div class="field">
-            <label>Belge türü</label>
-            <select class="rc_docType">${WC_DOCTYPES.map(d => `<option value="${d.v}">${d.t}</option>`).join('')}</select>
-            <div class="hint rc_docHint"></div>
-        </div>
-        <div class="rc_advanced" style="display:none">
+        <div class="acc-body">
             <div class="row">
-                <div class="field"><label>Yön</label>
-                    <select class="rc_dir">
-                        <option value="alacak">Tahsilat / Ödeme (ALACAK)</option>
-                        <option value="borc">Fatura / Borçlandırma (BORC)</option>
-                        <option value="any">Her ikisi</option>
-                    </select>
+                <div class="field">
+                    <label>Ne zaman gitsin?</label>
+                    <select class="rc_docType">${WC_DOCTYPES.map(d => `<option value="${d.v}">${esc(WC_DOC_WHEN[d.v] || d.t)}</option>`).join('')}</select>
+                    <div class="hint rc_docHint"></div>
                 </div>
-                <div class="field" style="flex:.55"><label>Min tutar</label><input class="rc_min" type="number" min="0" value="${Number(rule.minAmount) || 0}" /></div>
+                <div class="field" style="flex:.7"><label>Adı</label><input class="rc_name" placeholder="örn. Satış faturası" value="${esc(rule.name || '')}" /></div>
             </div>
             <div class="field">
-                <label>IZAHAT kodları (virgülle; boş = bu yöndeki tüm kodlar)</label>
-                <input class="rc_codes" placeholder="örn: 13, 32, 83" value="${esc((rule.izahatCodes || []).join(', '))}" />
-                <div class="hint"><a href="#" class="rc_showCodes">Bu dönemdeki kodları göster</a></div>
-                <div class="rc_codesList muted" style="font-size:12px; margin-top:6px"></div>
+                <label>Mesaj</label>
+                <textarea class="rc_template" placeholder="Sayın {firma}, ...">${esc(rule.template || '')}</textarea>
             </div>
-            <label class="check"><input type="checkbox" class="rc_excludeFatura" /> Fatura kaynaklı satırları dışla <span class="muted">(tahsilat için önerilir)</span></label>
-        </div>
-        <div class="field rc_minSimple"><label>Min tutar (TL)</label><input class="rc_min2" type="number" min="0" value="${Number(rule.minAmount) || 0}" /></div>
-        <div class="field">
-            <label>Mesaj şablonu</label>
-            <textarea class="rc_template" placeholder="Sayın {firma} müşterimiz, ...">${esc(rule.template || '')}</textarea>
-            <div class="chips rc_chips">${WC_VARS.map(v => `<span class="chip" data-v="${v}">${v}</span>`).join('')}</div>
-            <div class="hint">{firma}=cari adı, {tutar}=bu belgenin tutarı, {bakiye}=güncel kalan bakiye, {durum}=Borç/Alacak, {belge}=tür adı, {firmaadi}=kendi firma adın (Firma Bilgileri'nden).</div>
-        </div>
-        <label class="check rc_contentRow" style="display:none"><input type="checkbox" class="rc_includeContent" /> Belge içeriğini de gönder <span class="muted">(kesilen faturanın/belgenin kalemleri mesaja eklenir)</span></label>
-        <div class="field">
-            <label>Görsel / Video (opsiyonel)</label>
-            <input type="file" class="rc_media" accept="image/*,video/*" />
-            <div class="rc_mediaInfo hint" style="${mediaInfo ? '' : 'display:none'}">${mediaInfo}</div>
+            <label class="check rc_contentRow" style="display:none"><input type="checkbox" class="rc_includeContent" /> Belgenin kalemlerini de yaz</label>
+            <details class="adv">
+                <summary>Gelişmiş</summary>
+                <div class="field rc_minSimple"><label>En az tutar (TL)</label><input class="rc_min2" type="number" min="0" value="${Number(rule.minAmount) || 0}" /></div>
+                <div class="rc_advanced" style="display:none">
+                    <div class="row">
+                        <div class="field"><label>Yön</label>
+                            <select class="rc_dir">
+                                <option value="alacak">Tahsilat / ödeme (ALACAK)</option>
+                                <option value="borc">Fatura / borçlandırma (BORÇ)</option>
+                                <option value="any">Her ikisi</option>
+                            </select>
+                        </div>
+                        <div class="field" style="flex:.55"><label>En az tutar</label><input class="rc_min" type="number" min="0" value="${Number(rule.minAmount) || 0}" /></div>
+                    </div>
+                    <div class="field">
+                        <label>IZAHAT kodları (virgülle)</label>
+                        <input class="rc_codes" placeholder="örn: 13, 32, 83" value="${esc((rule.izahatCodes || []).join(', '))}" />
+                        <div class="hint"><a href="#" class="rc_showCodes">Bu dönemdeki kodları göster</a></div>
+                        <div class="rc_codesList muted" style="font-size:12px; margin-top:6px"></div>
+                    </div>
+                    <label class="check"><input type="checkbox" class="rc_excludeFatura" /> Fatura kaynaklı satırları dışla</label>
+                </div>
+                <div class="field">
+                    <label>Görsel / video</label>
+                    <input type="file" class="rc_media" accept="image/*,video/*" />
+                    <div class="rc_mediaInfo hint" style="${mediaInfo ? '' : 'display:none'}">${mediaInfo}</div>
+                </div>
+            </details>
+            <div class="acc-foot"><button class="link-danger rc_del" type="button">Bu mesajı sil</button></div>
         </div>`;
     card.querySelector('.rc_dir').value = dir;
     card.querySelector('.rc_docType').value = docType;
     card.querySelector('.rc_excludeFatura').checked = (rule.excludeFatura !== undefined) ? !!rule.excludeFatura : (dir === 'alacak');
     card.querySelector('.rc_includeContent').checked = rule.includeContent === true;
-    // Kalemli (içeriği olan) belge tipleri — "Belge içeriğini de gönder" yalnız bunlarda görünür.
+    // Kalemli (içeriği olan) belge tipleri — "kalemleri de yaz" yalnız bunlarda görünür.
     const CONTENT_DOCTYPES = new Set(['satisFaturasi', 'alisFaturasi', 'satisIrsaliyesi', 'alisIrsaliyesi', 'stokCikis', 'stokGiris']);
-    // Hazır tip → gelişmiş alanlar (yön/kod/fatura) otomatik, gizli; özel → göster.
-    const DOC_HINTS = {
-        satisFaturasi: 'Satış faturası kesildiğinde (müşteri borçlanır) gönderilir.',
-        satisIrsaliyesi: 'Satış irsaliyesi (sevk) düzenlendiğinde gönderilir.',
-        stokCikis: 'Stok çıkış fişi (mal/ürün çıkışı) düzenlendiğinde gönderilir.',
-        cariGiris: 'Cari giriş bordrosu = müşteriden ödeme/tahsilat alındığında gönderilir.',
-        cariCikis: 'Cari çıkış bordrosu = tedarikçiye ödeme (tediye) yapıldığında gönderilir.',
-        alisFaturasi: 'Alış faturası girildiğinde gönderilir.',
-        stokGiris: 'Stok giriş fişi düzenlendiğinde gönderilir.',
-        custom: 'IZAHAT kodlarını elle girerek özel bir kural tanımlayın.',
+
+    const tpl = card.querySelector('.rc_template');
+    const updateHead = () => {
+        const dt = card.querySelector('.rc_docType').value;
+        const name = card.querySelector('.rc_name').value.trim();
+        card.querySelector('.rc_title').textContent = name || WC_DOC_WHEN[dt] || 'Yeni mesaj';
+        const first = renderSample(tpl.value).split('\n')[0].trim();
+        card.querySelector('.rc_sum').textContent = name && WC_DOC_WHEN[dt]
+            ? `${WC_DOC_WHEN[dt]}${first ? ' · ' + first : ''}`
+            : (first || 'Mesaj yazılmadı');
     };
+    // Hazır tip → yön/kod/fatura otomatik (backend belirler), gizli; özel → göster.
     const applyDocTypeUI = () => {
         const dt = card.querySelector('.rc_docType').value;
         const custom = dt === 'custom';
         card.querySelector('.rc_advanced').style.display = custom ? '' : 'none';
         card.querySelector('.rc_minSimple').style.display = custom ? 'none' : '';
-        card.querySelector('.rc_docHint').textContent = DOC_HINTS[dt] || '';
+        card.querySelector('.rc_docHint').textContent = custom ? 'Vega IZAHAT kodlarını Gelişmiş bölümünden girin.' : '';
         card.querySelector('.rc_contentRow').style.display = CONTENT_DOCTYPES.has(dt) ? '' : 'none';
+        updateHead();
     };
     applyDocTypeUI();
     card.querySelector('.rc_docType').onchange = applyDocTypeUI;
-    card.querySelector('.rc_del').onclick = () => card.remove();
-    card.querySelectorAll('.rc_chips .chip').forEach(ch => ch.onclick = () => {
-        const ta = card.querySelector('.rc_template');
-        const v = ch.dataset.v;
-        const pos = ta.selectionStart ?? ta.value.length;
-        ta.value = ta.value.slice(0, pos) + v + ta.value.slice(pos);
-        ta.focus();
-    });
+    card.querySelector('.rc_name').addEventListener('input', updateHead);
+    tpl.addEventListener('input', updateHead);
+
+    // Başlığa tıkla → aç/kapa. Aç/kapa kutusu satırı açmaz, yalnız etkinliği değiştirir.
+    const head = card.querySelector('.acc-head');
+    const enabled = card.querySelector('.rc_enabled');
+    head.addEventListener('click', (e) => { if (e.target !== enabled) card.classList.toggle('open'); });
+    enabled.addEventListener('change', () => card.classList.toggle('off', !enabled.checked));
+
+    card.querySelector('.rc_del').onclick = () => {
+        if (confirm(`"${card.querySelector('.rc_title').textContent}" silinsin mi? (Kaydet'e basınca kalıcı olur)`)) card.remove();
+    };
     card.querySelector('.rc_showCodes').onclick = (e) => { e.preventDefault(); showRuleCodes(card); };
     const mc = card.querySelector('.rc_mediaClear');
     if (mc) mc.onclick = async (e) => {
@@ -1503,6 +1595,9 @@ function createRuleCard(rule) {
         await api(`/watcher/rules/${id}/media/clear`, { method: 'POST' });
         const box = card.querySelector('.rc_mediaInfo'); box.style.display = 'none'; box.innerHTML = '';
     };
+    mountTemplateEditor(tpl, WC_VARS, { presets: WC_PRESETS });
+    // Hazır metin seçilince textarea 'input' olayı üretmez → başlık özetini ayrıca tazele.
+    tpl.parentNode.addEventListener('change', updateHead);
     return card;
 }
 
@@ -1534,15 +1629,14 @@ function renderWatcherState(s) {
     $('wcState').textContent = on ? 'Aktif' : 'Pasif';
     $('wc_save').textContent = on ? 'Ayarları Kaydet' : 'Kaydet ve Başlat';
     $('wc_stop').style.display = on ? '' : 'none';
+    // Kısa durum satırı — tablo adı / IND gibi teknik bilgi ekranda gösterilmez.
     const parts = [];
-    if (s.table) parts.push(`Tablo: ${s.table}`);
-    if (s.watermark != null) parts.push(`Son IND: ${s.watermark}`);
-    if (s.pendingCount > 0) parts.push(`⏳ Kuyrukta ${s.pendingCount} mesaj (bağlanınca gönderilecek)`);
-    if (s.lastPollAt) parts.push(`Son tarama: ${new Date(s.lastPollAt).toLocaleTimeString('tr-TR')}`);
-    if (s.lastResult?.note) parts.push(s.lastResult.note);
     if (s.lastError) parts.push(`⚠ ${s.lastError}`);
-    $('wc_status').textContent = parts.join('  •  ') || '—';
-    $('wc_info').textContent = on ? `Her ${s.intervalSec}sn taranıyor` : '';
+    if (s.pendingCount > 0) parts.push(`${s.pendingCount} mesaj sırada bekliyor`);
+    if (s.lastPollAt) parts.push(`Son kontrol ${new Date(s.lastPollAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}`);
+    if (s.lastResult?.note && !s.lastError) parts.push(s.lastResult.note);
+    $('wc_status').textContent = parts.join(' · ') || (on ? 'Çalışıyor' : 'Kapalı — başlatmak için Kaydet ve Başlat');
+    $('wc_info').textContent = '';
 }
 
 function collectRules() {
@@ -1694,6 +1788,9 @@ async function loadSiparisConfig() {
     $('sp_watchCancel').checked = s.watchCancel !== false;
     $('sp_template').value = s.template || '';
     $('sp_cancelTemplate').value = s.cancelTemplate || '';
+    const SP_FIELDS = ['{firma}', '{kod}', '{evrak}', '{tarih}', '{saat}', '{tutar}', '{firmaadi}'];
+    mountTemplateEditor($('sp_template'), SP_FIELDS, { caption: 'Size böyle gelecek' });
+    mountTemplateEditor($('sp_cancelTemplate'), SP_FIELDS, { caption: 'Size böyle gelecek' });
     $('sp_interval').value = s.intervalSec || 30;
     $('sp_respectWindow').checked = s.respectSendWindow === true;
     $('sp_typing').checked = s.simulateTyping === true;
@@ -1703,20 +1800,17 @@ async function loadSiparisConfig() {
 function renderSiparisState(s) {
     const on = s.running;
     $('spDot').className = 'dot ' + (on ? 'on' : '');
-    $('spState').textContent = on ? 'Aktif' : 'Pasif';
-    $('sp_save').textContent = on ? 'Ayarları Kaydet' : 'Kaydet ve Başlat';
+    $('spState').textContent = on ? `Açık · ${s.phones?.length || 0} numara` : 'Kapalı';
+    $('sp_save').textContent = on ? 'Kaydet' : 'Kaydet ve Başlat';
     $('sp_stop').style.display = on ? '' : 'none';
     const parts = [];
-    if (s.phones?.length) parts.push(`${s.phones.length} numaraya bildiriliyor`);
-    if (s.invalidPhones?.length) parts.push(`⚠ geçersiz: ${s.invalidPhones.join(', ')}`);
-    if (s.table) parts.push(`Tablo: ${s.table}`);
-    if (s.watermark != null) parts.push(`Son IND: ${s.watermark}`);
-    if (s.pendingCount > 0) parts.push(`⏳ Kuyrukta ${s.pendingCount} bildirim`);
-    if (s.lastPollAt) parts.push(`Son tarama: ${new Date(s.lastPollAt).toLocaleTimeString('tr-TR')}`);
-    if (s.lastResult?.note) parts.push(s.lastResult.note);
     if (s.lastError) parts.push(`⚠ ${s.lastError}`);
-    $('sp_status').textContent = parts.join('  •  ') || '—';
-    $('sp_info').textContent = on ? `Her ${s.intervalSec}sn taranıyor` : '';
+    if (s.invalidPhones?.length) parts.push(`⚠ anlaşılmayan numara: ${s.invalidPhones.join(', ')}`);
+    if (s.pendingCount > 0) parts.push(`${s.pendingCount} bildirim sırada`);
+    if (s.lastPollAt) parts.push(`Son kontrol ${new Date(s.lastPollAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}`);
+    if (s.lastResult?.note && !s.lastError) parts.push(s.lastResult.note);
+    $('sp_status').textContent = parts.join(' · ') || '—';
+    $('sp_info').textContent = '';
 }
 
 function collectSiparisConfig() {
@@ -1833,8 +1927,6 @@ async function loadVadeConfig() {
     $('vd_days').value = (s.days || []).join(', ');
     $('vd_t_cek').checked = s.types?.cek !== false;
     $('vd_t_senet').checked = s.types?.senet !== false;
-    $('vd_t_visa').checked = s.types?.visa === true;
-    $('vd_visaTaksit').checked = s.visaOnlyTaksit !== false;
     $('vd_t_taksit').checked = s.types?.taksit === true;
     $('vd_direction').value = s.direction || 'ikisi';
     $('vd_min').value = s.minAmount || 0;
@@ -1842,6 +1934,16 @@ async function loadVadeConfig() {
     $('vd_template').value = s.template || '';
     $('vd_headerTemplate').value = s.headerTemplate || '';
     $('vd_lineTemplate').value = s.lineTemplate || '';
+    const VD_FIELDS = ['{tur}', '{belgeno}', '{firma}', '{banka}', '{vade}', '{kalan}', '{tutar}', '{yon}', '{kod}', '{firmaadi}'];
+    const VD_OPTS = { caption: 'Size böyle gelecek', labels: { '{kalan}': 'Kalan süre' }, overrides: { '{kalan}': '3 gün kaldı', '{firma}': 'ÖRNEK MÜŞTERİ A.Ş.', '{tutar}': '125.000,00' } };
+    mountTemplateEditor($('vd_template'), VD_FIELDS, {
+        ...VD_OPTS,
+        presets: [
+            { t: 'Ayrıntılı', v: '⏰ *Vade Hatırlatma* — {kalan}\n{tur} {belgeno} • {yon}\nCari: {firma}\nVade: {vade}\nTutar: {tutar} TL' },
+            { t: 'Tek satır', v: '⏰ {kalan}: {firma} — {tur} {belgeno} — {tutar} TL ({vade})' },
+        ],
+    });
+    mountTemplateEditor($('vd_lineTemplate'), VD_FIELDS, VD_OPTS);
     $('vd_fromHour').value = s.sendFromHour ?? 9;
     $('vd_toHour').value = s.sendToHour ?? 20;
     $('vd_interval').value = s.intervalSec || 900;
@@ -1853,20 +1955,18 @@ async function loadVadeConfig() {
 function renderVadeState(s) {
     const on = s.running;
     $('vdDot').className = 'dot ' + (on ? 'on' : '');
-    $('vdState').textContent = on ? 'Aktif' : 'Pasif';
-    $('vd_save').textContent = on ? 'Ayarları Kaydet' : 'Kaydet ve Başlat';
+    const kinds = [s.types?.cek && 'çek', s.types?.senet && 'senet', s.types?.taksit && 'taksit'].filter(Boolean).join(', ');
+    $('vdState').textContent = on ? `Açık · ${(s.days || []).join(', ')} gün kala · ${kinds}` : 'Kapalı';
+    $('vd_save').textContent = on ? 'Kaydet' : 'Kaydet ve Başlat';
     $('vd_stop').style.display = on ? '' : 'none';
     const parts = [];
-    if (s.days?.length) parts.push(`Eşik: ${s.days.join(', ')} gün kala`);
-    if (s.phones?.length) parts.push(`${s.phones.length} numaraya bildiriliyor`);
-    if (s.invalidPhones?.length) parts.push(`⚠ geçersiz: ${s.invalidPhones.join(', ')}`);
-    if (s.lastResult?.found != null) parts.push(`${s.lastResult.found} belge izleniyor`);
-    if (s.pendingCount > 0) parts.push(`⏳ Kuyrukta ${s.pendingCount} bildirim`);
-    if (s.lastPollAt) parts.push(`Son tarama: ${new Date(s.lastPollAt).toLocaleTimeString('tr-TR')}`);
-    if (s.lastResult?.note) parts.push(s.lastResult.note);
     if (s.lastError) parts.push(`⚠ ${s.lastError}`);
-    $('vd_status').textContent = parts.join('  •  ') || '—';
-    $('vd_info').textContent = on ? `Her ${Math.round((s.intervalSec || 900) / 60)} dk taranıyor` : '';
+    if (s.invalidPhones?.length) parts.push(`⚠ anlaşılmayan numara: ${s.invalidPhones.join(', ')}`);
+    if (s.pendingCount > 0) parts.push(`${s.pendingCount} bildirim sırada`);
+    if (s.lastPollAt) parts.push(`Son kontrol ${new Date(s.lastPollAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}`);
+    if (s.lastResult?.note && !s.lastError) parts.push(s.lastResult.note);
+    $('vd_status').textContent = parts.join(' · ') || '—';
+    $('vd_info').textContent = '';
 }
 
 function collectVadeConfig() {
@@ -1875,13 +1975,13 @@ function collectVadeConfig() {
         donemNo: $('wc_donem').value,
         phone: $('vd_phone').value.trim(),
         days: $('vd_days').value,
+        // Visa listeden kalktı: Vega'daki "vadesi" sahte (blokaj/işlem günü) — sunucu da taramaz.
         types: {
             cek: $('vd_t_cek').checked,
             senet: $('vd_t_senet').checked,
-            visa: $('vd_t_visa').checked,
+            visa: false,
             taksit: $('vd_t_taksit').checked,
         },
-        visaOnlyTaksit: $('vd_visaTaksit').checked,
         direction: $('vd_direction').value,
         minAmount: Math.max(0, +$('vd_min').value || 0),
         groupMessages: $('vd_group').checked,
@@ -1897,11 +1997,11 @@ function collectVadeConfig() {
 }
 
 function vadeValidate(cfg) {
-    if (!cfg.firmaNo || !cfg.donemNo) return 'Yukarıdan firma ve dönem seçin.';
-    if (!cfg.phone) return 'En az bir bildirim numarası girin.';
-    if (!/\d/.test(cfg.days)) return 'Kaç gün kala bildirileceğini girin (ör. 7, 3, 1).';
-    if (!Object.values(cfg.types).some(Boolean)) return 'En az bir belge tipi seçin (çek/senet/visa).';
-    if (!cfg.template.trim()) return 'Vade mesajı boş olamaz.';
+    if (!cfg.firmaNo || !cfg.donemNo) return 'Sayfanın üstünden firma ve dönem seçin.';
+    if (!cfg.phone) return 'Haber verilecek numarayı girin.';
+    if (!/\d/.test(cfg.days)) return 'Kaç gün kala haber verileceğini girin (ör. 3, 0).';
+    if (!Object.values(cfg.types).some(Boolean)) return 'Çek veya senetten en az birini seçin.';
+    if (!cfg.template.trim()) return 'Mesaj boş olamaz.';
     return '';
 }
 
@@ -1945,7 +2045,7 @@ $('vd_preview').onclick = async () => {
                     <span>${esc(d.kalan)} — <b>${esc(d.turAdi)}</b> ${esc(d.belgeno || '')}
                         <span class="muted">${esc(d.yonAdi)}</span>
                         — ${esc(d.firma)} <b>${esc(d.tutarStr)} TL</b>
-                        <span class="muted">(${new Date(d.vade).toLocaleDateString('tr-TR')})</span>
+                        <span class="muted">(${esc(d.vadeStr || '')})</span>
                     </span>
                     <span class="st ${d.bildirildi ? 'sent' : 'info'}">${d.bildirildi ? 'Bildirildi' : 'Bekliyor'}</span>
                 </div>`).join('');
@@ -2037,7 +2137,7 @@ function showSentMessage(e) {
 
 // Toplu gönderim log'undan: şablonu cariye göre doldur + cari/firma bilgileri.
 function showBulkMessage(r, status) {
-    const stLabel = { sent: 'Gönderildi', failed: 'Başarısız', invalid: 'Geçersiz no', notOnWhatsApp: 'WA yok' }[status] || status;
+    const stLabel = { sent: 'Gönderildi', failed: 'Başarısız', invalid: 'Geçersiz no', notOnWhatsApp: 'WA yok', optedOut: 'DUR listesinde' }[status] || status;
     $('msgModalMeta').textContent = [r.phone, stLabel].filter(Boolean).join('  ·  ');
     fillCariInfo([
         ['Firma', r.firma || r.unvan],
@@ -2116,9 +2216,16 @@ function renderReminderCards(reminders) {
     reminders.forEach(rem => box.appendChild(createReminderCard(rem)));
 }
 
+const RM_PRESETS = [
+    { t: 'Nazik bilgilendirme', v: 'Sayın {firma}, cari hesabınızda {bakiye} TL bakiye bulunmaktadır. Bilginize sunar, iyi çalışmalar dileriz.' },
+    { t: 'Ödeme ricası', v: 'Sayın {firma}, {bakiye} TL tutarındaki bakiyenizin ödemesini rica ederiz. Ödeme yaptıysanız bu mesajı dikkate almayınız.' },
+];
+
+// Akordeon satırı: kapalıyken "ad · her N günde bir, saat", tıklayınca ayarlar.
+// Sınıf adları collectReminders ile sözleşmelidir.
 function createReminderCard(rem) {
     const card = document.createElement('div');
-    card.className = 'rule-card';
+    card.className = 'rule-card acc-item' + (rem.enabled ? '' : ' off');
     card.dataset.id = rem.id;
     card.dataset.type = rem.type;
     const isOverdue = rem.type === 'overdueBuyer';
@@ -2130,40 +2237,58 @@ function createReminderCard(rem) {
         ? `Kayıtlı: <b>${esc(rem.media.name)}</b>${rem.media.kind ? ` (${esc(rem.media.kind)})` : ''} <a href="#" class="rm_mediaClear">Kaldır</a>` : '';
     const startVal = rem.startDate ? String(rem.startDate).slice(0, 10) : '';
     card.innerHTML = `
-        <div class="rule-head">
-            <label class="check"><input type="checkbox" class="rm_enabled" ${rem.enabled ? 'checked' : ''} /> <b>Etkin</b></label>
-            <input class="rm_name" value="${esc(rem.name || RM_TYPE_LABEL[rem.type] || '')}" />
-            <button class="btn ghost xs rm_preview" title="Göndermeden önce: kime ne gidecek (bakiye/vade) göster">Önizle</button>
-            <button class="btn ghost xs rm_test" title="Şimdi bir kez gönder (test)">Şimdi gönder</button>
+        <div class="acc-head">
+            <input type="checkbox" class="rm_enabled" title="Açık / kapalı" ${rem.enabled ? 'checked' : ''} />
+            <div class="acc-head-txt">
+                <span class="acc-t rm_title"></span>
+                <span class="acc-s rm_sum"></span>
+            </div>
         </div>
-        <div class="muted" style="font-size:12px; margin:-2px 0 8px">${esc(RM_TYPE_LABEL[rem.type] || rem.type)}</div>
-        <div class="field">
-            <label>Mesaj şablonu</label>
-            <textarea class="rm_template" placeholder="Sayın {firma} müşterimiz, ...">${esc(rem.template || '')}</textarea>
-            <div class="chips rm_chips">${vars.map(v => `<span class="chip" data-v="${v}">${v}</span>`).join('')}</div>
-            ${isOverdue ? '<div class="hint">{kalan}=geciken borç tutarı, {gecikmeGun}=gün, {enEskiVade}=en eski vade tarihi.</div>' : '<div class="hint">{bakiye}=kalan borç (cari hareketten, işaretsiz; belge mesajıyla aynı). {durum}=Borç/Alacak.</div>'}
-        </div>
-        <div class="grid2">
-            <div><label>Gün sıklığı</label><input class="rm_interval" type="number" min="1" value="${Number(rem.intervalDays) || 7}" /></div>
-            <div><label>Gönderim saati</label><input class="rm_time" type="time" value="${esc(rem.sendTime || '10:00')}" /></div>
-            <div><label>Başlangıç tarihi</label><input class="rm_start" type="date" value="${esc(startVal)}" /></div>
-            <div><label>Min tutar (TL)</label><input class="rm_min" type="number" min="0" value="${Number(rem.minAmount) || 0}" /></div>
-        </div>
-        <div class="field"><label>Varsayılan vade günü (cari vadesi boşsa)</label><input class="rm_vade" type="number" min="0" value="${Number(rem.vadeGunDefault) || 90}" /></div>
-        <label class="check"><input type="checkbox" class="rm_onlySms" ${rem.onlySmsGonder ? 'checked' : ''} /> Sadece <b>SMS Gönder izni</b> olan carilere</label>
-        <label class="check"><input type="checkbox" class="rm_verify" ${rem.verifyOnWhatsApp !== false ? 'checked' : ''} /> Numara WhatsApp'ta mı kontrol et</label>
-        <div class="field">
-            <label>Görsel / Video (opsiyonel)</label>
-            <input type="file" class="rm_media" accept="image/*,video/*" />
-            <div class="rm_mediaInfo hint" style="${mediaInfo ? '' : 'display:none'}">${mediaInfo}</div>
+        <div class="acc-body">
+            <div class="field">
+                <label>Mesaj</label>
+                <textarea class="rm_template" placeholder="Sayın {firma}, ...">${esc(rem.template || '')}</textarea>
+            </div>
+            <div class="grid2">
+                <div><label>Kaç günde bir?</label><input class="rm_interval" type="number" min="1" value="${Number(rem.intervalDays) || 7}" /></div>
+                <div><label>Saat</label><input class="rm_time" type="time" value="${esc(rem.sendTime || '10:00')}" /></div>
+            </div>
+            <details class="adv">
+                <summary>Gelişmiş</summary>
+                <div class="field"><label>Adı</label><input class="rm_name" value="${esc(rem.name || RM_TYPE_LABEL[rem.type] || '')}" /></div>
+                <div class="grid2">
+                    <div><label>Başlangıç tarihi</label><input class="rm_start" type="date" value="${esc(startVal)}" /></div>
+                    <div><label>En az tutar (TL)</label><input class="rm_min" type="number" min="0" value="${Number(rem.minAmount) || 0}" /></div>
+                    <div><label>Varsayılan vade günü</label><input class="rm_vade" type="number" min="0" value="${Number(rem.vadeGunDefault) || 90}" /></div>
+                </div>
+                <label class="check" style="margin-top:8px"><input type="checkbox" class="rm_onlySms" ${rem.onlySmsGonder ? 'checked' : ''} /> Yalnız "SMS Gönder" izni olanlara</label>
+                <label class="check"><input type="checkbox" class="rm_verify" ${rem.verifyOnWhatsApp !== false ? 'checked' : ''} /> Numara WhatsApp'ta mı kontrol et</label>
+                <div class="field" style="margin-top:8px">
+                    <label>Görsel / video</label>
+                    <input type="file" class="rm_media" accept="image/*,video/*" />
+                    <div class="rm_mediaInfo hint" style="${mediaInfo ? '' : 'display:none'}">${mediaInfo}</div>
+                </div>
+            </details>
+            <div class="acc-foot">
+                <button class="btn ghost sm rm_preview" type="button" title="Göndermeden: kime ne gidecek">Kime gidecek?</button>
+                <button class="btn ghost sm rm_test" type="button" title="Şimdi bir kez gönder">Şimdi gönder</button>
+            </div>
         </div>`;
-    card.querySelectorAll('.rm_chips .chip').forEach(ch => ch.onclick = () => {
-        const ta = card.querySelector('.rm_template');
-        const v = ch.dataset.v;
-        const pos = ta.selectionStart ?? ta.value.length;
-        ta.value = ta.value.slice(0, pos) + v + ta.value.slice(pos);
-        ta.focus();
-    });
+
+    const tpl = card.querySelector('.rm_template');
+    const updateHead = () => {
+        card.querySelector('.rm_title').textContent = card.querySelector('.rm_name').value.trim() || RM_TYPE_LABEL[rem.type] || 'Hatırlatma';
+        const n = +card.querySelector('.rm_interval').value || 7;
+        card.querySelector('.rm_sum').textContent = `Her ${n} günde bir · saat ${card.querySelector('.rm_time').value || '10:00'}`;
+    };
+    updateHead();
+    ['.rm_name', '.rm_interval', '.rm_time'].forEach(s => card.querySelector(s).addEventListener('input', updateHead));
+
+    const head = card.querySelector('.acc-head');
+    const enabled = card.querySelector('.rm_enabled');
+    head.addEventListener('click', (e) => { if (e.target !== enabled) card.classList.toggle('open'); });
+    enabled.addEventListener('change', () => card.classList.toggle('off', !enabled.checked));
+
     card.querySelector('.rm_test').onclick = () => testReminder(card);
     card.querySelector('.rm_preview').onclick = () => previewReminderCard(card);
     // overdueBuyer (geciken/vade) ŞU AN ASKIDA: kart gizli ama DOM'da kalır →
@@ -2175,6 +2300,7 @@ function createReminderCard(rem) {
         await api(`/reminders/${rem.id}/media/clear`, { method: 'POST' });
         const box = card.querySelector('.rm_mediaInfo'); box.style.display = 'none'; box.innerHTML = '';
     };
+    mountTemplateEditor(tpl, vars, { presets: RM_PRESETS, labels: { '{kalan}': 'Geciken tutar' } });
     return card;
 }
 
@@ -2356,8 +2482,8 @@ function renderRemindersStatus(s) {
     if (s.lastResult?.note) parts.push(`Son: ${s.lastResult.note}`);
     if (s.lastTickAt) parts.push(`Son denetim: ${new Date(s.lastTickAt).toLocaleTimeString('tr-TR')}`);
     if (s.lastError) parts.push(`⚠ ${s.lastError}`);
-    $('rm_status').textContent = parts.join('  •  ') || '—';
-    $('rm_info').textContent = active ? `${active} aktif kategori` : '';
+    $('rm_status').textContent = parts.join(' · ') || '—';
+    $('rm_info').textContent = '';   // aynı bilgi durum satırında — iki kez yazılmasın
 }
 
 async function refreshRemindersLog() {
