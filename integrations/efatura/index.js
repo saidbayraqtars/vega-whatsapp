@@ -154,6 +154,14 @@ class Integration {
         atomicJson(file, { ...readLocalSettings(this.host.dataDir), ...patch });
     }
 
+    // Ana ekrandaki "Son gonderilenler" listesine yaz. e-Fatura hatasi
+    // ProgramData logunda saklı kalmasin: belge metin olarak da gitmediği icin
+    // kullanici ekranda gormezse musteri hic mesaj almamis olur.
+    uiLog(entry) {
+        try { if (typeof this.host.log === 'function') this.host.log({ ruleName: 'e-Fatura PDF', ...entry }); }
+        catch { /* ana log yazilamadi, dosya logu yeterli */ }
+    }
+
     log(level, message) {
         const line = `${new Date().toISOString()} [${level}] ${message}`;
         try { fs.appendFileSync(this.logFile, line + '\n', 'utf8'); } catch { /* console yine calisir */ }
@@ -205,10 +213,12 @@ class Integration {
         const contact = contacts.get(Number(row.CARIIND));
         if (!this.testPhone && (!contact || !contact.valid || !contact.phone)) {
             this.state.setDoc(itemKey, { status: 'skipped', reason: 'gecerli cari cep telefonu yok', cariInd: row.CARIIND });
+            this.uiLog({ status: 'noPhone', name: (contact && contact.name) || 'e-Fatura', evrak: row.BELGENO, error: 'PDF gonderilemedi: cari cep telefonu yok' });
             return { skipped: 'telefon-yok', belgeNo: row.BELGENO };
         }
         if (contact && contact.pasif && !this.testPhone) {
             this.state.setDoc(itemKey, { status: 'skipped', reason: 'cari pasif', cariInd: row.CARIIND });
+            this.uiLog({ status: 'pasif', name: contact.name || 'e-Fatura', evrak: row.BELGENO, error: 'PDF gonderilmedi: cari pasif' });
             return { skipped: 'cari-pasif', belgeNo: row.BELGENO };
         }
 
@@ -267,6 +277,12 @@ class Integration {
                 recalled = await this.recallMessage(old);
                 this.state.setDoc(itemKey, { previousRecall: recalled, previousWaMessageId: old.waMessageId });
             }
+            this.uiLog({
+                status: mode === 'update' ? 'edited' : 'sent',
+                name: (this.testPhone ? '[TEST] ' : '') + (who.name || 'e-Fatura'),
+                phone: target.phone, evrak: row.BELGENO, tutar: formatMoney(row.TUTAR),
+                error: `PDF ${mode === 'update' ? 'guncellendi' : 'gonderildi'} (${rendered.design})`,
+            });
             this.log('INFO', `${row.BELGENO} ${row.DOCUMENT_TYPE} PDF ${mode === 'update' ? 'guncellenerek ' : ''}gonderildi (${rendered.design}, ${rendered.pdf.length} bayt)${this.testPhone ? ` [TEST → ${target.phone}]` : ''}`);
             return { sent: true, updated: mode === 'update', recalled, belgeNo: row.BELGENO, type: row.DOCUMENT_TYPE, design: rendered.design };
         } finally {
@@ -308,6 +324,10 @@ class Integration {
             cancelledAt: new Date().toISOString(), cancelReason: reason, recalled,
             cancelMessageId: result.id || (result.key && result.key.id) || null,
         });
+        this.uiLog({
+            status: 'recalled', name: doc.contactName || 'e-Fatura', phone: doc.phone,
+            evrak: doc.belgeNo || String(doc.ind), error: `fatura ${reason}; musteriye iptal bildirimi gonderildi`,
+        });
         this.log('INFO', `${doc.belgeNo || doc.ind} ${reason}; musteriye iptal bildirimi gonderildi`);
         return { cancelled: true, reason, belgeNo: doc.belgeNo };
     }
@@ -347,6 +367,7 @@ class Integration {
                 this.state.setDoc(doc.key, { lastChangeError: e.message, changeAttempts: Number(doc.changeAttempts || 0) + 1 });
                 this.lastError = e.message;
                 this.log('ERROR', `${doc.belgeNo || doc.ind} degisiklik/iptal islenemedi: ${e.message}`);
+                this.uiLog({ status: 'failed', name: doc.contactName || 'e-Fatura PDF', evrak: doc.belgeNo || String(doc.ind), error: `degisiklik/iptal islenemedi: ${e.message}` });
                 results.push({ belgeNo: doc.belgeNo, error: e.message });
                 break;
             }
@@ -415,7 +436,10 @@ class Integration {
                     this.state.setDoc(itemKey, { status: 'error', attempts: Number(previous.attempts || 0) + 1, lastError: e.message });
                     this.lastError = e.message;
                     // Ayni hata her taramada tekrarlanir (ornegin dizayn yok); log bir kez yazilsin.
-                    if (previous.lastError !== e.message) this.log('ERROR', `${row.BELGENO} islenemedi: ${e.message}`);
+                    if (previous.lastError !== e.message) {
+                        this.log('ERROR', `${row.BELGENO} islenemedi: ${e.message}`);
+                        this.uiLog({ status: 'failed', name: 'e-Fatura PDF', evrak: row.BELGENO, error: e.message });
+                    }
                     results.push({ belgeNo: row.BELGENO, error: e.message });
                     cursor = Number(row.IND);
                     break;

@@ -1242,8 +1242,12 @@ function resetWatermark() {
     if (t) { delete state.lastSeenInd[t]; saveState(); }
 }
 
+// Entegrasyonlar (e-Fatura PDF) kendi sonuclarini ayni "Son gonderilenler"
+// akisina yazsin: kullanici tek ekranda gorur, hatayi aramak zorunda kalmaz.
+function logEntry(entry) { pushLog(entry || {}); }
+
 module.exports = {
-    configure, autoStart, start, stop,
+    configure, autoStart, start, stop, logEntry,
     getConfig, setConfig, getStatus, getLog, resetWatermark, pollOnce,
     setRuleMedia, clearRuleMedia, clearPending,
 };

@@ -31,6 +31,15 @@ $donePath = Join-Path $requestDir ("done-{0}.json" -f $jobId)
 Remove-Item -LiteralPath $requestPath -Force
 
 try {
+    # Vega konsolu requireAdministrator manifesti tasir. Gorev yukseltilmemis
+    # calisiyorsa Start-Process UAC istemek zorunda kalir, oturum acilamadigi icin
+    # Windows "islem kullanici tarafindan iptal edildi" (1223) der ve tur 2 dakika
+    # bosa bekler. Onceden anla, hemen anlasilir hatayi yaz.
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $isAdmin = (New-Object Security.Principal.WindowsPrincipal $me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        throw ("Vega export gorevi yonetici yetkisiyle calismiyor (hesap: {0}). tools\setup-task.cmd dosyasini yonetici olarak bir kez calistirin." -f $me.Name)
+    }
     $consoleDir = Find-ConsoleDir
     $tempDir = Join-Path $consoleDir 'temp'
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
@@ -39,7 +48,11 @@ try {
     Get-ChildItem -LiteralPath $tempDir -Filter '*_dump.xml' -File -ErrorAction SilentlyContinue | ForEach-Object {
         $before[$_.FullName] = "{0}:{1}" -f $_.Length,$_.LastWriteTimeUtc.Ticks
     }
-    $proc = Start-Process -FilePath (Join-Path $consoleDir 'vega.earsiv.console.exe') -ArgumentList @($indText, 'einvoice') -WorkingDirectory $consoleDir -WindowStyle Hidden -PassThru
+    try {
+        $proc = Start-Process -FilePath (Join-Path $consoleDir 'vega.earsiv.console.exe') -ArgumentList @($indText, 'einvoice') -WorkingDirectory $consoleDir -WindowStyle Hidden -PassThru
+    } catch {
+        throw ("Vega konsolu baslatilamadi ({0}). Gorev yonetici yetkisiyle calismiyor olabilir: tools\setup-task.cmd dosyasini yonetici olarak calistirin." -f $_.Exception.Message)
+    }
     $xml = $null
     $exitedAt = $null
     $deadline = (Get-Date).AddSeconds(115)

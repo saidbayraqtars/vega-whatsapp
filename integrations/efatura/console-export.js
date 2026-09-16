@@ -47,6 +47,30 @@ async function waitForXml(tempDir, before, startedAt, timeoutMs, expectedBelgeNo
     throw new Error(`Vega UBL ${Math.round(timeoutMs / 1000)} sn icinde uretilmedi`);
 }
 
+// Gorev yukseltilmemis calisirsa Windows, requireAdministrator manifestli Vega
+// konsolunu baslatmayi reddeder ve mesaj "islem kullanici tarafindan iptal
+// edildi" (hata 1223) olur. Kullaniciya ne yapacagini soyleyen metne cevir.
+function friendlyTaskError(message) {
+    const raw = String(message || '').trim();
+    if (/iptal edildi|cancell?ed|1223|elevat|yetki/i.test(raw)) {
+        return 'Vega konsolu yonetici yetkisiyle baslatilamadi (gorev yukseltilmemis calisiyor). '
+            + 'integrations\\efatura\\tools\\setup-task.cmd dosyasini yonetici olarak bir kez calistirin.';
+    }
+    return raw || 'Vega export gorevi basarisiz';
+}
+
+// Zaman asiminda gec yazilan done dosyalari birikir; her istekten once eskileri
+// temizle ki klasor sismesin ve karisiklik olmasin.
+function cleanStaleDoneFiles(requestsDir, maxAgeMs = 600000) {
+    try {
+        for (const name of fs.readdirSync(requestsDir)) {
+            if (!/^done-.*.json$/i.test(name)) continue;
+            const file = path.join(requestsDir, name);
+            try { if (Date.now() - fs.statSync(file).mtimeMs > maxAgeMs) fs.unlinkSync(file); } catch { /* baskasi silmis */ }
+        }
+    } catch { /* klasor yok */ }
+}
+
 function invoiceId(xml) {
     // Kok Invoice'in dogrudan cbc:ID alani, satir/party ID'lerinden once gelir.
     const m = String(xml || '').match(/<(?:cbc:)?ID(?:\s[^>]*)?>([^<]+)<\/(?:cbc:)?ID>/i);
@@ -72,6 +96,7 @@ function taskExists(taskName) {
 async function runViaTask({ taskName, dataDir, ind, expectedBelgeNo, timeoutMs }) {
     const requests = path.join(dataDir, 'requests');
     fs.mkdirSync(requests, { recursive: true });
+    cleanStaleDoneFiles(requests);
     const jobId = crypto.randomUUID();
     const requestPath = path.join(requests, 'request.json');
     const donePath = path.join(requests, `done-${jobId}.json`);
@@ -84,7 +109,7 @@ async function runViaTask({ taskName, dataDir, ind, expectedBelgeNo, timeoutMs }
         if (fs.existsSync(donePath)) {
             const done = JSON.parse(fs.readFileSync(donePath, 'utf8'));
             try { fs.unlinkSync(donePath); } catch { /* kritik degil */ }
-            if (!done.ok) throw new Error(done.error || 'Vega export gorevi basarisiz');
+            if (!done.ok) throw new Error(friendlyTaskError(done.error));
             const xml = fs.readFileSync(done.xmlPath, 'utf8');
             if (invoiceId(xml) !== expectedBelgeNo) {
                 throw new Error(`Vega e-Fatura firma/donem ayari uyusmuyor: beklenen ${expectedBelgeNo}, uretilen ${invoiceId(xml) || '(okunamadi)'}`);
@@ -93,7 +118,8 @@ async function runViaTask({ taskName, dataDir, ind, expectedBelgeNo, timeoutMs }
         }
         await sleep(350);
     }
-    throw new Error(`yuksek yetkili Vega export gorevi ${Math.round(timeoutMs / 1000)} sn icinde bitmedi`);
+    throw new Error(`yuksek yetkili Vega export gorevi ${Math.round(timeoutMs / 1000)} sn icinde bitmedi`
+        + ' (gorev yonetici yetkisiyle kayitli degilse tools\\setup-task.cmd dosyasini yonetici olarak calistirin)');
 }
 
 async function runDirect({ consoleDir, ind, expectedBelgeNo, timeoutMs }) {
@@ -136,4 +162,4 @@ function exportInvoice(opts) {
     return next;
 }
 
-module.exports = { exportInvoice, findConsoleDir, taskExists, invoiceId, EXE };
+module.exports = { exportInvoice, findConsoleDir, taskExists, invoiceId, friendlyTaskError, cleanStaleDoneFiles, EXE };
