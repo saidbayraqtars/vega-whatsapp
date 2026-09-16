@@ -5,11 +5,23 @@ const db = require('./db');
 const exporter = require('./console-export');
 const renderer = require('./renderer');
 
+// Virus tarayici/yedekleme araci dosyayi kisa sure kilitleyince rename EPERM
+// verir. Canlida bu tum taramayi dusurdu; birkac kez dene, olmazsa dogrudan yaz.
+function sleepSync(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function atomicJson(file, value) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
+    const text = JSON.stringify(value, null, 2);
     const tmp = file + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8');
-    fs.renameSync(tmp, file);
+    fs.writeFileSync(tmp, text, 'utf8');
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try { fs.renameSync(tmp, file); return; }
+        catch { sleepSync(80); }
+    }
+    try { fs.writeFileSync(file, text, 'utf8'); }
+    finally { try { fs.unlinkSync(tmp); } catch { /* sonraki yazimda ustune gelir */ } }
 }
 
 // TR cep numarasi → 905xxxxxxxxx (bos/gecersizse '').
