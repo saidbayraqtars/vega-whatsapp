@@ -3349,6 +3349,11 @@ integrations.configure({
     checkOnWhatsApp: waCheckX,
     gate: (ch) => gateX(ch, null),
     getEnabled: () => { const c = loadConfigFile(); return (c && c.efatura) || null; },
+    // "Carideki tüm telefonlara gönder" belge mesajı gibi e-Fatura PDF'ine de uygulanır.
+    getWatcherOptions: () => {
+        try { const w = watcher.getConfig(); return { sendAllPhones: !!(w && w.sendAllPhones) }; }
+        catch { return { sendAllPhones: false }; }
+    },
     // Entegrasyon sonuclari "Son gönderilenler" listesinde görünsün.
     log: (entry) => { try { watcher.logEntry(entry); } catch { /* log kritik değil */ } },
     getContext: () => {

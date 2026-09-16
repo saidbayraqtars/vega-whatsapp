@@ -204,16 +204,42 @@ class Integration {
             && String(item.evrak || '').trim().length === 16;
     }
 
+    // Belgenin gittigi tum numaralar. Eski kayitlarda yalniz phone/waMessageId vardir.
+    static deliveries(doc) {
+        if (!doc) return [];
+        if (Array.isArray(doc.sends) && doc.sends.length) return doc.sends.filter(s => s && s.phone);
+        return doc.phone ? [{ phone: doc.phone, waMessageId: doc.waMessageId || null }] : [];
+    }
+
     async recallMessage(doc) {
-        if (!doc || !doc.phone || !doc.waMessageId || !this.host.waDelete) return { skipped: true };
-        try {
-            const result = await this.host.waDelete(doc.phone, doc.waMessageId);
-            if (!result || result.success === false) throw new Error((result && (result.error || result.message)) || 'mesaj geri cekilemedi');
-            return { success: true };
-        } catch (e) {
-            this.log('WARN', `${doc.belgeNo || doc.ind} onceki PDF geri cekilemedi: ${e.message}`);
-            return { success: false, error: e.message };
+        const targets = Integration.deliveries(doc).filter(s => s.waMessageId);
+        if (!targets.length || !this.host.waDelete) return { skipped: true };
+        const errors = [];
+        for (const s of targets) {
+            try {
+                const result = await this.host.waDelete(s.phone, s.waMessageId);
+                if (!result || result.success === false) throw new Error((result && (result.error || result.message)) || 'mesaj geri cekilemedi');
+            } catch (e) {
+                errors.push(`${s.phone}: ${e.message}`);
+            }
         }
+        if (!errors.length) return { success: true };
+        this.log('WARN', `${doc.belgeNo || doc.ind} onceki PDF geri cekilemedi: ${errors.join('; ')}`);
+        return { success: false, error: errors.join('; ') };
+    }
+
+    // Watcher'daki "Carideki tum telefonlara gonder" ayari PDF icin de gecerli.
+    recipients(contact) {
+        const opts = typeof this.host.getWatcherOptions === 'function' ? (this.host.getWatcherOptions() || {}) : {};
+        const phones = opts.sendAllPhones && contact && Array.isArray(contact.phones) && contact.phones.length
+            ? contact.phones : [contact && contact.phone];
+        return [...new Set(phones.filter(Boolean))];
+    }
+
+    // Ayni cariye art arda numaralar arasinda kisa bekleme (anti-ban, watcher gibi).
+    async phoneGap() {
+        const ms = this.phoneGapMs != null ? this.phoneGapMs : 3000 + Math.floor(Math.random() * 4000);
+        if (ms > 0) await new Promise(r => setTimeout(r, ms));
     }
 
     async processOne(ctx, row, mode = 'initial') {
@@ -271,33 +297,56 @@ class Integration {
             const target = this.testTarget(who);
             const text = target.prefix + caption(mode === 'update' ? this.settings.updatedCaption : this.settings.caption, row, who);
             const fileName = `${String(row.BELGENO).replace(/[^A-Za-z0-9._-]/g, '_')}.pdf`;
-            const result = await this.host.waSend(target.phone, text, {
-                kind: 'document', buffer: rendered.pdf, mimetype: 'application/pdf', fileName,
-            }, { simulateTyping: true, typingMs: 1200, channel: 'watcher' });
-            if (!result || result.success === false) throw new Error((result && (result.error || result.message)) || 'WhatsApp gonderimi basarisiz');
+            const media = { kind: 'document', buffer: rendered.pdf, mimetype: 'application/pdf', fileName };
+            // PDF bir kez uretilir, secili her numaraya ayni belge gider.
+            const sends = [], failures = [];
+            for (const [i, phone] of target.phones.entries()) {
+                if (i > 0) {
+                    const g = this.host.gate ? this.host.gate('watcher') : { ok: true };
+                    if (g && g.ok === false) { failures.push({ phone, error: `gonderim limiti: ${g.reason || 'dolu'}` }); continue; }
+                    await this.phoneGap();
+                }
+                try {
+                    const result = await this.host.waSend(phone, text, media, { simulateTyping: true, typingMs: 1200, channel: 'watcher' });
+                    if (!result || result.success === false) throw new Error((result && (result.error || result.message)) || 'WhatsApp gonderimi basarisiz');
+                    sends.push({ phone, waMessageId: result.id || (result.key && result.key.id) || null });
+                } catch (e) {
+                    failures.push({ phone, error: e.message });
+                }
+            }
+            // Hicbir numaraya gitmediyse belge sonraki turda yeniden denenir. Bir kismina
+            // gittiyse "gonderildi" sayilir: yeniden denemek gidenlere ikinci PDF atar.
+            if (!sends.length) throw new Error(failures.map(f => `${f.phone}: ${f.error}`).join('; ') || 'WhatsApp gonderimi basarisiz');
             this.state.setDoc(itemKey, {
                 status: 'sent', sentAt: new Date().toISOString(), type: row.DOCUMENT_TYPE,
                 contextKey: this.key(ctx), ind: Number(row.IND), belgeNo: row.BELGENO,
-                phone: target.phone, cariInd: row.CARIIND, design: rendered.design, testMode: !!this.testPhone,
+                phone: sends[0].phone, sends, failedPhones: failures,
+                cariInd: row.CARIIND, design: rendered.design, testMode: !!this.testPhone,
                 contactName: who.name || '', invoiceDate: row.TARIH, amount: row.TUTAR,
                 currency: row.PARABIRIMI || 'TL', fingerprint: fingerprint(row),
-                waMessageId: result.id || (result.key && result.key.id) || null,
+                waMessageId: sends[0].waMessageId,
                 revision: mode === 'update' ? Number((old && old.revision) || 1) + 1 : 1,
                 pdfBytes: rendered.pdf.length, exportMode: exported.mode,
             });
             let recalled = null;
-            if (mode === 'update' && old && old.waMessageId) {
+            if (mode === 'update' && old && Integration.deliveries(old).some(s => s.waMessageId)) {
                 recalled = await this.recallMessage(old);
-                this.state.setDoc(itemKey, { previousRecall: recalled, previousWaMessageId: old.waMessageId });
+                this.state.setDoc(itemKey, { previousRecall: recalled, previousWaMessageId: old.waMessageId, previousSends: Integration.deliveries(old) });
             }
-            this.uiLog({
-                status: mode === 'update' ? 'edited' : 'sent',
-                name: (this.testPhone ? '[TEST] ' : '') + (who.name || 'e-Fatura'),
-                phone: target.phone, evrak: row.BELGENO, tutar: formatMoney(row.TUTAR),
-                error: `PDF ${mode === 'update' ? 'guncellendi' : 'gonderildi'} (${rendered.design})`,
-            });
-            this.log('INFO', `${row.BELGENO} ${row.DOCUMENT_TYPE} PDF ${mode === 'update' ? 'guncellenerek ' : ''}gonderildi (${rendered.design}, ${rendered.pdf.length} bayt)${this.testPhone ? ` [TEST → ${target.phone}]` : ''}`);
-            return { sent: true, updated: mode === 'update', recalled, belgeNo: row.BELGENO, type: row.DOCUMENT_TYPE, design: rendered.design };
+            const name = (this.testPhone ? '[TEST] ' : '') + (who.name || 'e-Fatura');
+            for (const s of sends) {
+                this.uiLog({
+                    status: mode === 'update' ? 'edited' : 'sent', name,
+                    phone: s.phone, evrak: row.BELGENO, tutar: formatMoney(row.TUTAR),
+                    error: `PDF ${mode === 'update' ? 'guncellendi' : 'gonderildi'} (${rendered.design})`,
+                });
+            }
+            for (const f of failures) {
+                this.uiLog({ status: 'failed', name, phone: f.phone, evrak: row.BELGENO, error: `PDF bu numaraya gonderilemedi: ${f.error}` });
+                this.log('WARN', `${row.BELGENO} PDF ${f.phone} numarasina gonderilemedi: ${f.error}`);
+            }
+            this.log('INFO', `${row.BELGENO} ${row.DOCUMENT_TYPE} PDF ${mode === 'update' ? 'guncellenerek ' : ''}gonderildi (${rendered.design}, ${rendered.pdf.length} bayt) → ${sends.map(s => s.phone).join(', ')}${this.testPhone ? ' [TEST]' : ''}`);
+            return { sent: true, updated: mode === 'update', recalled, belgeNo: row.BELGENO, type: row.DOCUMENT_TYPE, design: rendered.design, phones: sends.map(s => s.phone), failed: failures.length };
         } finally {
             try { fs.unlinkSync(htmlPath); } catch { /* gecici dosya yok */ }
             try { fs.unlinkSync(exported.xmlPath); } catch { /* Vega temp temizligi kritik degil */ }
@@ -308,10 +357,11 @@ class Integration {
     // Test modunda alici test numarasi olur; mesajin basina gercek alici yazilir ki
     // testte kimin alacagi gorulsun.
     testTarget(contact) {
-        if (!this.testPhone) return { phone: contact.phone, prefix: '' };
-        const real = contact && contact.phone ? contact.phone : 'telefon yok';
+        const phones = this.recipients(contact);
+        if (!this.testPhone) return { phone: phones[0], phones, prefix: '' };
+        const real = phones.length ? phones.join(', ') : 'telefon yok';
         return {
-            phone: this.testPhone,
+            phone: this.testPhone, phones: [this.testPhone],
             prefix: `🔔 TEST — gercek alici: ${(contact && contact.name) || '(cari adi yok)'} (${real})\n`,
         };
     }
@@ -329,19 +379,32 @@ class Integration {
         // Test modunda gonderilen belge doc.phone'da zaten test numarasini tasir.
         const prefix = (this.testPhone || doc.testMode) ? `🔔 TEST — gercek alici: ${doc.contactName || '(cari adi yok)'}\n` : '';
         const text = prefix + caption(this.settings.cancelledCaption, invoice, { name: doc.contactName || '' });
-        const result = await this.host.waSend(doc.phone, text, null, {
-            simulateTyping: true, typingMs: 900, channel: 'watcher',
-        });
-        if (!result || result.success === false) throw new Error((result && (result.error || result.message)) || 'iptal bildirimi gonderilemedi');
+        // PDF hangi numaralara gittiyse iptal bildirimi de onlara gider.
+        const phones = [...new Set(Integration.deliveries(doc).map(s => s.phone))];
+        const notified = [], errors = [];
+        for (const [i, phone] of phones.entries()) {
+            if (i > 0) await this.phoneGap();
+            try {
+                const result = await this.host.waSend(phone, text, null, { simulateTyping: true, typingMs: 900, channel: 'watcher' });
+                if (!result || result.success === false) throw new Error((result && (result.error || result.message)) || 'iptal bildirimi gonderilemedi');
+                notified.push({ phone, waMessageId: result.id || (result.key && result.key.id) || null });
+            } catch (e) {
+                errors.push(`${phone}: ${e.message}`);
+            }
+        }
+        if (!notified.length) throw new Error(errors.join('; ') || 'iptal bildirimi gonderilemedi');
+        if (errors.length) this.log('WARN', `${doc.belgeNo || doc.ind} iptal bildirimi bazi numaralara gitmedi: ${errors.join('; ')}`);
         this.state.setDoc(doc.key, {
             status: reason === 'silindi' ? 'deleted' : 'cancelled',
             cancelledAt: new Date().toISOString(), cancelReason: reason, recalled,
-            cancelMessageId: result.id || (result.key && result.key.id) || null,
+            cancelMessageId: notified[0].waMessageId, cancelSends: notified,
         });
-        this.uiLog({
-            status: 'recalled', name: doc.contactName || 'e-Fatura', phone: doc.phone,
-            evrak: doc.belgeNo || String(doc.ind), error: `fatura ${reason}; musteriye iptal bildirimi gonderildi`,
-        });
+        for (const n of notified) {
+            this.uiLog({
+                status: 'recalled', name: doc.contactName || 'e-Fatura', phone: n.phone,
+                evrak: doc.belgeNo || String(doc.ind), error: `fatura ${reason}; musteriye iptal bildirimi gonderildi`,
+            });
+        }
         this.log('INFO', `${doc.belgeNo || doc.ind} ${reason}; musteriye iptal bildirimi gonderildi`);
         return { cancelled: true, reason, belgeNo: doc.belgeNo };
     }
