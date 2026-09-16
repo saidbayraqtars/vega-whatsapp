@@ -43,6 +43,28 @@ function Get-DumpFiles($dirs) {
     return $files
 }
 
+# Konsol hatayi ekrana degil kendi NLog dosyasina yazar (C:\eArsiv\logs\gg.log)
+# ve yine 0 ile cikar. Gercek sebep orada: "PayableAmount 0 olamaz", "dizayn yok"
+# gibi. Basarisizlikta o satiri bulup hataya ekliyoruz.
+function Get-VegaLogError([string]$consoleDir, [datetime]$since) {
+    try {
+        $file = Join-Path $consoleDir ('logs\{0}.log' -f (Get-Date -Format 'yyyy-MM-dd'))
+        if (-not (Test-Path -LiteralPath $file)) { return '' }
+        $lines = Get-Content -LiteralPath $file -Tail 200 -ErrorAction Stop
+        $hit = ''
+        foreach ($line in $lines) {
+            $m = [regex]::Match($line, '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+            if (-not $m.Success) { continue }
+            $stamp = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact($m.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss',
+                [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$stamp)) { continue }
+            if ($stamp -lt $since.AddSeconds(-5)) { continue }
+            if ($line -match 'Exception|ERROR') { $hit = $line }
+        }
+        return ($hit -replace '\s+', ' ').Trim()
+    } catch { return '' }
+}
+
 function Read-InvoiceId([string]$path) {
     try {
         [xml]$doc = Get-Content -LiteralPath $path -Raw
@@ -136,6 +158,11 @@ try {
         if ($consoleOut) {
             if ($consoleOut.Length -gt 300) { $consoleOut = $consoleOut.Substring(0, 300) + '...' }
             $detay += ("konsol ciktisi: " + $consoleOut)
+        }
+        $vegaLog = Get-VegaLogError $consoleDir $started
+        if ($vegaLog) {
+            if ($vegaLog.Length -gt 400) { $vegaLog = $vegaLog.Substring(0, 400) + '...' }
+            $detay += ("Vega kaydi: " + $vegaLog)
         }
         $kod = if ($proc.HasExited) { [string]$proc.ExitCode } else { 'calisiyor' }
         throw ("Vega UBL uretilmedi (IND {0}, beklenen {1}, konsol cikis kodu {2}). {3}" -f $indText, $expectedBelgeNo, $kod, ($detay -join ' | '))
