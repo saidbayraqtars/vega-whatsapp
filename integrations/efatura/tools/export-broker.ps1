@@ -59,19 +59,34 @@ function Get-VegaLogError([string]$consoleDir, [datetime]$since) {
             if (-not [datetime]::TryParseExact($m.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss',
                 [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$stamp)) { continue }
             if ($stamp -lt $since.AddSeconds(-5)) { continue }
-            if ($line -match 'Exception|ERROR') { $hit = $line }
+            # Vega adim kayitlarini da ERROR seviyesinde yazar ("step 1-3"); yalniz istisna gercek sebep.
+            if ($line -match 'Exception') { $hit = $line }
         }
         return ($hit -replace '\s+', ' ').Trim()
     } catch { return '' }
 }
 
-function Read-InvoiceId([string]$path) {
+# Kok Invoice'in ID ve UUID'si. Bazi firmalarda Vega numarayi GIB'e gonderirken
+# verir; dump'ta <cbc:ID /> bos gelir. O zaman fatura ETTN (UUID) ile taninir.
+function Read-InvoiceKeys([string]$path) {
+    $keys = @{ ok=$false; id=''; uuid='' }
     try {
-        [xml]$doc = Get-Content -LiteralPath $path -Raw
+        $doc = New-Object Xml.XmlDocument
+        $doc.Load($path)
+        $keys.ok = $true
         $node = $doc.SelectSingleNode('/*[local-name()="Invoice"]/*[local-name()="ID"][1]')
-        if ($node) { return $node.InnerText.Trim() }
+        if ($node) { $keys.id = $node.InnerText.Trim() }
+        $node = $doc.SelectSingleNode('/*[local-name()="Invoice"]/*[local-name()="UUID"][1]')
+        if ($node) { $keys.uuid = $node.InnerText.Trim() }
     } catch { }
-    return ''
+    return $keys
+}
+
+function Test-InvoiceMatch($keys, [string]$belgeNo, [string]$uuid) {
+    if (-not $keys.ok) { return $false }
+    if ($keys.id) { return $keys.id -eq $belgeNo }
+    if (-not $uuid) { return $true }
+    return $keys.uuid -ieq $uuid
 }
 
 if (-not (Test-Path -LiteralPath $requestPath)) { exit 0 }
@@ -79,9 +94,11 @@ $request = Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json
 $jobId = [string]$request.jobId
 $indText = [string]$request.ind
 $expectedBelgeNo = [string]$request.expectedBelgeNo
+$expectedUuid = ([string]$request.expectedUuid).Trim()
 if ($jobId -notmatch '^[0-9a-fA-F-]{36}$') { throw 'Gecersiz jobId.' }
 if ($indText -notmatch '^[1-9][0-9]{0,9}$') { throw 'Gecersiz fatura IND.' }
 if ($expectedBelgeNo -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw 'Gecersiz BELGENO.' }
+if ($expectedUuid -and $expectedUuid -notmatch '^[0-9a-fA-F-]{32,36}$') { $expectedUuid = '' }
 $donePath = Join-Path $requestDir ("done-{0}.json" -f $jobId)
 Remove-Item -LiteralPath $requestPath -Force
 
@@ -138,9 +155,10 @@ try {
             $sig = "{0}:{1}" -f $f.Length,$f.LastWriteTimeUtc.Ticks
             if ($f.Length -gt 0 -and $f.LastWriteTime -ge $started.AddSeconds(-2) -and $before[$f.FullName] -ne $sig) {
                 $before[$f.FullName] = $sig
-                $id = Read-InvoiceId $f.FullName
-                $found += ("{0}(ID={1})" -f $f.Name, $(if ($id) { $id } else { 'okunamadi' }))
-                if ($id -eq $expectedBelgeNo) { $xml = $f.FullName; break }
+                $keys = Read-InvoiceKeys $f.FullName
+                $idText = if (-not $keys.ok) { 'okunamadi' } elseif ($keys.id) { $keys.id } else { 'bos' }
+                $found += ("{0}(ID={1}, ETTN={2})" -f $f.Name, $idText, $keys.uuid)
+                if (Test-InvoiceMatch $keys $expectedBelgeNo $expectedUuid) { $xml = $f.FullName; break }
             }
         }
         # Konsol kapandiktan sonra dosyayi yazan baska bir surec olabilir; kisa
@@ -165,7 +183,7 @@ try {
             $detay += ("Vega kaydi: " + $vegaLog)
         }
         $kod = if ($proc.HasExited) { [string]$proc.ExitCode } else { 'calisiyor' }
-        throw ("Vega UBL uretilmedi (IND {0}, beklenen {1}, konsol cikis kodu {2}). {3}" -f $indText, $expectedBelgeNo, $kod, ($detay -join ' | '))
+        throw ("Vega UBL uretilmedi (IND {0}, beklenen {1}, ETTN {2}, konsol cikis kodu {3}). {4}" -f $indText, $expectedBelgeNo, $(if ($expectedUuid) { $expectedUuid } else { '?' }), $kod, ($detay -join ' | '))
     }
     $json = @{ ok=$true; xmlPath=$xml } | ConvertTo-Json -Compress
     [IO.File]::WriteAllText($donePath, $json, [Text.UTF8Encoding]::new($false))

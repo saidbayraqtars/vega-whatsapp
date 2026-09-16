@@ -246,6 +246,7 @@ class Integration {
         const exported = await exporter.exportInvoice({
             ind: row.IND,
             expectedBelgeNo: row.BELGENO,
+            expectedUuid: row.EFATURAUUID || '',
             consoleDir,
             taskName: this.settings.taskName,
             dataDir: this.host.dataDir,
@@ -300,6 +301,7 @@ class Integration {
         } finally {
             try { fs.unlinkSync(htmlPath); } catch { /* gecici dosya yok */ }
             try { fs.unlinkSync(exported.xmlPath); } catch { /* Vega temp temizligi kritik degil */ }
+            if (exported.sourcePath) { try { fs.unlinkSync(exported.sourcePath); } catch { /* SYSTEM'e ait olabilir */ } }
         }
     }
 

@@ -3,6 +3,7 @@
 // de "einvoice" olur. Sonucun belge numarasi ayrica XML icinde dogrulanir.
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawn, execFile } = require('child_process');
 const crypto = require('crypto');
 
@@ -30,7 +31,7 @@ function listDumpFiles(tempDir) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function waitForXml(tempDir, before, startedAt, timeoutMs, expectedBelgeNo) {
+async function waitForXml(tempDir, before, startedAt, timeoutMs, expectedBelgeNo, expectedUuid) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         for (const [file, sig] of listDumpFiles(tempDir)) {
@@ -40,7 +41,7 @@ async function waitForXml(tempDir, before, startedAt, timeoutMs, expectedBelgeNo
             if (!st.size || st.mtimeMs < startedAt - 2000) continue;
             let xml;
             try { xml = fs.readFileSync(file, 'utf8'); } catch { continue; }
-            if (!expectedBelgeNo || invoiceId(xml) === expectedBelgeNo) return { file, xml };
+            if (!expectedBelgeNo || matchesInvoice(xml, expectedBelgeNo, expectedUuid)) return { file, xml };
         }
         await sleep(300);
     }
@@ -71,10 +72,42 @@ function cleanStaleDoneFiles(requestsDir, maxAgeMs = 600000) {
     } catch { /* klasor yok */ }
 }
 
+// Kok Invoice'in kendi alanlari (ID, UUID) ilk cac: blogundan once gelir. Sonrasi
+// AdditionalDocumentReference/party/satir ID'leridir; onlari okumamak icin kes.
+function invoiceHead(xml) {
+    const s = String(xml || '');
+    const i = s.search(/<cac:/i);
+    return i < 0 ? s : s.slice(0, i);
+}
+
 function invoiceId(xml) {
-    // Kok Invoice'in dogrudan cbc:ID alani, satir/party ID'lerinden once gelir.
-    const m = String(xml || '').match(/<(?:cbc:)?ID(?:\s[^>]*)?>([^<]+)<\/(?:cbc:)?ID>/i);
+    // Bazi firmalarda Vega numarayi GIB'e gonderirken verir; dump'ta <cbc:ID /> bos gelir.
+    const m = invoiceHead(xml).match(/<(?:cbc:)?ID(?:\s[^>]*)?(?:\/>|>([^<]*)<\/(?:cbc:)?ID>)/i);
+    return m && m[1] ? m[1].trim() : '';
+}
+
+function invoiceUuid(xml) {
+    const m = invoiceHead(xml).match(/<(?:cbc:)?UUID(?:\s[^>]*)?>([^<]*)<\/(?:cbc:)?UUID>/i);
     return m ? m[1].trim() : '';
+}
+
+// Dump bu faturaya mi ait? Numara varsa numara belirler. Numara bossa ETTN
+// (EFATURAUUID) karsilastirilir; ETTN de bilinmiyorsa bu IND icin calistirilan
+// konsolun urettigi dosya kabul edilir.
+function matchesInvoice(xml, expectedBelgeNo, expectedUuid) {
+    const id = invoiceId(xml);
+    if (id) return id === expectedBelgeNo;
+    const want = String(expectedUuid || '').trim().toLowerCase();
+    return !want || invoiceUuid(xml).toLowerCase() === want;
+}
+
+// Numarasi bos dump PDF'te "Fatura No" alanini bos birakir; Vega'daki BELGENO'yu yaz.
+function fillInvoiceId(xml, belgeNo) {
+    const s = String(xml || '');
+    const head = invoiceHead(s);
+    const filled = head.replace(/<((?:cbc:)?ID)((?:\s+[^\s/>]+)*)\s*(?:\/>|>\s*<\/(?:cbc:)?ID>)/i,
+        (_, tag, attrs) => `<${tag}${attrs || ''}>${belgeNo}</${tag}>`);
+    return filled + s.slice(head.length);
 }
 
 function findConsoleDir(setting) {
@@ -93,14 +126,16 @@ function taskExists(taskName) {
     return new Promise(resolve => execFile('schtasks.exe', ['/Query', '/TN', taskName], { windowsHide: true }, e => resolve(!e)));
 }
 
-async function runViaTask({ taskName, dataDir, ind, expectedBelgeNo, timeoutMs }) {
+async function runViaTask({ taskName, dataDir, ind, expectedBelgeNo, expectedUuid, timeoutMs }) {
     const requests = path.join(dataDir, 'requests');
     fs.mkdirSync(requests, { recursive: true });
     cleanStaleDoneFiles(requests);
     const jobId = crypto.randomUUID();
     const requestPath = path.join(requests, 'request.json');
     const donePath = path.join(requests, `done-${jobId}.json`);
-    atomicJson(requestPath, { jobId, ind: Number(ind), expectedBelgeNo, requestedAt: new Date().toISOString() });
+    atomicJson(requestPath, {
+        jobId, ind: Number(ind), expectedBelgeNo, expectedUuid: expectedUuid || '', requestedAt: new Date().toISOString(),
+    });
     await new Promise((resolve, reject) => execFile('schtasks.exe', ['/Run', '/TN', taskName], { windowsHide: true },
         (e, stdout, stderr) => e ? reject(new Error(`yuksek yetkili gorev baslatilamadi: ${(stderr || stdout || e.message).trim()}`)) : resolve()));
 
@@ -111,8 +146,8 @@ async function runViaTask({ taskName, dataDir, ind, expectedBelgeNo, timeoutMs }
             try { fs.unlinkSync(donePath); } catch { /* kritik degil */ }
             if (!done.ok) throw new Error(friendlyTaskError(done.error));
             const xml = fs.readFileSync(done.xmlPath, 'utf8');
-            if (invoiceId(xml) !== expectedBelgeNo) {
-                throw new Error(`Vega e-Fatura firma/donem ayari uyusmuyor: beklenen ${expectedBelgeNo}, uretilen ${invoiceId(xml) || '(okunamadi)'}`);
+            if (!matchesInvoice(xml, expectedBelgeNo, expectedUuid)) {
+                throw new Error(`Vega e-Fatura firma/donem ayari uyusmuyor: beklenen ${expectedBelgeNo}, uretilen ${invoiceId(xml) || `(numarasiz, ETTN ${invoiceUuid(xml) || '?'})`}`);
             }
             return { xmlPath: done.xmlPath, xml, mode: 'task' };
         }
@@ -122,7 +157,7 @@ async function runViaTask({ taskName, dataDir, ind, expectedBelgeNo, timeoutMs }
         + ' (gorev yonetici yetkisiyle kayitli degilse tools\\setup-task.cmd dosyasini yonetici olarak calistirin)');
 }
 
-async function runDirect({ consoleDir, ind, expectedBelgeNo, timeoutMs }) {
+async function runDirect({ consoleDir, ind, expectedBelgeNo, expectedUuid, timeoutMs }) {
     const tempDir = path.join(consoleDir, 'temp');
     fs.mkdirSync(tempDir, { recursive: true });
     const before = listDumpFiles(tempDir), startedAt = Date.now();
@@ -136,7 +171,7 @@ async function runDirect({ consoleDir, ind, expectedBelgeNo, timeoutMs }) {
     ))));
     try {
         const result = await Promise.race([
-            waitForXml(tempDir, before, startedAt, timeoutMs, expectedBelgeNo),
+            waitForXml(tempDir, before, startedAt, timeoutMs, expectedBelgeNo, expectedUuid),
             processError,
         ]);
         return { xmlPath: result.file, xml: result.xml, mode: 'direct' };
@@ -152,14 +187,25 @@ function exportInvoice(opts) {
         if (!opts.expectedBelgeNo) throw new Error('beklenen BELGENO zorunlu');
         const timeoutMs = Number(opts.timeoutMs) || 120000;
         const consoleDir = findConsoleDir(opts.consoleDir);
-        if (await taskExists(opts.taskName)) {
-            return runViaTask({ ...opts, consoleDir, ind, timeoutMs });
-        }
-        return runDirect({ ...opts, consoleDir, ind, timeoutMs });
+        const result = (await taskExists(opts.taskName))
+            ? await runViaTask({ ...opts, consoleDir, ind, timeoutMs })
+            : await runDirect({ ...opts, consoleDir, ind, timeoutMs });
+        if (invoiceId(result.xml)) return result;
+        // Numarasiz dump: BELGENO'yu yazip kendi klasorumuze kopyala (Vega temp'i
+        // SYSTEM'e ait olabilir). Tasarim XSLT'si bu kopyadan calisir.
+        const xml = fillInvoiceId(result.xml, opts.expectedBelgeNo);
+        const workDir = path.join(opts.dataDir || os.tmpdir(), 'work');
+        fs.mkdirSync(workDir, { recursive: true });
+        const xmlPath = path.join(workDir, `${ind}-ubl.xml`);
+        fs.writeFileSync(xmlPath, xml, 'utf8');
+        return { ...result, xml, xmlPath, sourcePath: result.xmlPath, filledId: true };
     };
     const next = serial.then(run, run);
     serial = next.catch(() => {});
     return next;
 }
 
-module.exports = { exportInvoice, findConsoleDir, taskExists, invoiceId, friendlyTaskError, cleanStaleDoneFiles, EXE };
+module.exports = {
+    exportInvoice, findConsoleDir, taskExists, invoiceId, invoiceUuid, matchesInvoice, fillInvoiceId,
+    friendlyTaskError, cleanStaleDoneFiles, EXE,
+};

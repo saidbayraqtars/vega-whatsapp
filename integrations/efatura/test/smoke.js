@@ -13,6 +13,23 @@ assert.equal(db.code('101', 'firma'), '0101');
 assert.equal(db.code('D3', 'donem'), '0003');
 assert.throws(() => db.code('01x1', 'firma'));
 assert.equal(exporter.invoiceId(xml), 'TEST2026000000001');
+// Bazi firmalarda Vega dump'i numarasiz uretir (<cbc:ID />); ETTN ile taninir,
+// sonraki AdditionalDocumentReference ID'si fatura numarasi sanilmamali.
+{
+    const blank = xml.replace('<cbc:ID>TEST2026000000001</cbc:ID>', '<cbc:ID />')
+        .replace('<cac:AccountingSupplierParty>', '<cac:AdditionalDocumentReference><cbc:ID>099e8ea70d</cbc:ID></cac:AdditionalDocumentReference><cac:AccountingSupplierParty>');
+    const uuid = '00000000-0000-0000-0000-000000000001';
+    assert.equal(exporter.invoiceId(blank), '');
+    assert.equal(exporter.invoiceUuid(blank), uuid);
+    assert.ok(exporter.matchesInvoice(blank, 'EXP2026000000550', uuid.toUpperCase()));
+    assert.ok(!exporter.matchesInvoice(blank, 'EXP2026000000550', '11111111-0000-0000-0000-000000000001'));
+    assert.ok(exporter.matchesInvoice(blank, 'EXP2026000000550', ''));
+    assert.ok(!exporter.matchesInvoice(xml, 'EXP2026000000550', uuid));
+    const filled = exporter.fillInvoiceId(blank, 'EXP2026000000550');
+    assert.equal(exporter.invoiceId(filled), 'EXP2026000000550');
+    assert.equal(filled.replace('<cbc:ID>EXP2026000000550</cbc:ID>', '<cbc:ID />'), blank);
+    assert.equal(exporter.fillInvoiceId(xml, 'X'), xml);
+}
 assert.equal(renderer.xmlValue(xml, 'ProfileID'), 'TEMELFATURA');
 assert.equal(renderer.supplierVkn(xml), '1234567890');
 // Dizayn: once <tur>_<VKN>.xslt, sonra <tur>.xslt; hic yoksa hata (gonderilmez).
