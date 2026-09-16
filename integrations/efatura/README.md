@@ -49,10 +49,17 @@ kez cift tiklayin ve UAC onayini verin.
 
 ## Test modu
 
-`settings.json` icine `{ "testPhone": "905xxxxxxxxx" }` yazilirsa butun PDF ve
-iptal mesajlari cari yerine o numaraya gider, basinda gercek alici yazar. Test
-modunda gonderilen faturalar gonderildi sayilir; kapatinca gercek cariye tekrar
-gitmez.
+Ayarlar > **e-Fatura PDF gonderimi** > "Test modu" isaretlenip numara ve sure
+secilir. **Varsayilan KAPALI.** Acikken butun PDF ve iptal mesajlari cari yerine
+o numaraya gider, mesajin basinda gercek alici yazar.
+
+Gecicidir: secilen sure (1 saat / 4 saat / 1 gun) dolunca kendiliginden kapanir
+ve gonderim gercek carilere doner; "suresiz" secilirse elle kapatilana kadar
+surer. Ayar `settings.json` icinde `testPhone` + `testUntil` olarak durur,
+elle de yazilabilir.
+
+Test modunda gonderilen faturalar gonderildi sayilir; kapatinca ayni fatura
+gercek cariye tekrar gitmez.
 
 ## Degisiklik ve iptal
 

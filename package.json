@@ -13,7 +13,9 @@
     "dist": "electron-builder --win",
     "release": "electron-builder --win --publish always",
     "test:efatura": "node integrations/efatura/test/smoke.js",
-    "test:efatura-pdf": "electron integrations/efatura/test/electron-pdf-smoke.js"
+    "test:efatura-pdf": "electron integrations/efatura/test/electron-pdf-smoke.js",
+    "test:efatura-testmode": "node integrations/efatura/test/testmode.js",
+    "test:efatura-e2e": "electron integrations/efatura/test/e2e-send.js"
   },
   "build": {
     "appId": "com.vega.whatsapp",

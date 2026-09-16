@@ -691,6 +691,18 @@
             <summary><span class="acc-t">e-Fatura PDF gönderimi</span><span class="acc-s" id="ef_sum">kapalı</span></summary>
             <div class="acc-body">
                 <label class="check"><input type="checkbox" id="ef_enabled" /> Fatura kesilince PDF'i müşteriye WhatsApp'tan gönder</label>
+                <label class="check"><input type="checkbox" id="ef_test" /> Test modu — PDF'ler cariye değil test numarasına gitsin</label>
+                <div class="row" id="ef_testFields" style="display:none">
+                    <div class="field"><label>Test numarası</label><input id="ef_testPhone" placeholder="5350786101" /></div>
+                    <div class="field"><label>Süre</label>
+                        <select id="ef_testMinutes">
+                            <option value="60">1 saat</option>
+                            <option value="240">4 saat</option>
+                            <option value="1440">1 gün</option>
+                            <option value="0">süresiz (elle kapatılana kadar)</option>
+                        </select>
+                    </div>
+                </div>
                 <div class="hint" id="ef_info" style="white-space:pre-line"></div>
                 <div class="actionbar">
                     <button class="btn green sm" id="ef_save">Kaydet</button>

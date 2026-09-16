@@ -1345,6 +1345,21 @@ app.post('/api/integrations/efatura/enabled', (req, res) => {
     res.json({ success: true, enabled });
 });
 
+// Test modu (varsayılan kapalı, süreli): açıkken bütün e-Fatura PDF ve iptal
+// mesajları cari yerine test numarasına gider. Süre dolunca kendiliğinden
+// gerçek cariye döner ki açık unutulmasın.
+app.post('/api/integrations/efatura/test-mode', (req, res) => {
+    const ef = integrations.instance('efatura');
+    if (!ef || typeof ef.setTestMode !== 'function') return res.json({ success: false, message: 'e-Fatura entegrasyonu yüklü değil.' });
+    const b = req.body || {};
+    try {
+        const result = ef.setTestMode({ phone: b.enabled === true ? b.phone : '', minutes: b.minutes });
+        res.json({ success: true, ...result });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
 // Dizayn (xslt) + log klasörünü Gezgin'de aç — ProgramData'yı elle aramaya gerek kalmasın.
 app.post('/api/integrations/efatura/open-folder', async (req, res) => {
     const ef = integrations.status().find(x => x.id === 'efatura');

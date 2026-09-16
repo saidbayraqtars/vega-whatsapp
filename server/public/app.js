@@ -820,7 +820,10 @@ async function loadEfatura() {
         $('ef_wrap').classList.toggle('hidden', !ef);
         if (!ef) return;
         $('ef_enabled').checked = !!ef.enabled;
-        $('ef_sum').textContent = ef.enabled ? 'açık' : 'kapalı';
+        $('ef_test').checked = !!ef.testPhone;
+        if (ef.testPhone) $('ef_testPhone').value = ef.testPhone;
+        toggleEfTest();
+        $('ef_sum').textContent = (ef.enabled ? 'açık' : 'kapalı') + (ef.testPhone ? ' · TEST MODU' : '');
         const d = ef.designs || [];
         const lines = [
             d.length ? 'Dizayn: ' + d.join(', ') : '⚠ Dizayn yok — klasöre invoice.xslt / earchive.xslt koyun, yoksa gönderilmez.',
@@ -828,11 +831,21 @@ async function loadEfatura() {
         ];
         if (ef.error) lines.push('⚠ ' + ef.error);
         if (ef.task === 'kurulum-gerekli') lines.push('⚠ Yönetici görevi yok: integrations\\efatura\\tools\\setup-task.cmd');
-        if (ef.testPhone) lines.push('Test modu: tüm PDF\'ler ' + ef.testPhone + ' numarasına gider.');
+        if (ef.testPhone) {
+            lines.push('⚠ TEST MODU AÇIK: tüm PDF\'ler ' + ef.testPhone + ' numarasına gider, cariye gitmez'
+                + (ef.testUntil ? ' — ' + new Date(ef.testUntil).toLocaleString('tr-TR') + ' tarihinde kendiliğinden kapanır.' : ' (süresiz).'));
+        }
         if (ef.enabled && ef.lastError) lines.push('Son hata: ' + ef.lastError);
         $('ef_info').textContent = lines.join('\n');
     } catch { $('ef_wrap').classList.add('hidden'); }
 }
+
+// Test modu geçici bir anahtar: açıkken bütün e-Fatura PDF'leri cari yerine
+// test numarasına gider. Varsayılan kapalı, süresi dolunca kendiliğinden kapanır.
+function toggleEfTest() {
+    $('ef_testFields').style.display = $('ef_test').checked ? '' : 'none';
+}
+$('ef_test').onchange = toggleEfTest;
 
 $('ef_save').onclick = async () => {
     const box = $('ef_result');
@@ -843,9 +856,19 @@ $('ef_save').onclick = async () => {
             body: JSON.stringify({ enabled: $('ef_enabled').checked }),
         });
         if (!r.success) { box.className = 'err'; box.textContent = r.message || 'Kaydedilemedi.'; return; }
+        const t = await api('/integrations/efatura/test-mode', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                enabled: $('ef_test').checked,
+                phone: $('ef_testPhone').value.trim(),
+                minutes: Number($('ef_testMinutes').value),
+            }),
+        });
+        if (!t.success) { box.className = 'err'; box.textContent = t.message || 'Test modu kaydedilemedi.'; return; }
         await loadEfatura();
         box.style.display = ''; box.className = 'hint ok';
-        box.textContent = r.enabled ? '✓ Açıldı. Bundan sonra kesilen faturalar gönderilir.' : '✓ Kapatıldı.';
+        box.textContent = (r.enabled ? '✓ Açıldı. Bundan sonra kesilen faturalar gönderilir.' : '✓ Kapatıldı.')
+            + (t.testPhone ? ' TEST MODU: PDF\'ler ' + t.testPhone + ' numarasına gidiyor.' : '');
     } catch (e) { box.className = 'err'; box.textContent = 'Hata: ' + e.message; }
 };
 

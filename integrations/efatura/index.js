@@ -93,7 +93,10 @@ class Integration {
             ...(host.manifest.settings || {}), ...readLocalSettings(host.dataDir),
         };
         // TEST MODU: dolu ise butun PDF/iptal mesajlari cari yerine bu numaraya gider.
-        this.testPhone = normalizeTestPhone(this.settings.testPhone);
+        // Ayarlar'dan acilir, varsayilan KAPALI. Acik unutulmasin diye surelidir:
+        // testUntil gecince kendiliginden gercek carilere doner.
+        this._testPhone = normalizeTestPhone(this.settings.testPhone);
+        this._testUntil = Date.parse(this.settings.testUntil) || 0;
         this.state = new State(path.join(host.dataDir, 'state.json'));
         // Guncelleme Program Files'i sildigi icin musteri dosyalari ProgramData'da;
         // Ayarlar > e-Fatura > "Klasoru ac" ile tek tikla ulasilir.
@@ -105,6 +108,50 @@ class Integration {
         this.lastRun = null;
         this.lastError = null;
         this.lastResult = null;
+    }
+
+    // Suresi dolan test modu ilk okumada kendini kapatir; tick ve status da bu
+    // getter'dan gectigi icin program acik kalsa bile gercek cariye geri doner.
+    get testPhone() {
+        if (!this._testPhone) return '';
+        if (this._testUntil && Date.now() > this._testUntil) {
+            this._testPhone = '';
+            this._testUntil = 0;
+            this.settings.testPhone = '';
+            this.settings.testUntil = null;
+            this.writeLocalSettings({ testPhone: '', testUntil: null });
+            this.log('INFO', 'test modu suresi doldu; PDF gonderimi gercek carilere dondu');
+        }
+        return this._testPhone;
+    }
+
+    testModeStatus() {
+        const phone = this.testPhone;
+        return { testPhone: phone || null, testUntil: phone && this._testUntil ? new Date(this._testUntil).toISOString() : null };
+    }
+
+    // Ayarlar > e-Fatura > Test modu. phone bos ise kapatir.
+    setTestMode({ phone, minutes } = {}) {
+        const target = normalizeTestPhone(phone);
+        if (phone && !target) throw new Error('Test numarasi gecersiz. Ornek: 5350786101');
+        const mins = Number(minutes);
+        const until = target && Number.isFinite(mins) && mins > 0 ? Date.now() + mins * 60000 : 0;
+        this._testPhone = target;
+        this._testUntil = until;
+        this.settings.testPhone = target;
+        this.settings.testUntil = until ? new Date(until).toISOString() : null;
+        this.writeLocalSettings({ testPhone: target, testUntil: this.settings.testUntil });
+        this.log('INFO', target
+            ? `test modu acildi → ${target}${until ? ` (${new Date(until).toLocaleString('tr-TR')} kadar)` : ' (sure sinirsiz)'}`
+            : 'test modu kapatildi; PDF gonderimi gercek carilere gider');
+        return this.testModeStatus();
+    }
+
+    // integration.json Program Files'ta (yonetici ister); makineye ozel ayar
+    // ProgramData...efaturasettings.json icinde tutulur.
+    writeLocalSettings(patch) {
+        const file = path.join(this.host.dataDir, 'settings.json');
+        atomicJson(file, { ...readLocalSettings(this.host.dataDir), ...patch });
     }
 
     log(level, message) {
@@ -426,7 +473,7 @@ class Integration {
             lastError: this.lastError,
             lastResult: this.lastResult,
             task,
-            testPhone: this.testPhone || null,
+            ...this.testModeStatus(),
             dataDir: this.host.dataDir,
             designsDir: this.designsDir,
         };

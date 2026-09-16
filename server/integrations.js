@@ -111,6 +111,12 @@ async function runNow(id) {
     return await x.instance.tick();
 }
 
+// Entegrasyona ozel kontrol uclari icin (ornegin e-Fatura test modu).
+function instance(id) {
+    const x = loaded.get(id);
+    return (x && x.instance) || null;
+}
+
 function status() {
     return [...loaded.values()].map(x => ({
         id: x.manifest.id,
@@ -131,4 +137,4 @@ function claimsWatcherDocument(item) {
     return false;
 }
 
-module.exports = { configure, loadAll, autoStart, stopAll, runNow, status, integrationRoots, claimsWatcherDocument };
+module.exports = { configure, loadAll, autoStart, stopAll, runNow, status, instance, integrationRoots, claimsWatcherDocument };
