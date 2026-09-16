@@ -48,8 +48,19 @@ try {
     Get-ChildItem -LiteralPath $tempDir -Filter '*_dump.xml' -File -ErrorAction SilentlyContinue | ForEach-Object {
         $before[$_.FullName] = "{0}:{1}" -f $_.Length,$_.LastWriteTimeUtc.Ticks
     }
+    # ONEMLI: Start-Process (UseShellExecute) requireAdministrator manifestli exe icin
+    # UAC brokerine (AppInfo) gider. Gorev SYSTEM/oturum 0 da calistigi icin onay
+    # penceresi gosterilemez: cagri once ~2 dakika asili kalir, sonra "islem kullanici
+    # tarafindan iptal edildi" (1223) doner ve fatura hic gitmez. SYSTEM zaten tam
+    # yetkili; dogrudan CreateProcess ile yukseltme brokerine hic ugranmaz.
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $consoleDir 'vega.earsiv.console.exe'
+    $psi.WorkingDirectory = $consoleDir
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.Arguments = '{0} einvoice' -f $indText
     try {
-        $proc = Start-Process -FilePath (Join-Path $consoleDir 'vega.earsiv.console.exe') -ArgumentList @($indText, 'einvoice') -WorkingDirectory $consoleDir -WindowStyle Hidden -PassThru
+        $proc = [Diagnostics.Process]::Start($psi)
     } catch {
         throw ("Vega konsolu baslatilamadi ({0}). Gorev yonetici yetkisiyle calismiyor olabilir: tools\setup-task.cmd dosyasini yonetici olarak calistirin." -f $_.Exception.Message)
     }
