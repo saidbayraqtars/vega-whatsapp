@@ -1520,7 +1520,7 @@ app.get('/api/shopstar', (req, res) => {
 });
 
 app.post('/api/shopstar', (req, res) => {
-    const allowed = ['firmaNo', 'donemNo', 'verifyOnWhatsApp', 'onlySmsGonder', 'payment', 'overdue'];
+    const allowed = ['firmaNo', 'donemNo', 'verifyOnWhatsApp', 'onlySmsGonder', 'sendAllPhones', 'payment', 'overdue'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
     res.json({ success: true, status: shopstar.setConfig(patch) });

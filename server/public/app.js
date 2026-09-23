@@ -3547,6 +3547,7 @@ async function loadShopstarConfig() {
     $('ss_odMin').value = o.minAmount || 0;
     $('ss_odTemplate').value = o.template || '';
     $('ss_onlySms').checked = s.onlySmsGonder === true;
+    $('ss_allPhones').checked = s.sendAllPhones === true;
     $('ss_verify').checked = s.verifyOnWhatsApp !== false;
     $('ss_payCard').classList.toggle('off', !p.enabled);
     $('ss_odCard').classList.toggle('off', !o.enabled);
@@ -3570,6 +3571,7 @@ function collectShopstarConfig() {
         firmaNo: $('ss_firma').value,
         donemNo: $('ss_donem').value,
         onlySmsGonder: $('ss_onlySms').checked,
+        sendAllPhones: $('ss_allPhones').checked,
         verifyOnWhatsApp: $('ss_verify').checked,
         payment: {
             enabled: $('ss_payEnabled').checked,

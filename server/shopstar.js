@@ -104,6 +104,8 @@ const DEFAULT_CONFIG = {
     donemNo: null,
     verifyOnWhatsApp: true,
     onlySmsGonder: false,
+    // Açıksa karttaki tüm geçerli numaralara (TELEFON1/2/3…) gönderilir; kapalıysa yalnız birincil numaraya.
+    sendAllPhones: false,
     payment: {
         enabled: false,
         types: { kasa: true, havale: true },
@@ -326,9 +328,21 @@ function recipientBlock(contact) {
     if (contact.pasif) return 'Cari pasif (STATUS=2)';
     if (config.onlySmsGonder && !contact.smsGonder) return '"SMS Gönder" izni yok';
     if (!contact.phone || !contact.valid) return 'Geçerli telefon yok';
-    if (typeof deps.isOptedOut === 'function' && deps.isOptedOut(contact.phone)) return 'DUR listesinde';
-    if (typeof deps.isSuspended === 'function' && deps.isSuspended(contact.phone)) return 'Üst üste yanıt yok (dinlendiriliyor)';
-    return null;
+    if (targetPhones(contact).length) return null;
+    const optedOut = (p) => typeof deps.isOptedOut === 'function' && deps.isOptedOut(p);
+    return optedOut(contact.phone) ? 'DUR listesinde' : 'Üst üste yanıt yok (dinlendiriliyor)';
+}
+
+// Mesajın gideceği numaralar. "Tüm numaralara gönder" açıksa karttaki bütün geçerli
+// numaralar (TELEFON1/2/3…), kapalıysa yalnız birincil numara. DUR listesindeki ve
+// dinlendirilen numaralar her durumda çıkarılır.
+function targetPhones(contact) {
+    if (!contact || !contact.phone || !contact.valid) return [];
+    const all = config.sendAllPhones && Array.isArray(contact.phones) && contact.phones.length
+        ? contact.phones : [contact.phone];
+    return [...new Set(all)].filter(p =>
+        !(typeof deps.isOptedOut === 'function' && deps.isOptedOut(p)) &&
+        !(typeof deps.isSuspended === 'function' && deps.isSuspended(p)));
 }
 
 async function resolveContacts(ids) {
@@ -338,18 +352,32 @@ async function resolveContacts(ids) {
     return map;
 }
 
-// { ok } | { ok:false, status, error, transient }
+// Hedef numaraların hepsine sırayla gönderir. En az biri giderse başarılı sayılır
+// (defter işaretlenir; tek numara hatası müşteriye ikinci turda mükerrer mesaj açmasın).
+// { ok, phones:[gidenler], error? } | { ok:false, status, error, transient }
 async function sendText(contact, text) {
-    if (config.verifyOnWhatsApp !== false) {
-        const chk = await deps.checkOnWhatsApp(contact.phone);
-        if (!chk.exists) {
-            return chk.transient
-                ? { ok: false, status: 'failed', error: 'WhatsApp doğrulaması geçici hata', transient: true }
-                : { ok: false, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' };
+    const phones = targetPhones(contact);
+    const sent = [], errors = [];
+    let transient = false;
+    for (const phone of phones) {
+        if (sent.length || errors.length) await sleep(rand(2000, 5000));
+        if (config.verifyOnWhatsApp !== false) {
+            const chk = await deps.checkOnWhatsApp(phone);
+            if (!chk.exists) {
+                if (chk.transient) transient = true;
+                errors.push(`${phone}: ${chk.transient ? 'WhatsApp doğrulaması geçici hata' : 'WhatsApp kullanıcısı değil'}`);
+                continue;
+            }
         }
+        const res = await deps.waSend(phone, text, null, { simulateTyping: true, typingMs: rand(1200, 2400), channel: CHANNEL });
+        if (res.success) sent.push(phone);
+        else { transient = true; errors.push(`${phone}: ${res.error || 'Gönderilemedi'}`); }
     }
-    const res = await deps.waSend(contact.phone, text, null, { simulateTyping: true, typingMs: rand(1200, 2400), channel: CHANNEL });
-    return res.success ? { ok: true } : { ok: false, status: 'failed', error: res.error || 'Gönderilemedi', transient: true };
+    if (sent.length) return { ok: true, phones: sent, error: errors.length ? errors.join(' • ') : undefined };
+    const error = phones.length > 1 ? errors.join(' • ') : (errors[0] || 'Gönderilemedi').replace(/^[^:]+: /, '');
+    return transient
+        ? { ok: false, status: 'failed', error, transient: true }
+        : { ok: false, status: 'notOnWhatsApp', error };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -485,7 +513,7 @@ async function processPayQueue(pool, T, { manual = false } = {}) {
         if (res.ok) {
             sent++;
             done('sent');
-            pushLog({ ...logBase, status: 'sent', message: text });
+            pushLog({ ...logBase, phone: res.phones.join(', '), status: 'sent', message: text, error: res.error });
         } else if (res.transient) {
             // Geçici hata: kuyrukta kalsın, sonraki turda yeniden denensin.
             if (!deps.waStatus().ready) { stopReason = 'WhatsApp bağlantısı koptu'; break; }
@@ -605,7 +633,7 @@ async function runOverdue({ manual = false } = {}) {
             sent++;
             state.overdueSent[custKey(c.ind)] = nowIso;
             delete state.overdueTried[custKey(c.ind)];
-            pushLog({ ...logBase, status: 'sent', message: text });
+            pushLog({ ...logBase, phone: res.phones.join(', '), status: 'sent', message: text, error: res.error });
         } else {
             skipped++;
             if (res.transient && !deps.waStatus().ready) { interrupted = true; stopReason = 'WhatsApp bağlantısı koptu'; break; }
@@ -699,6 +727,7 @@ function getStatus() {
         firmaNo: config.firmaNo, donemNo: config.donemNo, table: tableName(),
         verifyOnWhatsApp: config.verifyOnWhatsApp !== false,
         onlySmsGonder: config.onlySmsGonder === true,
+        sendAllPhones: config.sendAllPhones === true,
         payment: { ...config.payment },
         overdue: { ...config.overdue },
         payQueue: state.payQueue.length,
@@ -724,7 +753,7 @@ async function previewOverdue() {
         const pv = planVars(c.plan);
         return {
             ind: c.ind, name: contact.name || String(c.ind), kod: contact.kod || '',
-            phone: contact.phone || '', valid: !!contact.valid,
+            phone: targetPhones(contact).join(', ') || contact.phone || '', valid: !!contact.valid,
             gecikenTaksit: pv.gecikenTaksit, gecikenTutar: pv.gecikenTutar, gecikmeGun: pv.gecikmeGun,
             enEskiVade: pv.enEskiVade, kalan: pv.kalan,
             willSend: !skip, skipReason: skip, message: overdueText(c, contact, bizFirma),
@@ -768,7 +797,7 @@ async function previewPayments(limit = 20) {
             const paidOff = kalanNum <= 0.009;
             const item = { musteri: r.MUSTERINO, evrak: vars.evrak, odenen: Number(r.ODENEN), bordroInd: r.BORDROIND || null };
             return {
-                ind: r.MUSTERINO, name: contact.name || String(r.MUSTERINO), phone: contact.phone || '',
+                ind: r.MUSTERINO, name: contact.name || String(r.MUSTERINO), phone: targetPhones(contact).join(', ') || contact.phone || '',
                 odenen: vars.odenen, tarih: vars.tarih, tur: vars.odemeTuru, evrak: vars.evrak, kalan: vars.kalan,
                 kalanTaksit: vars.kalanTaksit,
                 block: recipientBlock(contact),
@@ -823,7 +852,7 @@ async function sendOverdueOne(ind) {
         state.overdueSent[custKey(indNum)] = new Date().toISOString();
         delete state.overdueTried[custKey(indNum)];
         saveState();
-        pushLog({ ...logBase, status: 'sent', message: text });
+        pushLog({ ...logBase, phone: res.phones.join(', '), status: 'sent', message: text, error: res.error });
         return { success: true, message: 'Gönderildi' };
     }
     pushLog({ ...logBase, status: res.status, error: res.error });
