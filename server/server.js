@@ -44,6 +44,7 @@ const watcher = require('./watcher');
 const siparis = require('./siparis');
 const vade = require('./vade');
 const reminders = require('./reminders');
+const shopstar = require('./shopstar');
 const activeCari = require('./activeCari');
 const aiBot = require('./aiBot');
 const credits = require('./credits');
@@ -361,6 +362,7 @@ function startAutomationUnlessRelay() {
     try { siparis.autoStart(); } catch { /* yok say */ }
     try { vade.autoStart(); } catch { /* yok say */ }
     try { reminders.autoStart(); } catch { /* Faz 6 */ }
+    try { shopstar.autoStart(); } catch (e) { console.error('[ShopStar] otomatik baslatma:', e.message); }
     try { activeCari.autoStart(); } catch { /* yok say */ }
     try { integrations.autoStart(); } catch (e) { console.error('[Entegrasyon] otomatik baslatma:', e.message); }
 }
@@ -1507,6 +1509,64 @@ app.get('/api/vade/upcoming', async (req, res) => {
 
 app.post('/api/vade/test', async (req, res) => {
     try { res.json(await vade.sendTest()); }
+    catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SHOPSTAR — taksitli satış (tahsilat bildirimi + geciken taksit hatırlatması)
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/shopstar', (req, res) => {
+    res.json({ success: true, status: shopstar.getStatus() });
+});
+
+app.post('/api/shopstar', (req, res) => {
+    const allowed = ['firmaNo', 'donemNo', 'verifyOnWhatsApp', 'onlySmsGonder', 'payment', 'overdue'];
+    const patch = {};
+    for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    res.json({ success: true, status: shopstar.setConfig(patch) });
+});
+
+// ShopStar verisi olan en son firma/dönem (seçici ilk açılışta boş kalmasın).
+app.get('/api/shopstar/detect', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    try { res.json({ success: true, found: await shopstar.detectDefault() }); }
+    catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+app.get('/api/shopstar/log', (req, res) => {
+    res.json({ success: true, log: shopstar.getLog(), status: shopstar.getStatus() });
+});
+
+// Önizlemeler mesaj GÖNDERMEZ.
+app.get('/api/shopstar/overdue/preview', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    try { res.json({ success: true, ...(await shopstar.previewOverdue()) }); }
+    catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+app.get('/api/shopstar/payments/preview', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    try { res.json({ success: true, ...(await shopstar.previewPayments(parseInt(req.query.limit, 10) || 20)) }); }
+    catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+app.post('/api/shopstar/overdue/run', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    try {
+        const r = await shopstar.runOverdueNow();
+        res.json({ success: !r.aborted, message: r.aborted ? r.reason : r.note, result: r, status: shopstar.getStatus() });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+app.post('/api/shopstar/overdue/send-one', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    try { res.json(await shopstar.sendOverdueOne(req.body && req.body.ind)); }
+    catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+app.post('/api/shopstar/test', async (req, res) => {
+    if (!requireDb(req, res)) return;
+    try { res.json(await shopstar.sendTest(req.body && req.body.kind, req.body && req.body.phone)); }
     catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -3189,6 +3249,7 @@ function stopAutomation(sebep) {
     try { siparis.stop(); } catch { /* yok say */ }
     try { vade.stop(); } catch { /* yok say */ }
     try { reminders.stop(); } catch { /* yok say */ }
+    try { shopstar.stop(); } catch { /* yok say */ }
     try { activeCari.stop(); } catch { /* yok say */ }
     try { integrations.stopAll(); } catch { /* yok say */ }
     console.warn(`[Lisans] Otomasyon durduruldu — ${sebep}`);
@@ -3332,6 +3393,22 @@ reminders.configure({
     isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
     shouldAskSave: (phone) => { try { return stats.shouldAskSave(phone); } catch { return false; } },
     saveContactText: SAVE_CONTACT_LINE,
+});
+
+// ShopStar (taksitli satış): tahsilat sonrası kalan taksit bildirimi + geciken taksit hatırlatması.
+// Mesaj CARİYE gider; kaynak F{firma}D{donem}TBLWSTAKSITLISATIS.
+shopstar.configure({
+    getPool: () => pool,
+    sql,
+    resolveCariContacts,
+    waSend: waSendX,
+    checkOnWhatsApp: waCheckX,
+    waStatus: waStatusX,
+    gate: (ch) => gateX(ch, null),
+    baseDir,
+    getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
+    isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
+    isOptedOut: (phone) => { try { return optout.has(phone); } catch { return false; } },
 });
 
 // Arctos'ta o an açık cariyi plan cache'ten tespit eden izleyici (yüzen buton için).

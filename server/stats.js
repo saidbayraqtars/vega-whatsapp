@@ -48,7 +48,7 @@ const KEEP_DAYS = 60;
 // gönderimi durdur → şikayet/ban yüzeyini düşür. streak = son GELEN mesajdan bu yana
 // giden ardışık OTOMATİK mesaj sayısı; o numaradan gelen her mesaj streak'i sıfırlar.
 // state.engage[phone] = { out, inn, streak, lastOutAt, lastInAt }.
-const AUTO_CHANNELS = new Set(['belge', 'reminder']);
+const AUTO_CHANNELS = new Set(['belge', 'reminder', 'shopstar']);
 const MAX_ENGAGE = 6000;
 const ENGAGE_TTL_MS = 45 * 24 * 60 * 60 * 1000;
 // VARSAYILAN AÇIK (11 Tem 2026): kapalıyken canlı bir kurulumda 31 mesaj gidip 0 yanıt

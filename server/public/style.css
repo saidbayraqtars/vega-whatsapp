@@ -215,6 +215,8 @@ h2 { font-size: 16px; margin: 0 0 12px; display: flex; align-items: center; gap:
     text-align: left; width: 100%; transition: background .14s, color .14s;
 }
 .tab .ic { width: 18px; height: 18px; flex: none; opacity: .75; }
+/* Sidebar grup başlığı (ör. SHOPSTAR) */
+.nav-group { margin: 12px 12px 4px; font-size: 11px; font-weight: 700; letter-spacing: .08em; color: var(--sb-muted); }
 .tab:hover { background: var(--sb-hover); color: #fff; }
 .tab.active { background: rgba(63, 181, 122, .16); color: #fff; border-left-color: #3fb57a; }
 .tab.active .ic { opacity: 1; }

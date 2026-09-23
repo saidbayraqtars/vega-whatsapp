@@ -1392,10 +1392,11 @@ document.querySelectorAll('.tab').forEach(t => {
         document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
         t.classList.add('active');
         const v = t.dataset.view;
-        ['viewBulk', 'viewWatcher', 'viewReminders', 'viewExtre', 'viewAiBot', 'viewFirma'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
+        ['viewBulk', 'viewWatcher', 'viewReminders', 'viewShopstar', 'viewExtre', 'viewAiBot', 'viewFirma'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
         const at = $('appbarTitle'); if (at) at.textContent = t.dataset.title || t.textContent.trim();
         if (v === 'viewWatcher') initWatcherView();
         if (v === 'viewReminders' && typeof initRemindersView === 'function') initRemindersView();
+        if (v === 'viewShopstar' && typeof initShopstarView === 'function') initShopstarView();
         if (v === 'viewExtre' && typeof initExtreView === 'function') initExtreView();
         if (v === 'viewAiBot' && typeof initAiBotView === 'function') initAiBotView();
         if (v === 'viewFirma' && typeof initFirmaView === 'function') initFirmaView();
@@ -3443,3 +3444,337 @@ function esc(s) {
 }
 
 boot();
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SHOPSTAR — Taksit Takibi (tahsilat bildirimi + geciken taksit hatırlatması)
+//  Sınıf/ID sözleşmesi: index.html#viewShopstar. Mesaj müşteriye (cariye) gider.
+// ═══════════════════════════════════════════════════════════════════════════
+Object.assign(TPL_FIELDS, {
+    '{odenen}': ['Ödenen', '1.500,00'],
+    '{odemeTuru}': ['Ödeme türü', 'Kasa'],
+    '{kalanTaksit}': ['Kalan taksit sayısı', '5'],
+    '{sonrakiVade}': ['Sonraki vade', '30.04.2026'],
+    '{sonrakiTutar}': ['Sonraki taksit tutarı', '1.400,00'],
+    '{gecikenTaksit}': ['Geciken taksit sayısı', '2'],
+    '{gecikenTutar}': ['Geciken tutar', '2.800,00'],
+    '{taksitListesi}': ['Taksit listesi', '• 30.04.2026 — 1.400,00 TL\n• 30.05.2026 — 1.400,00 TL'],
+});
+const SS_PAY_VARS = ['{ad}', '{odenen}', '{tarih}', '{kalan}', '{kalanTaksit}', '{sonrakiVade}', '{sonrakiTutar}', '{gecikenTaksit}', '{taksitListesi}', '{odemeTuru}', '{evrak}', '{firmaadi}'];
+const SS_OD_VARS = ['{ad}', '{gecikenTaksit}', '{gecikenTutar}', '{enEskiVade}', '{gecikmeGun}', '{kalan}', '{kalanTaksit}', '{taksitListesi}', '{firmaadi}'];
+const SS_PAY_OVR = { '{kalan}': '7.000,00', '{tarih}': SAMPLE_TODAY };
+const SS_OD_OVR = { '{kalan}': '7.000,00' };
+const SS_PAY_PRESETS = [
+    { t: 'Kısa', v: 'Sayın {ad}, {odenen} TL ödemeniz alınmıştır. Kalan borcunuz {kalan} TL ({kalanTaksit} taksit). Sonraki taksit: {sonrakiVade} — {sonrakiTutar} TL.\n\n{firmaadi}' },
+    { t: 'Taksit listeli', v: 'Sayın {ad}, {tarih} tarihli {odenen} TL ödemeniz alınmıştır, teşekkür ederiz.\nKalan borcunuz: {kalan} TL\nKalan taksitleriniz:\n{taksitListesi}\n\n{firmaadi}' },
+];
+const SS_OD_PRESETS = [
+    { t: 'Nazik', v: 'Sayın {ad}, {enEskiVade} vadeli taksidinizin ödemesini henüz alamadık. Ödeme yaptıysanız bu mesajı dikkate almayınız.\n\n{firmaadi}' },
+    { t: 'Ayrıntılı', v: 'Sayın {ad}, vadesi geçmiş {gecikenTaksit} taksit ödemeniz bulunmaktadır:\n{taksitListesi}\nToplam kalan borcunuz: {kalan} TL\n\n{firmaadi}' },
+];
+let ssLoaded = false;
+let ssLogTimer = null;
+let ssLogEntries = [];
+let ssPvKind = null;
+
+async function initShopstarView() {
+    if (!ssLoaded) {
+        const fr = await api('/firmalar');
+        const sel = $('ss_firma');
+        sel.innerHTML = '';
+        if (fr.success) fr.data.forEach(f => {
+            const o = document.createElement('option');
+            o.value = f.FIRMANO; o.textContent = `${f.FIRMANO} — ${f.FIRMAADI}`;
+            sel.appendChild(o);
+        });
+        sel.onchange = () => loadShopstarDonemler();
+        for (const id of ['ss_payCard', 'ss_odCard']) {
+            const card = $(id);
+            const chk = card.querySelector('.acc-head input[type=checkbox]');
+            card.querySelector('.acc-head').addEventListener('click', (e) => { if (e.target !== chk) card.classList.toggle('open'); });
+            chk.addEventListener('change', () => { card.classList.toggle('off', !chk.checked); ssUpdateHeads(); });
+        }
+        ['ss_odGrace', 'ss_odRepeat', 'ss_odTime'].forEach(id => $(id).addEventListener('input', ssUpdateHeads));
+        ['ss_payKasa', 'ss_payHavale'].forEach(id => $(id).addEventListener('change', ssUpdateHeads));
+        try { $('ss_testPhone').value = localStorage.getItem('vega.ssTestPhone') || ''; } catch { /* yok say */ }
+        ssLoaded = true;
+    }
+    await loadShopstarConfig();
+    if (ssLogTimer) clearInterval(ssLogTimer);
+    refreshShopstarLog();
+    ssLogTimer = setInterval(() => { if ($('viewShopstar').style.display !== 'none') refreshShopstarLog(); }, 5000);
+}
+
+async function loadShopstarDonemler(selectDonem) {
+    const firmaNo = $('ss_firma').value;
+    const sel = $('ss_donem');
+    sel.innerHTML = '<option>...</option>';
+    const r = await api(`/donemler?firmaNo=${firmaNo}`);
+    sel.innerHTML = '';
+    if (r.success && r.data.length) {
+        r.data.forEach(d => {
+            const o = document.createElement('option');
+            o.value = d.donemNo; o.textContent = d.donem ? `${d.donemNo} — ${d.donem}` : d.donemNo;
+            sel.appendChild(o);
+        });
+        sel.value = selectDonem || r.data[r.data.length - 1].donemNo;
+    } else {
+        sel.innerHTML = '<option value="">dönem yok</option>';
+    }
+}
+
+async function loadShopstarConfig() {
+    const r = await api('/shopstar');
+    if (!r.success) return;
+    const s = r.status;
+    // Kayıtlı seçim yoksa ShopStar verisi olan son firma/dönemi öner (yoksa genel bağlam).
+    let pick = s.firmaNo ? { firmaNo: s.firmaNo, donemNo: s.donemNo } : null;
+    if (!pick) { try { const d = await api('/shopstar/detect'); pick = d.found || null; } catch { /* yok say */ } }
+    if (!pick) pick = localContext();
+    if (pick.firmaNo) $('ss_firma').value = pick.firmaNo;
+    await loadShopstarDonemler(pick.donemNo);
+    const p = s.payment || {}, o = s.overdue || {};
+    $('ss_payEnabled').checked = !!p.enabled;
+    $('ss_payTemplate').value = p.template || '';
+    $('ss_paidOffTemplate').value = p.paidOffTemplate || '';
+    $('ss_payKasa').checked = p.types?.kasa !== false;
+    $('ss_payHavale').checked = p.types?.havale !== false;
+    $('ss_payMin').value = p.minAmount || 0;
+    $('ss_odEnabled').checked = !!o.enabled;
+    $('ss_odGrace').value = o.graceDays ?? 7;
+    $('ss_odRepeat').value = o.repeatDays || 7;
+    $('ss_odTime').value = o.sendTime || '10:00';
+    $('ss_odMaxAge').value = o.maxAgeDays || 180;
+    $('ss_odMin').value = o.minAmount || 0;
+    $('ss_odTemplate').value = o.template || '';
+    $('ss_onlySms').checked = s.onlySmsGonder === true;
+    $('ss_verify').checked = s.verifyOnWhatsApp !== false;
+    $('ss_payCard').classList.toggle('off', !p.enabled);
+    $('ss_odCard').classList.toggle('off', !o.enabled);
+    mountTemplateEditor($('ss_payTemplate'), SS_PAY_VARS, { presets: SS_PAY_PRESETS, overrides: SS_PAY_OVR, labels: { '{kalan}': 'Kalan borç' } });
+    mountTemplateEditor($('ss_paidOffTemplate'), SS_PAY_VARS, { overrides: { ...SS_PAY_OVR, '{kalan}': '0,00' }, labels: { '{kalan}': 'Kalan borç' } });
+    mountTemplateEditor($('ss_odTemplate'), SS_OD_VARS, { presets: SS_OD_PRESETS, overrides: SS_OD_OVR, labels: { '{kalan}': 'Kalan borç' } });
+    ssUpdateHeads();
+    renderShopstarStatus(s);
+}
+
+function ssUpdateHeads() {
+    const kinds = [$('ss_payKasa').checked && 'kasa', $('ss_payHavale').checked && 'havale'].filter(Boolean).join(' + ');
+    $('ss_paySum').textContent = $('ss_payEnabled').checked ? `Açık · ${kinds || 'tahsilat türü seçilmedi'}` : 'Kapalı';
+    $('ss_odSum').textContent = $('ss_odEnabled').checked
+        ? `Açık · ${+$('ss_odGrace').value || 0} gün gecikince · ${+$('ss_odRepeat').value || 7} günde bir · saat ${$('ss_odTime').value || '10:00'}`
+        : 'Kapalı';
+}
+
+function collectShopstarConfig() {
+    return {
+        firmaNo: $('ss_firma').value,
+        donemNo: $('ss_donem').value,
+        onlySmsGonder: $('ss_onlySms').checked,
+        verifyOnWhatsApp: $('ss_verify').checked,
+        payment: {
+            enabled: $('ss_payEnabled').checked,
+            template: $('ss_payTemplate').value,
+            paidOffTemplate: $('ss_paidOffTemplate').value,
+            types: { kasa: $('ss_payKasa').checked, havale: $('ss_payHavale').checked },
+            minAmount: Math.max(0, +$('ss_payMin').value || 0),
+        },
+        overdue: {
+            enabled: $('ss_odEnabled').checked,
+            graceDays: Math.max(0, +$('ss_odGrace').value || 0),
+            repeatDays: Math.max(1, +$('ss_odRepeat').value || 7),
+            sendTime: $('ss_odTime').value || '10:00',
+            maxAgeDays: Math.max(1, +$('ss_odMaxAge').value || 180),
+            minAmount: Math.max(0, +$('ss_odMin').value || 0),
+            template: $('ss_odTemplate').value,
+        },
+    };
+}
+
+function shopstarValidate(cfg) {
+    if (!cfg.firmaNo || !cfg.donemNo) return 'Firma ve dönem seçin.';
+    if (cfg.payment.enabled && !cfg.payment.template.trim()) return 'Tahsilat mesajı boş olamaz.';
+    if (cfg.payment.enabled && !cfg.payment.types.kasa && !cfg.payment.types.havale) return 'En az bir tahsilat türü seçin (kasa / havale).';
+    if (cfg.overdue.enabled && !cfg.overdue.template.trim()) return 'Hatırlatma mesajı boş olamaz.';
+    return '';
+}
+
+async function saveShopstarConfig() {
+    const cfg = collectShopstarConfig();
+    const r = await api('/shopstar', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+    if (r.status) renderShopstarStatus(r.status);
+    return r;
+}
+
+$('ss_save').onclick = async () => {
+    $('ss_err').textContent = '';
+    const err = shopstarValidate(collectShopstarConfig());
+    if (err) { $('ss_err').textContent = err; return; }
+    $('ss_save').disabled = true;
+    try { await saveShopstarConfig(); await loadShopstarConfig(); }
+    catch (e) { $('ss_err').textContent = 'Hata: ' + e.message; }
+    $('ss_save').disabled = false;
+};
+
+function renderShopstarStatus(s) {
+    const parts = [];
+    if (s.lastError) parts.push(`⚠ ${s.lastError}`);
+    if (s.payment?.enabled) {
+        const bits = [];
+        if (s.payQueue > 0) bits.push(`${s.payQueue} bekliyor`);
+        if (s.lastPayResult?.note) bits.push(s.lastPayResult.note);
+        parts.push(`Tahsilat: ${bits.join(', ') || 'izleniyor'}`);
+    }
+    if (s.overdue?.enabled) {
+        parts.push(`Hatırlatma: ${s.lastOverdueResult?.note || s.overdueDue || 'bugün sırada'}`);
+    }
+    if (!s.payment?.enabled && !s.overdue?.enabled) parts.push('İkisi de kapalı');
+    if (s.lastTickAt) parts.push(`Son kontrol ${new Date(s.lastTickAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}`);
+    $('ss_status').textContent = parts.join(' · ') || '—';
+    $('ss_info').textContent = '';
+}
+
+async function refreshShopstarLog() {
+    try {
+        const r = await api('/shopstar/log');
+        if (!r.success) return;
+        renderShopstarStatus(r.status);
+        const box = $('ss_log');
+        if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz gönderim yok.</div>'; return; }
+        ssLogEntries = r.log;
+        const labels = { sent: 'Gönderildi', failed: 'Başarısız', skipped: 'Atlandı', notOnWhatsApp: 'WA yok', cleared: 'Düştü' };
+        box.innerHTML = r.log.map((e, i) => `
+            <div class="logline">
+                <span>${esc(e.name || e.phone || '')}
+                    <span class="muted">${e.kind === 'overdue' ? 'Hatırlatma' : 'Tahsilat'}</span>
+                    ${e.odenen ? `<b>${esc(e.odenen)} TL</b>` : ''}
+                    ${e.geciken ? `<b>${esc(e.geciken)} TL gecikmiş</b>` : ''}
+                    ${e.kalan ? `<span class="muted">kalan ${esc(e.kalan)} TL</span>` : ''}
+                    ${e.error ? `<span class="muted">— ${esc(e.error)}</span>` : ''}
+                    <span class="muted" style="font-size:11px">${e.at ? new Date(e.at).toLocaleString('tr-TR') : ''}</span>
+                    ${e.message ? `<a href="#" class="ss_msg" data-i="${i}">mesajı gör</a>` : ''}
+                </span>
+                <span class="st ${e.status === 'sent' ? 'sent' : (e.status === 'failed' ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>
+            </div>`).join('');
+        box.querySelectorAll('.ss_msg').forEach(a => a.onclick = (ev) => {
+            ev.preventDefault();
+            const e = ssLogEntries[+a.dataset.i];
+            showSentMessage({ ...e, tutar: e.odenen, bakiye: e.kalan });
+        });
+    } catch { /* yok say */ }
+}
+
+// ─── Önizleme (göndermez) ────────────────────────────────────────────────────
+function ssMsgBox(text) {
+    return `<div style="white-space:pre-wrap; font-size:13px; line-height:1.5; margin-top:6px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--bg3)">${esc(text || '')}</div>`;
+}
+
+async function ssOpenPreview(kind) {
+    $('ss_err').textContent = '';
+    const cfg = collectShopstarConfig();
+    if (!cfg.firmaNo || !cfg.donemNo) { $('ss_err').textContent = 'Firma ve dönem seçin.'; return; }
+    const btn = kind === 'overdue' ? $('ss_odPreview') : $('ss_payPreview');
+    btn.disabled = true; const old = btn.textContent; btn.textContent = 'Hazırlanıyor...';
+    try {
+        await saveShopstarConfig();   // güncel şablon/firma ile önizle
+        ssPvKind = kind;
+        await ssRenderPreview();
+        $('ssPreviewModal').classList.remove('hidden');
+    } catch (e) { $('ss_err').textContent = 'Hata: ' + e.message; }
+    finally { btn.disabled = false; btn.textContent = old; }
+}
+
+async function ssRenderPreview() {
+    const body = $('sspvBody');
+    if (ssPvKind === 'overdue') {
+        $('sspvTitle').textContent = 'Geciken taksit — kime ne gidecek';
+        const r = await api('/shopstar/overdue/preview');
+        if (!r.success) { $('sspvMeta').textContent = r.message || 'Okunamadı.'; body.innerHTML = ''; return; }
+        $('sspvMeta').innerHTML = `Geciken müşteri: <b>${r.total}</b> &nbsp;•&nbsp; Gönderilecek: <b>${r.willSend}</b> &nbsp;—&nbsp; <span class="muted">hiçbiri henüz GÖNDERİLMEDİ. Günlük gönderim tavanı dolunca kalanlar ertesi gün sürer.</span>`;
+        $('sspvConfirm').style.display = r.willSend ? '' : 'none';
+        body.innerHTML = r.rows.length ? r.rows.slice(0, 300).map(x => `
+            <div class="logline" style="display:block; padding:10px 12px; opacity:${x.willSend ? 1 : 0.6}">
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+                    <b>${esc(x.name)}</b>
+                    <span class="muted">${x.phone ? esc(x.phone) : 'telefon yok'}</span>
+                    <span><b>${esc(x.gecikenTutar)} TL</b> · ${esc(String(x.gecikenTaksit))} taksit · ${esc(String(x.gecikmeGun))} gün</span>
+                    <span class="st ${x.willSend ? 'sent' : 'info'}" style="margin-left:auto">${x.willSend ? 'Gönderilecek' : 'Atlanacak: ' + esc(x.skipReason || '')}</span>
+                    ${x.phone && x.valid ? `<button class="btn ghost xs" data-act="send" data-ind="${esc(String(x.ind))}">Gönder</button>` : ''}
+                </div>
+                ${ssMsgBox(x.message)}
+            </div>`).join('') + (r.rows.length > 300 ? `<div class="muted" style="padding:10px">… ${r.rows.length - 300} müşteri daha</div>` : '')
+            : '<div class="muted" style="padding:12px">Ayara uyan geciken taksit yok.</div>';
+    } else {
+        $('sspvTitle').textContent = 'Son tahsilatlar — giden / gidecek mesaj';
+        $('sspvConfirm').style.display = 'none';
+        const r = await api('/shopstar/payments/preview?limit=20');
+        if (!r.success) { $('sspvMeta').textContent = r.message || 'Okunamadı.'; body.innerHTML = ''; return; }
+        $('sspvMeta').innerHTML = 'Bu dönemin son 20 tahsilatı. <span class="muted">Açılıştan ÖNCEKİ tahsilatlara mesaj gitmez; yalnız bundan sonrakiler bildirilir.</span>';
+        body.innerHTML = r.rows.length ? r.rows.map(x => {
+            const st = x.bildirildi ? ['sent', 'Bildirildi'] : x.eski ? ['info', 'Eski — gönderilmez'] : x.block ? ['info', 'Atlanacak: ' + x.block] : ['sent', 'Gönderilecek'];
+            return `
+            <div class="logline" style="display:block; padding:10px 12px">
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+                    <b>${esc(x.name)}</b>
+                    <span class="muted">${x.phone ? esc(x.phone) : 'telefon yok'}</span>
+                    <span><b>${esc(x.odenen)} TL</b> ${esc(x.tur)} · ${esc(x.tarih)}</span>
+                    <span class="muted">kalan ${esc(x.kalan)} TL · ${esc(String(x.kalanTaksit))} taksit</span>
+                    <span class="st ${st[0]}" style="margin-left:auto">${esc(st[1])}</span>
+                </div>
+                ${ssMsgBox(x.message)}
+            </div>`;
+        }).join('') : '<div class="muted" style="padding:12px">Bu dönemde tahsilat yok.</div>';
+    }
+}
+
+$('ss_payPreview').onclick = () => ssOpenPreview('payment');
+$('ss_odPreview').onclick = () => ssOpenPreview('overdue');
+$('sspvClose').onclick = () => { $('ssPreviewModal').classList.add('hidden'); ssPvKind = null; };
+
+$('sspvBody').onclick = async (e) => {
+    const btn = e.target.closest('button[data-act="send"]');
+    if (!btn) return;
+    btn.disabled = true; btn.textContent = 'Gönderiliyor...';
+    try {
+        const r = await api('/shopstar/overdue/send-one', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ind: btn.dataset.ind }) });
+        btn.textContent = r.success ? '✓ Gönderildi' : 'Başarısız';
+        if (!r.success) { btn.disabled = false; alert(r.message || 'Gönderilemedi.'); }
+        refreshShopstarLog();
+    } catch (err) { btn.disabled = false; btn.textContent = 'Gönder'; alert('Hata: ' + err.message); }
+};
+
+$('sspvConfirm').onclick = async () => {
+    if (!confirm('Listede "Gönderilecek" görünen TÜM müşterilere şimdi hatırlatma gönderilecek. Devam edilsin mi?')) return;
+    const btn = $('sspvConfirm'); btn.disabled = true; btn.textContent = 'Gönderiliyor...';
+    try {
+        const r = await api('/shopstar/overdue/run', { method: 'POST' });
+        if (!r.success) $('ss_err').textContent = r.message || 'Gönderilemedi.';
+        else $('ss_status').textContent = r.message || '';
+        refreshShopstarLog();
+    } catch (e) { $('ss_err').textContent = 'Hata: ' + e.message; }
+    $('ssPreviewModal').classList.add('hidden'); ssPvKind = null;
+    btn.disabled = false; btn.textContent = 'Şimdi gönder';
+};
+
+async function ssSendTest(kind) {
+    $('ss_err').textContent = '';
+    const phone = $('ss_testPhone').value.trim();
+    if (!phone) {
+        $('ss_err').textContent = 'Önce "Diğer ayarlar" altından test numarası girin.';
+        document.querySelector('#viewShopstar details.acc').open = true;
+        $('ss_testPhone').focus();
+        return;
+    }
+    try { localStorage.setItem('vega.ssTestPhone', phone); } catch { /* yok say */ }
+    const btn = kind === 'overdue' ? $('ss_odTest') : $('ss_payTest');
+    btn.disabled = true;
+    try {
+        await saveShopstarConfig();
+        const r = await api('/shopstar/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind, phone }) });
+        if (r.success) $('ss_status').textContent = r.message || 'Test gönderildi.';
+        else $('ss_err').textContent = r.message || 'Test gönderilemedi.';
+        refreshShopstarLog();
+    } catch (e) { $('ss_err').textContent = 'Hata: ' + e.message; }
+    btn.disabled = false;
+}
+$('ss_payTest').onclick = () => ssSendTest('payment');
+$('ss_odTest').onclick = () => ssSendTest('overdue');
