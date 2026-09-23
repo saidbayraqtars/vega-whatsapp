@@ -160,6 +160,7 @@ let pending = [];
 
 const SENT_WINDOW_MS = 120 * 24 * 60 * 60 * 1000;   // defteri 120 gün tut
 const MAX_SEND_ATTEMPTS = 8;
+const PENDING_MAX_AGE_MS = 2 * 24 * 60 * 60 * 1000;   // "3 gün kaldı" bir hafta sonra gitmesin
 const MAX_PER_POLL = 60;            // tek turda en fazla kaç belge işlensin
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -521,7 +522,36 @@ function enqueue(entry, phone, text, reason) {
     pushLog({ ...entry, phone, status: 'queued', error: reason, message: text });
 }
 
+// Kuyruktaki bildirim artık gönderilmemeli mi? Kuyruk, kuyruğa alındığı andaki METNİ
+// saklar; tip sonradan kapatılırsa (v1.8.0'da visa) tarama onu bulmaz ama kuyruk yine
+// gönderirdi — güncellemeden önce kuyruğa düşen visa bildirimleri böyle gitti.
+// Eski kayıtlarda turIds yok: tekilde tip adından, grupta metindeki tip adından bakılır.
+function pendingDropReason(item) {
+    const age = Date.now() - new Date(item.queuedAt || 0).getTime();
+    if (!(age < PENDING_MAX_AGE_MS)) return 'bekleme süresi doldu';
+    const active = activeTypes();
+    const off = DOC_TYPES.filter(t => !active[t.id]);
+    const hit = Array.isArray(item.turIds)
+        ? off.find(t => item.turIds.includes(t.id))
+        : off.find(t => item.tur ? item.tur === t.label : String(item.text || '').includes(t.label));
+    return hit ? `${hit.label} bildirimi kapalı` : null;
+}
+
+function dropDisabledPending() {
+    let changed = false;
+    for (const item of [...pending]) {
+        const why = pendingDropReason(item);
+        if (!why) continue;
+        pending = pending.filter(p => p !== item);
+        pushLog({ ...item, status: 'cleared', error: `Kuyruktan çıkarıldı (${why})` });
+        changed = true;
+    }
+    if (changed) savePending();
+}
+
 async function processPending() {
+    if (!pending.length) return 0;
+    dropDisabledPending();
     if (!pending.length) return 0;
     if (!deps.waStatus().ready) return 0;
     if (config.respectSendWindow && antiban.inQuietHours()) return 0;
@@ -644,6 +674,7 @@ async function pollOnce() {
             const text = header + '\n' + lines.join('\n');
             const entry = {
                 key: `vade:group:${Date.now()}`, kind: 'group', adet: batch.length,
+                turIds: [...new Set(batch.map(b => b.d.tur))],
                 firma: `${batch.length} belge`, tutar: fmtAmount(toplam),
                 evrak: batch.map(b => b.d.belgeno).filter(Boolean).slice(0, 5).join(', '),
             };
@@ -658,7 +689,7 @@ async function pollOnce() {
                 const entry = {
                     key: docKey(b.d, b.pick.esik), kind: 'single',
                     firma: vars.firma, kod: vars.kod, tutar: vars.tutar,
-                    evrak: b.d.belgeno, tur: b.d.turAdi, vade: vars.vade, kalan: vars.kalan,
+                    evrak: b.d.belgeno, tur: b.d.turAdi, turIds: [b.d.tur], vade: vars.vade, kalan: vars.kalan,
                 };
                 const res = await sendOrQueue(entry, text);
                 sent += res.sent; queued += res.queued;
