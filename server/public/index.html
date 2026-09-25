@@ -213,11 +213,11 @@
                 </div>
             </details>
 
-            <!-- Çek / senet vade hatırlatması (cariye değil, kendi numaralarına) -->
+            <!-- Çek / senet / vadeli visa vade hatırlatması (cariye değil, kendi numaralarına) -->
             <details class="acc">
                 <summary>
                     <span class="dot" id="vdDot"></span>
-                    <span class="acc-t">Çek / senet vadesi yaklaşınca haber ver</span>
+                    <span class="acc-t">Çek / senet / visa vadesi yaklaşınca haber ver</span>
                     <span class="acc-s" id="vdState">Pasif</span>
                 </summary>
                 <div class="acc-body">
@@ -238,6 +238,7 @@
                         <div class="inline-checks">
                             <label class="check"><input type="checkbox" id="vd_t_cek" checked /> Çek</label>
                             <label class="check"><input type="checkbox" id="vd_t_senet" checked /> Senet</label>
+                            <label class="check"><input type="checkbox" id="vd_t_visa" /> Vadeli visa</label>
                         </div>
                     </div>
                     <div class="field">
@@ -259,6 +260,7 @@
                             <div class="field" style="flex:.6"><label>Alt tutar sınırı (TL)</label><input id="vd_min" type="number" min="0" value="0" /></div>
                         </div>
                         <label class="check"><input type="checkbox" id="vd_t_taksit" /> Taksit belgelerini de izle</label>
+                        <label class="check"><input type="checkbox" id="vd_visaTaksit" checked /> Visa'da yalnız taksitli işlemleri al (peşin kart çekimini alma)</label>
                         <label class="check"><input type="checkbox" id="vd_group" checked /> Aynı anda birden çok belge varsa tek mesajda topla</label>
                         <div class="field" style="margin-top:8px"><label>Toplu mesaj başlığı</label><textarea id="vd_headerTemplate" style="min-height:56px"></textarea></div>
                         <div class="field"><label>Toplu mesajda her belge satırı</label><textarea id="vd_lineTemplate" style="min-height:50px"></textarea></div>

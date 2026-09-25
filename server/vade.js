@@ -47,6 +47,8 @@
 //  işi değil, cari hatırlatması işi).
 //  Bu yüzden visa varsayılan KAPALI ve açılırsa varsayılan olarak yalnız taksitli
 //  işlemler alınır (visaOnlyTaksit) — peşin kart çekimi "vade" sayılmaz.
+//  Kuruluma göre değişir: czgr F0102D0013'te 9029 visa satırının 8014'ünde VADE işlemden
+//  11+ gün sonra (bankanın parayı geçireceği gün) — orada vade gerçek.
 //
 //  BANKA ADI: h.BANKANO → F{firma}TBLBANKALAR.IND → ADI (dönemsiz tablo; canlı:
 //  101→AKBANK). Tablo/eşleşme yoksa belge tablosunun metin alanına düşülür.
@@ -304,10 +306,8 @@ function renderTemplate(tpl, vars) {
 }
 
 // Tarama seçenekleri tek yerden — üç çağıran (poll / önizleme / test) aynı filtreyi kullansın.
-// VİSA KAPALI (config'te açık olsa bile): satırdaki VADE taksit vadesi değil, peşinde banka
-// blokajı, taksitlide işlem tarihinin aynısı (başlıktaki VİSA notu). Açık bırakılan
-// kurulumlarda "yanlış tarihli" bildirim üretiyordu; gerçek taksit takvimi ayrı tabloda.
-const activeTypes = () => ({ ...config.types, visa: false });
+// Visa kullanıcı seçeneğidir (v1.8.0–v1.10.1 arası zorla kapalıydı, geri açıldı).
+const activeTypes = () => ({ ...config.types });
 const scanOpts = () => ({
     types: activeTypes(),
     direction: config.direction,
@@ -722,7 +722,7 @@ function start() {
     if (!config.firmaNo || !config.donemNo) { lastError = 'Firma/dönem seçilmemiş.'; return false; }
     if (!targetPhones().length) { lastError = 'Geçerli bildirim numarası yok.'; return false; }
     if (!config.days.length) { lastError = 'Kalan gün eşiği girilmemiş.'; return false; }
-    if (!Object.values(activeTypes()).some(Boolean)) { lastError = 'En az bir belge tipi seçin (çek/senet).'; return false; }
+    if (!Object.values(activeTypes()).some(Boolean)) { lastError = 'En az bir belge tipi seçin (çek/senet/visa).'; return false; }
     stop();
     running = true;
     config.enabled = true;

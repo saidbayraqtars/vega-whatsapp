@@ -1998,6 +1998,8 @@ async function loadVadeConfig() {
     $('vd_days').value = (s.days || []).join(', ');
     $('vd_t_cek').checked = s.types?.cek !== false;
     $('vd_t_senet').checked = s.types?.senet !== false;
+    $('vd_t_visa').checked = s.types?.visa === true;
+    $('vd_visaTaksit').checked = s.visaOnlyTaksit !== false;
     $('vd_t_taksit').checked = s.types?.taksit === true;
     $('vd_direction').value = s.direction || 'ikisi';
     $('vd_min').value = s.minAmount || 0;
@@ -2026,7 +2028,7 @@ async function loadVadeConfig() {
 function renderVadeState(s) {
     const on = s.running;
     $('vdDot').className = 'dot ' + (on ? 'on' : '');
-    const kinds = [s.types?.cek && 'çek', s.types?.senet && 'senet', s.types?.taksit && 'taksit'].filter(Boolean).join(', ');
+    const kinds = [s.types?.cek && 'çek', s.types?.senet && 'senet', s.types?.visa && 'visa', s.types?.taksit && 'taksit'].filter(Boolean).join(', ');
     $('vdState').textContent = on ? `Açık · ${(s.days || []).join(', ')} gün kala · ${kinds}` : 'Kapalı';
     $('vd_save').textContent = on ? 'Kaydet' : 'Kaydet ve Başlat';
     $('vd_stop').style.display = on ? '' : 'none';
@@ -2046,13 +2048,13 @@ function collectVadeConfig() {
         donemNo: $('wc_donem').value,
         phone: $('vd_phone').value.trim(),
         days: $('vd_days').value,
-        // Visa listeden kalktı: Vega'daki "vadesi" sahte (blokaj/işlem günü) — sunucu da taramaz.
         types: {
             cek: $('vd_t_cek').checked,
             senet: $('vd_t_senet').checked,
-            visa: false,
+            visa: $('vd_t_visa').checked,
             taksit: $('vd_t_taksit').checked,
         },
+        visaOnlyTaksit: $('vd_visaTaksit').checked,
         direction: $('vd_direction').value,
         minAmount: Math.max(0, +$('vd_min').value || 0),
         groupMessages: $('vd_group').checked,
@@ -2071,7 +2073,7 @@ function vadeValidate(cfg) {
     if (!cfg.firmaNo || !cfg.donemNo) return 'Sayfanın üstünden firma ve dönem seçin.';
     if (!cfg.phone) return 'Haber verilecek numarayı girin.';
     if (!/\d/.test(cfg.days)) return 'Kaç gün kala haber verileceğini girin (ör. 3, 0).';
-    if (!Object.values(cfg.types).some(Boolean)) return 'Çek veya senetten en az birini seçin.';
+    if (!Object.values(cfg.types).some(Boolean)) return 'Çek, senet veya visadan en az birini seçin.';
     if (!cfg.template.trim()) return 'Mesaj boş olamaz.';
     return '';
 }

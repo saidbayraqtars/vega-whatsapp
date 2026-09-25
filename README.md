@@ -124,19 +124,24 @@ yeni bir gönderim yolu eklenirse ham fonksiyon değil bunlar kullanılmalıdır
 
 ---
 
-## Çek / senet vade takibi
+## Çek / senet / vadeli visa vade takibi
 
-Çek ve senedin vadesine **kaç gün kala** (ör. `3, 0` — 0 = vade günü) girilen numaralara
-bildirim gider. Kod: `server/vade.js`.
+Çek, senet ve vadeli visanın vadesine **kaç gün kala** (ör. `3, 0` — 0 = vade günü) girilen
+numaralara bildirim gider. Visa varsayılan kapalıdır, "Hangi belgeler?" altından açılır.
+Kod: `server/vade.js`.
 
 **Veri nerede**
 
 - Vade belge tablosunda değil, cari fişinin ödeme satırındadır:
   `F{firma}D{dönem}TBLCAR{GIR|CIK}HAREKET.VADE` (`GIR` = müşteriden alınan, `CIK` = bizim verdiğimiz).
 - Belge tipi tablo üyeliğiyle bulunur: `d.IND = h.BELGELINK AND d.EVRAKNO = h.EVRAKNO`
-  → `TBLCEKGIRIS/CIKIS`, `TBLSENETGIRIS/CIKIS`, `TBLTAKSITGIRIS`. Yalnız `BELGELINK` ile
+  → `TBLCEKGIRIS/CIKIS`, `TBLSENETGIRIS/CIKIS`, `TBLVISAGIRIS`, `TBLTAKSITGIRIS`. Yalnız `BELGELINK` ile
   eşleştirmek gerçek veride ~%17 yanlış tip üretir. Dönemde olmayan tablo atlanır.
 - Banka adı `h.BANKANO → F{firma}TBLBANKALAR.ADI`.
+- Visa satırındaki `VADE`, Vega'nın vadeli visa listesindeki tarihtir: bankanın kart tahsilatını
+  hesaba geçireceği gün. Kuruluma göre değişir: bazı yerde işlemden 11+ gün sonra, bazı yerde
+  işlem günüyle aynı. Gelişmiş'teki "yalnız taksitli" seçeneği (varsayılan açık) `TAKSITSAYISI > 1`
+  olmayanları eler. Müşterinin mağaza taksit takvimi burada değil, ShopStar Taksit Takibi'ndedir.
 
 **Aynı belge iki kez gitmesin**
 
@@ -154,9 +159,6 @@ bildirim gider. Kod: `server/vade.js`.
 
 **Bilerek kapsam dışı**
 
-- **Visa / kredi kartı:** Vega bu satırda taksit vadesini tutmaz (peşinde banka blokaj günü,
-  taksitlide işlem günü). Yanlış tarihli bildirim üretmemesi için ayarda açık olsa bile taranmaz.
-  Gerçek taksit takvimi `TBLWSTAKSITLISATIS`'tedir.
 - Ciro edilen müşteri çeki: alınırken zaten bildirilmiştir.
 
 ---
@@ -230,7 +232,7 @@ server/
   server.js          Express + tüm uçlar + gönderim sarmalayıcıları
   watcher.js         belge mesajları
   reminders.js       bakiye hatırlatma
-  vade.js            çek / senet vade bildirimi
+  vade.js            çek / senet / visa vade bildirimi
   siparis.js         sipariş bildirimi
   extre.js           PDF hesap ekstresi
   aiBot.js           AI oto-yanıt
