@@ -108,7 +108,10 @@ const PRESET_RULES = [
     {
         id: 'stokCikis', docType: 'stokCikis', name: 'Stok Çıkış Fişi',
         direction: 'any', izahatCodes: [33], excludeFatura: false, enabled: false,
-        template: 'Sayın {firma}, {tarih} tarihli {tutar} TL tutarındaki mal/ürün çıkışınız (sevkiyat) gerçekleştirilmiştir. Bilginize sunarız.',
+        // Tutarsız (fiyatsız) fiş de olabildiği için metinde {tutar} yok; ürün/miktar
+        // listesi (includeContent) altına eklenir.
+        includeContent: true,
+        template: 'Sayın {firma}, {tarih} tarihli {evrak} numaralı mal/ürün çıkışınız (sevkiyat) gerçekleştirilmiştir. Bilginize sunarız.',
     },
     {
         id: 'cariGiris', docType: 'cariGiris', name: 'Cari Giriş / Havale (Tahsilat)',
@@ -771,7 +774,14 @@ function matchRule(row, rules) {
     for (const rule of rules) {
         if (!rule.enabled) continue;
         let amount;
-        if (rule.direction === 'borc') { if (!(borc > 0)) continue; amount = borc; }
+        // Fiyatsız stok çıkışı (BORC=ALACAK=0; czgr F0118D0001'de 1676'nın 1662'si) saf
+        // ürün hareketidir. "Kalemleri de yaz" açıksa tutarsız da eşleşir — mesajın
+        // asıl bilgisi ürün/miktar listesidir. Kapalıyken söyleyecek bir şey yok.
+        if (!(borc > 0) && !(alacak > 0)) {
+            if (rule.docType !== 'stokCikis' || rule.includeContent !== true) continue;
+            amount = 0;
+        }
+        else if (rule.direction === 'borc') { if (!(borc > 0)) continue; amount = borc; }
         else if (rule.direction === 'alacak') { if (!(alacak > 0)) continue; amount = alacak; }
         else { amount = borc > 0 ? borc : alacak; if (!(amount > 0)) continue; }
         if (amount < (rule.minAmount || 0)) continue;
@@ -1016,7 +1026,7 @@ async function pollOnce() {
         const mainQuery = `
             SELECT h.IND, h.FIRMANO, h.BORC, h.ALACAK, h.BAKIYE, h.EVRAKNO, h.TARIH, h.IZAHAT, h.PARABIRIMI
             FROM [${tbl}] h
-            WHERE h.IND > @last AND (h.BORC > 0 OR h.ALACAK > 0)
+            WHERE h.IND > @last AND (h.BORC > 0 OR h.ALACAK > 0 OR h.IZAHAT = '33')
             ORDER BY h.IND ASC
         `;
         let rows;
@@ -1123,6 +1133,9 @@ async function pollOnce() {
                     // bloğundaki "Toplam" bununla yazılsın (kalem toplamı iskontoda sapar).
                     const content = await deps.buildDocContentText(config.firmaNo, config.donemNo, rule.docType, row.EVRAKNO, amount);
                     if (content) text += '\n\n' + content;
+                    else if (!(amount > 0)) {
+                        skipped++; pushLog({ ...base, status: 'info', error: 'Tutarsız stok çıkışı — ürün satırı bulunamadı, gönderilmedi' }); continue;
+                    }
                 } catch (e) { console.error('[Watcher] belge içeriği eklenemedi:', e.message); }
             }
             // İlk temasta "numaramızı kaydedin" ricası (kaydet-opt-in açıksa).

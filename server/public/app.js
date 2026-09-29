@@ -1457,6 +1457,7 @@ async function initWatcherView() {
                 name: docType === 'custom' ? '' : (t ? t.t : ''),
                 direction: WC_DOC_DIR[docType] || 'alacak',
                 excludeFatura: docType === 'custom',
+                includeContent: docType === 'stokCikis',
                 template: WC_DOC_PRESET[docType] != null ? WC_PRESETS[WC_DOC_PRESET[docType]].v : '',
             }, true);
             // Açık diğer satırları kapat → yeni eklenen öne çıksın.
@@ -1535,11 +1536,12 @@ const WC_PRESETS = [
     { t: 'Fatura kesildi', v: 'Sayın {firma}, {tarih} tarihli {tutar} TL tutarındaki faturanız düzenlenmiştir. Güncel bakiyeniz: {bakiye} TL ({durum}).\n{firmaadi}' },
     { t: 'Ödeme alındı', v: 'Sayın {firma}, {tarih} tarihinde {tutar} TL tutarındaki ödemeniz alınmıştır, teşekkür ederiz. Güncel bakiyeniz: {bakiye} TL ({durum}).\n{firmaadi}' },
     { t: 'Sevkiyat yapıldı', v: 'Sayın {firma}, {tarih} tarihli {tutar} TL tutarındaki sevkiyatınız yapılmıştır. Bilginize sunarız.\n{firmaadi}' },
+    { t: 'Ürün çıkışı yapıldı', v: 'Sayın {firma}, {tarih} tarihli {evrak} numaralı ürün çıkışınız yapılmıştır. Bilginize sunarız.\n{firmaadi}' },
     { t: 'Tedarikçiye ödeme yapıldı', v: 'Sayın {firma}, {tarih} tarihinde tarafınıza {tutar} TL ödeme yapılmıştır. Güncel bakiye: {bakiye} TL ({durum}).\n{firmaadi}' },
 ];
 
 // Yeni eklenen türün başlangıç metni (WC_PRESETS sırası) ve yönü.
-const WC_DOC_PRESET = { satisFaturasi: 0, alisFaturasi: 0, cariGiris: 1, satisIrsaliyesi: 2, stokCikis: 2, stokGiris: 2, cariCikis: 3 };
+const WC_DOC_PRESET = { satisFaturasi: 0, alisFaturasi: 0, cariGiris: 1, satisIrsaliyesi: 2, stokCikis: 3, stokGiris: 2, cariCikis: 4 };
 const WC_DOC_DIR = { satisFaturasi: 'borc', satisIrsaliyesi: 'borc', stokCikis: 'borc', cariGiris: 'alacak', cariCikis: 'borc', alisFaturasi: 'alacak', stokGiris: 'alacak' };
 
 // Satır başlığında "ne zaman gider" — belge türü kodu yerine düz cümle.
@@ -1587,7 +1589,7 @@ function createRuleCard(rule, open) {
                 <label>Mesaj</label>
                 <textarea class="rc_template" placeholder="Sayın {firma}, ...">${esc(rule.template || '')}</textarea>
             </div>
-            <label class="check rc_contentRow" style="display:none"><input type="checkbox" class="rc_includeContent" /> Belgenin kalemlerini de yaz</label>
+            <label class="check rc_contentRow" style="display:none"><input type="checkbox" class="rc_includeContent" /> <span class="rc_contentLbl">Belgenin kalemlerini de yaz</span></label>
             <details class="adv">
                 <summary>Gelişmiş</summary>
                 <div class="field rc_minSimple"><label>En az tutar (TL)</label><input class="rc_min2" type="number" min="0" value="${Number(rule.minAmount) || 0}" /></div>
@@ -1643,6 +1645,9 @@ function createRuleCard(rule, open) {
         card.querySelector('.rc_minSimple').style.display = custom ? 'none' : '';
         card.querySelector('.rc_docHint').textContent = custom ? 'Vega IZAHAT kodlarını Gelişmiş bölümünden girin.' : '';
         card.querySelector('.rc_contentRow').style.display = CONTENT_DOCTYPES.has(dt) ? '' : 'none';
+        // Stok fişinde fiyatsız ürün/miktar listesi gider (fatura dökümü değil).
+        card.querySelector('.rc_contentLbl').textContent = (dt === 'stokCikis' || dt === 'stokGiris')
+            ? 'Ürün ve miktarları da yaz' : 'Belgenin kalemlerini de yaz';
         updateHead();
     };
     applyDocTypeUI();

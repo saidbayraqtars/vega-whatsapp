@@ -2354,6 +2354,28 @@ function formatDocContentText(kalemler, belgeTutari, baslik = 'Belge içeriği:'
     return out.join('\n');
 }
 
+// Stok fişi (çıkış/giriş) kalemlerini "ürün hareketi" metnine çevir: yalnız ürün +
+// miktar + birim. Fiyat/toplam YOK — istenen fatura dökümü değil, hangi üründen kaç
+// adet çıktığı (Vega Yazılım, 2026-09-28). Stok fişleri çoğu zaman fiyatsız da kesilir
+// (czgr F0118D0001: 1712 fişin 1696'sı TUTAR=0), fiyat satırı orada "0,00 TL" olurdu.
+function formatStokMovementText(kalemler, baslik = 'Ürün hareketi:') {
+    const ks = Array.isArray(kalemler) ? kalemler : [];
+    if (!ks.length) return null;
+    const qty = (n) => {
+        const x = Number(n) || 0;
+        return Number.isInteger(x) ? String(x) : x.toLocaleString('tr-TR', { maximumFractionDigits: 3 });
+    };
+    const out = [baslik];
+    const MAX = 25;
+    for (const k of ks.slice(0, MAX)) {
+        const q = Number(k.miktar) ? `: ${qty(k.miktar)}${k.birim ? ' ' + k.birim : ''}` : '';
+        out.push(`- ${k.ad || '(ürün)'}${q}`);
+    }
+    if (ks.length > MAX) out.push(`... (+${ks.length - MAX} kalem daha)`);
+    out.push(`Toplam: ${ks.length} kalem`);
+    return out.join('\n');
+}
+
 // docType (watcher) → izahat kodu (DOC_LINE_MAP kalem tablosu eşlemesi için).
 const DOCTYPE_IZAHAT = { satisFaturasi: 21, alisFaturasi: 20, satisIrsaliyesi: 22, alisIrsaliyesi: 23, stokCikis: 33, stokGiris: 32 };
 
@@ -2365,6 +2387,7 @@ async function buildDocContentText(firmaNo, donemNo, docType, evrak, belgeTutari
     if (!izahat || evrak == null || evrak === '') return null;
     let kalemler = null;
     try { kalemler = await fetchBelgeKalemleri(firmaNo, donemNo, izahat, evrak); } catch { kalemler = null; }
+    if (docType === 'stokCikis' || docType === 'stokGiris') return formatStokMovementText(kalemler);
     return formatDocContentText(kalemler, belgeTutari);
 }
 
