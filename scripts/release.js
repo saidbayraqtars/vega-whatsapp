@@ -35,7 +35,16 @@ const version = require(path.join(root, 'package.json')).version;
 console.log(`\nYayınlanıyor: v${version} → github.com/saidbayraqtars/vega-whatsapp-releases\n`);
 
 // 3) Derle + GitHub Releases'a yükle
-const b = run('npx', ['electron-builder', '--win', '--publish', 'always'], {
+// Electron zip'i GitHub'dan indirmek bu ağda sık zaman aşımına düşüyor; aynı
+// sürüm node_modules/electron/dist'te zaten varsa onu kullan.
+const fs = require('fs');
+const builderArgs = ['electron-builder', '--win', '--publish', 'always'];
+try {
+    const localVer = fs.readFileSync(path.join(root, 'node_modules/electron/dist/version'), 'utf8').trim();
+    const pkgVer = require(path.join(root, 'node_modules/electron/package.json')).version;
+    if (localVer === pkgVer) builderArgs.push('--config.electronDist=node_modules/electron/dist');
+} catch { /* yerel dist yok → electron-builder kendisi indirir */ }
+const b = run('npx', builderArgs, {
     env: { ...process.env, GH_TOKEN: m[1] },
 });
 process.exit(b.status || 0);
