@@ -297,6 +297,7 @@ const TPL_FIELDS = {
     '{yon}': ['Alınan/Verilen', 'Alınan'],
     '{belgeno}': ['Çek/senet no', '1234567'],
     '{banka}': ['Banka', 'AKBANK'],
+    '{taksit}': ['Visa taksiti', '3/6. taksit'],
     '{vade}': ['Vade tarihi', SAMPLE_TODAY],
     '{gun}': ['Kalan gün', '3'],
     '{adet}': ['Belge sayısı', '4'],
@@ -2012,7 +2013,7 @@ async function loadVadeConfig() {
     $('vd_template').value = s.template || '';
     $('vd_headerTemplate').value = s.headerTemplate || '';
     $('vd_lineTemplate').value = s.lineTemplate || '';
-    const VD_FIELDS = ['{tur}', '{belgeno}', '{firma}', '{banka}', '{vade}', '{kalan}', '{tutar}', '{yon}', '{kod}', '{firmaadi}'];
+    const VD_FIELDS = ['{tur}', '{belgeno}', '{firma}', '{banka}', '{taksit}', '{vade}', '{kalan}', '{tutar}', '{yon}', '{kod}', '{firmaadi}'];
     const VD_OPTS = { caption: 'Size böyle gelecek', labels: { '{kalan}': 'Kalan süre' }, overrides: { '{kalan}': '3 gün kaldı', '{firma}': 'ÖRNEK MÜŞTERİ A.Ş.', '{tutar}': '125.000,00' } };
     mountTemplateEditor($('vd_template'), VD_FIELDS, {
         ...VD_OPTS,
@@ -2121,6 +2122,7 @@ $('vd_preview').onclick = async () => {
             box.innerHTML = r.docs.map(d => `
                 <div class="logline">
                     <span>${esc(d.kalan)} — <b>${esc(d.turAdi)}</b> ${esc(d.belgeno || '')}
+                        ${d.taksitStr ? `<span class="muted">${esc(d.taksitStr)}</span>` : ''}
                         <span class="muted">${esc(d.yonAdi)}</span>
                         — ${esc(d.firma)} <b>${esc(d.tutarStr)} TL</b>
                         <span class="muted">(${esc(d.vadeStr || '')})</span>

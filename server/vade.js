@@ -37,18 +37,24 @@
 //  (aynı vade, aynı tutar) haber vermek olurdu. BELGENO'yu ikinci anahtar yapmayı
 //  denedik: kazanılan 8 satır tamamen mükerrer, üstelik 1-2 yanlış tip eşleşmesi getirdi.
 //
-//  VİSA'NIN VADESİ — DİKKAT: TBLVISAGIRIS satırındaki VADE, taksit vadesi DEĞİL.
-//  Ölçüm (F0101D0017, 2240 satır): TAKSITSAYISI=1 olan 1723 satırda VADE = işlem+0..9
-//  gün (banka blokajı), TAKSITSAYISI>1 olan 517 satırda VADE = işlem tarihinin AYNISI
-//  (0 gün). Yani Vega taksit takvimini bu tabloda tutmuyor — 6 taksitli satış tek
-//  satır, tek tarih. Gerçek taksit takvimi ayrı tabloda: TBLWSTAKSITLISATIS
-//  (IZAHAT=100, taksit başına 1 satır, TARIH=taksit vadesi) — bu modülün kapsamında
-//  DEĞİL (canlıda 37.614 satır, 16.132'si gelecek vadeli → sabit numaraya bildirim
-//  işi değil, cari hatırlatması işi).
-//  Bu yüzden visa varsayılan KAPALI ve açılırsa varsayılan olarak yalnız taksitli
-//  işlemler alınır (visaOnlyTaksit) — peşin kart çekimi "vade" sayılmaz.
-//  Kuruluma göre değişir: czgr F0102D0013'te 9029 visa satırının 8014'ünde VADE işlemden
-//  11+ gün sonra (bankanın parayı geçireceği gün) — orada vade gerçek.
+//  VİSA'NIN VADESİ — TBLVISAGIRIS'te satır = bankanın ödeyeceği BİR parça:
+//    • LN>=1  → banka anlaşması (F{firma}TBLBNKKARTANLASMAHAREKET) tanımlı: Vega satışı
+//               taksitlere böler, her taksit ayrı satır (TAKSITSAYISI=1, LN=taksit no),
+//               VADE = işlem + BLOKEGUN + (LN-1) × TAHSILATSEKLI gün → GERÇEK ödeme günü.
+//    • LN=0   → anlaşma yok/bölünmemiş: tek satır, VADE çoğunlukla işlem gününün AYNISI
+//               (czgr 1014 satırın 855'i, özdemirkaya %100) → vade değil, işlem tarihi.
+//    • PORTFOYNO = satış şekli (kaç taksitle satıldı; anlaşmadaki SATISSEKLI ile eşleşir).
+//      TAKSITSAYISI bölünmüş satırda 1'dir — "taksitli mi" sorusunun cevabı DEĞİL.
+//  2026-09-30 düzeltmesi: eskiden "taksitli" = TAKSITSAYISI>1 idi → tam tersini seçiyordu:
+//  vadesi işlem günü olan bölünmemiş satırları alıp ("bugün vadesi"), gerçek taksit
+//  satırlarını (czgr 6657, özdemirkaya 4222) hiç görmüyordu. Artık:
+//    - taksitli = PORTFOYNO>1 (visaOnlyTaksit),
+//    - VADE işlem gününden SONRA olmalı (vadesi işlem günü olan satırın takip edilecek vadesi yok),
+//    - STATUS=27 "Kredi Kartı Bankada" (Vega'nın tahsil edilmemiş visa görünümüyle aynı;
+//      28/52 = tahsil edildi, 50/51 = iade).
+//  Taksit günlerini Vega anlaşmadan hesaplar; anlaşma yanlış girilmişse (ör. özdemirkaya:
+//  BLOKEGUN=1, TAHSILATSEKLI=1 → 6 taksit art arda 6 gün) Vega ekranı da aynı günü gösterir.
+//  Gerçek taksitli SATIŞ takvimi (mağaza taksiti) ayrı: TBLWSTAKSITLISATIS — bkz. shopstar.js.
 //
 //  BANKA ADI: h.BANKANO → F{firma}TBLBANKALAR.IND → ADI (dönemsiz tablo; canlı:
 //  101→AKBANK). Tablo/eşleşme yoksa belge tablosunun metin alanına düşülür.
@@ -99,13 +105,23 @@ let lastResult = null;
 
 // Belge tipi tanımı: hangi belge tablosuna bağlanırsa o tip.
 // side: 'GIR' = alınan (tahsilat), 'CIK' = verilen (ödeme).
+// taksit = satışın taksit sayısı, taksitNo = bu satır kaçıncı taksit (visa dışında yok).
 const DOC_TYPES = [
-    { id: 'cek', label: 'Çek', gir: 'TBLCEKGIRIS', cik: 'TBLCEKCIKIS', ek: 'd.SUBE', taksit: 'NULL' },
-    { id: 'senet', label: 'Senet', gir: 'TBLSENETGIRIS', cik: 'TBLSENETCIKIS', ek: 'd.KESIDEEDEN', taksit: 'NULL' },
+    { id: 'cek', label: 'Çek', gir: 'TBLCEKGIRIS', cik: 'TBLCEKCIKIS', ek: 'd.SUBE', taksit: 'NULL', taksitNo: 'NULL' },
+    { id: 'senet', label: 'Senet', gir: 'TBLSENETGIRIS', cik: 'TBLSENETCIKIS', ek: 'd.KESIDEEDEN', taksit: 'NULL', taksitNo: 'NULL' },
     // Visa'da BANKAADI canlıda çoğu satırda NULL; kart adı (GARANTI/ISBANK/MAİLORDER) dolu.
-    { id: 'visa', label: 'Kredi Kartı', gir: 'TBLVISAGIRIS', cik: null, ek: 'ISNULL(d.BANKAADI, d.KARTADI)', taksit: 'd.TAKSITSAYISI' },
-    { id: 'taksit', label: 'Taksit', gir: 'TBLTAKSITGIRIS', cik: null, ek: 'NULL', taksit: 'NULL' },
+    // PORTFOYNO = satış şekli (taksit sayısı), LN = taksit no — bkz. başlıktaki VİSA notu.
+    { id: 'visa', label: 'Kredi Kartı', gir: 'TBLVISAGIRIS', cik: null, ek: 'ISNULL(d.BANKAADI, d.KARTADI)', taksit: 'd.PORTFOYNO', taksitNo: 'd.LN' },
+    { id: 'taksit', label: 'Taksit', gir: 'TBLTAKSITGIRIS', cik: null, ek: 'NULL', taksit: 'NULL', taksitNo: 'NULL' },
 ];
+
+// Visa satırı için ek filtre: tahsil edilmemiş (27), vadesi işlem gününden sonra,
+// istenirse yalnız taksitli satış (PORTFOYNO>1). Bkz. başlıktaki VİSA notu.
+function visaFilter(onlyTaksit) {
+    return ' AND h.STATUS = 27'
+        + ' AND h.VADE >= DATEADD(day, 1, CAST(d.ISLEMTARIHI AS date))'
+        + (onlyTaksit ? ' AND ISNULL(d.PORTFOYNO, 0) > 1' : '');
+}
 const typeLabel = (id) => (DOC_TYPES.find(t => t.id === id) || {}).label || id;
 
 const DEFAULT_TEMPLATE =
@@ -371,9 +387,7 @@ async function buildQuery(pool, opts) {
                 missing.push(full);
                 continue;
             }
-            // Visa'da peşin çekimi ele: taksitsiz satırın "vade"si banka blokajıdır, vade değil.
-            const extra = (t.id === 'visa' && opts.visaOnlyTaksit !== false)
-                ? ' AND ISNULL(d.TAKSITSAYISI, 0) > 1' : '';
+            const extra = t.id === 'visa' ? visaFilter(opts.visaOnlyTaksit !== false) : '';
             parts.push(`
                 SELECT '${t.id}' AS TUR, '${side === 'GIR' ? 'alinan' : 'verilen'}' AS YON,
                        h.IND AS HIND, h.BELGELINK AS DIND, h.EVRAKNO AS FISIND,
@@ -382,6 +396,7 @@ async function buildQuery(pool, opts) {
                        h.FIRMANO AS FIRMANO, h.BELGENO AS BELGENO,
                        CAST(${t.ek} AS nvarchar(120)) AS EK,
                        CAST(${t.taksit} AS decimal(18,2)) AS TAKSIT,
+                       CAST(${t.taksitNo} AS int) AS TAKSITNO,
                        ${bankaCol} AS BANKAADI,
                        b.BELGENO AS FISNO, b.TARIH AS FISTARIHI
                 FROM [${harTbl}] h
@@ -424,6 +439,7 @@ async function fetchDueDocs(pool, maxDays, opts) {
         // Banka adı varsa onu göster; yoksa belge tablosunun metin alanı (şube/keşideci/kart).
         ek: (row.BANKAADI || row.EK || '').trim(),
         taksit: row.TAKSIT == null ? null : Number(row.TAKSIT),
+        taksitNo: row.TAKSITNO == null ? null : Number(row.TAKSITNO),
         fisno: row.FISNO || '',
     }));
 
@@ -594,6 +610,12 @@ async function getBizFirma() {
     } catch { return bizFirmaCache.name || ''; }
 }
 
+// "3/6. taksit" (bölünmüş visa satırı) / "6 taksit" (bölünmemiş) / '' (peşin, çek, senet).
+function taksitLabel(d) {
+    if (!(d.taksit > 1)) return '';
+    return d.taksitNo > 0 ? `${d.taksitNo}/${d.taksit}. taksit` : `${d.taksit} taksit`;
+}
+
 function docVars(d, bizFirma, contact) {
     const c = contact || {};
     return {
@@ -603,7 +625,7 @@ function docVars(d, bizFirma, contact) {
         yon: d.yonAdi,
         belgeno: d.belgeno,
         banka: d.ek,
-        taksit: d.taksit && d.taksit > 1 ? `${d.taksit} taksit` : '',
+        taksit: taksitLabel(d),
         vade: trDate(d.vade),
         kalan: kalanLabel(d.kalanGun),
         gun: d.kalanGun,
@@ -804,7 +826,7 @@ async function listUpcoming(days) {
         const c = contacts.get(d.firmano) || {};
         return {
             tur: d.tur, turAdi: d.turAdi, yon: d.yon, yonAdi: d.yonAdi,
-            belgeno: d.belgeno, banka: d.ek, taksit: d.taksit,
+            belgeno: d.belgeno, banka: d.ek, taksit: d.taksit, taksitStr: taksitLabel(d),
             firma: c.firma || c.name || String(d.firmano), kod: c.kod || '',
             vade: d.vade, vadeStr: trDate(d.vade), kalanGun: d.kalanGun, kalan: kalanLabel(d.kalanGun),
             tutar: d.tutar, tutarStr: fmtAmount(d.tutar),
