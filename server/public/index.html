@@ -261,6 +261,13 @@
                         </div>
                         <label class="check"><input type="checkbox" id="vd_t_taksit" /> Taksit belgelerini de izle</label>
                         <label class="check"><input type="checkbox" id="vd_visaTaksit" checked /> Visa'da yalnız taksitli işlemleri al (peşin kart çekimini alma)</label>
+                        <div class="field" style="margin-top:8px">
+                            <label>Vega'da vadesi olmayan kart satışları (vade = işlem günü)</label>
+                            <div class="grid2">
+                                <div><input id="vd_ruleFirst" type="number" min="0" max="365" placeholder="boş = alma" /><div class="hint">Banka ilk ödemeyi kaç gün sonra yapar</div></div>
+                                <div><input id="vd_ruleEvery" type="number" min="0" max="120" value="30" /><div class="hint">Taksitler kaç gün arayla · 0 = hepsi birden</div></div>
+                            </div>
+                        </div>
                         <label class="check"><input type="checkbox" id="vd_group" checked /> Aynı anda birden çok belge varsa tek mesajda topla</label>
                         <div class="field" style="margin-top:8px"><label>Toplu mesaj başlığı</label><textarea id="vd_headerTemplate" style="min-height:56px"></textarea></div>
                         <div class="field"><label>Toplu mesajda her belge satırı</label><textarea id="vd_lineTemplate" style="min-height:50px"></textarea></div>

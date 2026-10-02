@@ -1457,7 +1457,8 @@ app.get('/api/vade', (req, res) => {
 });
 
 app.post('/api/vade', (req, res) => {
-    const allowed = ['firmaNo', 'donemNo', 'phone', 'days', 'types', 'visaOnlyTaksit', 'direction', 'minAmount',
+    const allowed = ['firmaNo', 'donemNo', 'phone', 'days', 'types', 'visaOnlyTaksit', 'visaRuleFirst', 'visaRuleEvery',
+        'direction', 'minAmount',
         'groupMessages', 'sendFromHour', 'sendToHour', 'intervalSec', 'respectSendWindow',
         'simulateTyping', 'template', 'headerTemplate', 'lineTemplate'];
     const patch = {};
@@ -1501,9 +1502,14 @@ app.get('/api/vade/log', (req, res) => {
 });
 
 // Önizleme: vadesi yaklaşan çek/senet/visa listesi — mesaj GÖNDERMEZ.
+// visa = kart satışı dökümü (kaçının Vega'da vadesi yok vb.); okunamazsa liste yine döner.
 app.get('/api/vade/upcoming', async (req, res) => {
     if (!requireDb(req, res)) return;
-    try { res.json({ success: true, docs: await vade.listUpcoming(req.query.days) }); }
+    try {
+        const docs = await vade.listUpcoming(req.query.days);
+        const visa = await vade.visaSummary().catch(e => { console.error('[Vade] visa özeti:', e.message); return null; });
+        res.json({ success: true, docs, visa });
+    }
     catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 

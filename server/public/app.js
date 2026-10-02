@@ -2006,6 +2006,8 @@ async function loadVadeConfig() {
     $('vd_t_senet').checked = s.types?.senet !== false;
     $('vd_t_visa').checked = s.types?.visa === true;
     $('vd_visaTaksit').checked = s.visaOnlyTaksit !== false;
+    $('vd_ruleFirst').value = s.visaRuleFirst ?? '';
+    $('vd_ruleEvery').value = s.visaRuleEvery ?? 30;
     $('vd_t_taksit').checked = s.types?.taksit === true;
     $('vd_direction').value = s.direction || 'ikisi';
     $('vd_min').value = s.minAmount || 0;
@@ -2061,6 +2063,8 @@ function collectVadeConfig() {
             taksit: $('vd_t_taksit').checked,
         },
         visaOnlyTaksit: $('vd_visaTaksit').checked,
+        visaRuleFirst: $('vd_ruleFirst').value.trim(),
+        visaRuleEvery: $('vd_ruleEvery').value.trim(),
         direction: $('vd_direction').value,
         minAmount: Math.max(0, +$('vd_min').value || 0),
         groupMessages: $('vd_group').checked,
@@ -2104,6 +2108,20 @@ $('vd_stop').onclick = async () => {
     renderVadeState(r.status);
 };
 
+// Kart satışı dökümü — visa neden gelmiyor sorusunun cevabı (önizlemenin üstünde).
+function vadeVisaNote(v) {
+    if (!v) return '';
+    const lines = [];
+    if (!v.acik) lines.push('Kredi kartı: bu dönemde tahsil edilmemiş kart satışı yok.');
+    else {
+        lines.push(`Kredi kartı — tahsil edilmemiş: ${v.acik} · Vega'da vadeli: ${v.vadeli} (ileri tarihli: ${v.ileri}) · vadesiz: ${v.vadesiz}`);
+        if (v.vadesiz && !v.rule) lines.push("Vadesizler alınmıyor: Vega'da banka anlaşması (blokaj günü / taksit aralığı) girilmemiş. Gelişmiş'ten ödeme kuralı girilirse hesaplanır.");
+        if (v.vadesiz && v.rule) lines.push(`Vadesizler kuralla hesaplanıyor: ilk ödeme ${v.rule.first} gün sonra, ${v.rule.every ? `taksitler ${v.rule.every} gün arayla` : 'hepsi birden'}.`);
+        if (v.onlyTaksit && v.pesin) lines.push(`Peşin satış: ${v.pesin} — "yalnız taksitli" açık olduğu için alınmıyor.`);
+    }
+    return `<div class="muted" style="padding:8px 10px">${lines.map(esc).join('<br>')}</div>`;
+}
+
 // Önizleme: hangi belgeleri okuduğumuzu göster (mesaj göndermez).
 $('vd_preview').onclick = async () => {
     $('vd_err').textContent = '';
@@ -2116,13 +2134,14 @@ $('vd_preview').onclick = async () => {
     try {
         await api('/vade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
         const r = await api('/vade/upcoming?days=60');
+        const note = r.success ? vadeVisaNote(r.visa) : '';
         if (!r.success) { box.innerHTML = `<div class="muted" style="padding:10px">${esc(r.message || 'Okunamadı.')}</div>`; }
-        else if (!r.docs.length) { box.innerHTML = '<div class="muted" style="padding:10px">Önümüzdeki 60 günde vadesi gelen çek/senet/visa yok.</div>'; }
+        else if (!r.docs.length) { box.innerHTML = note + '<div class="muted" style="padding:10px">Önümüzdeki 60 günde vadesi gelen çek/senet/visa yok.</div>'; }
         else {
-            box.innerHTML = r.docs.map(d => `
+            box.innerHTML = note + r.docs.map(d => `
                 <div class="logline">
                     <span>${esc(d.kalan)} — <b>${esc(d.turAdi)}</b> ${esc(d.belgeno || '')}
-                        ${d.taksitStr ? `<span class="muted">${esc(d.taksitStr)}</span>` : ''}
+                        ${d.taksitStr ? `<span class="muted">${esc(d.taksitStr)}</span>` : ''}${d.kural ? ` <span class="muted" title="Vega'da vade yok; Gelişmiş'teki ödeme kuralıyla hesaplandı">(kural)</span>` : ''}
                         <span class="muted">${esc(d.yonAdi)}</span>
                         — ${esc(d.firma)} <b>${esc(d.tutarStr)} TL</b>
                         <span class="muted">(${esc(d.vadeStr || '')})</span>

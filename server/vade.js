@@ -48,12 +48,22 @@
 //  2026-09-30 düzeltmesi: eskiden "taksitli" = TAKSITSAYISI>1 idi → tam tersini seçiyordu:
 //  vadesi işlem günü olan bölünmemiş satırları alıp ("bugün vadesi"), gerçek taksit
 //  satırlarını (czgr 6657, özdemirkaya 4222) hiç görmüyordu. Artık:
-//    - taksitli = PORTFOYNO>1 (visaOnlyTaksit),
+//    - taksitli = PORTFOYNO>1, PORTFOYNO yoksa TAKSITSAYISI>1 (visaOnlyTaksit),
 //    - VADE işlem gününden SONRA olmalı (vadesi işlem günü olan satırın takip edilecek vadesi yok),
-//    - STATUS=27 "Kredi Kartı Bankada" (Vega'nın tahsil edilmemiş visa görünümüyle aynı;
-//      28/52 = tahsil edildi, 50/51 = iade).
+//    - STATUS=27 "Kredi Kartı Bankada" (Vega'nın tahsil edilmemiş visa görünümüyle aynı:
+//      F..VTBLTAHSILEDILMEMISVISALAR da CH.STATUS=27 + CH.VADE kullanır; 28/52 = tahsil
+//      edildi, 50/51 = iade).
 //  Taksit günlerini Vega anlaşmadan hesaplar; anlaşma yanlış girilmişse (ör. özdemirkaya:
 //  BLOKEGUN=1, TAHSILATSEKLI=1 → 6 taksit art arda 6 gün) Vega ekranı da aynı günü gösterir.
+//
+//  VADESİ OLMAYAN SATIŞ (2026-10-02): anlaşma tanımlı değilse Vega VADE'ye işlem gününü
+//  yazar — özdemirkaya'da 2240 satırın ~1700'ü (YKB, ZİRAAT, AKBANK, VISA…). Bu satırlar
+//  yukarıdaki kuralla elenir; bir kurulumda bütün kart satışları böyleyse visa bildirimi
+//  HİÇ gelmez (patron PC'si). Gerçek ödeme günü Vega'da yok, biz uydurmayız: kullanıcı
+//  isterse Vega'nın formülünü kendi verir (visaRuleFirst = blokaj günü, visaRuleEvery =
+//  taksit aralığı; 0 = tek seferde). Yalnız BÖLÜNMEMİŞ satışa uygulanır — bölünmüş satışın
+//  bir parçasının tutarını tekrar bölmemek için (LN<=1 ve aynı fişte LN>1 satır yok).
+//  Önizlemedeki visa özeti (visaSummary) kaç satırın neden alınmadığını gösterir.
 //  Gerçek taksitli SATIŞ takvimi (mağaza taksiti) ayrı: TBLWSTAKSITLISATIS — bkz. shopstar.js.
 //
 //  BANKA ADI: h.BANKANO → F{firma}TBLBANKALAR.IND → ADI (dönemsiz tablo; canlı:
@@ -106,22 +116,38 @@ let lastResult = null;
 // Belge tipi tanımı: hangi belge tablosuna bağlanırsa o tip.
 // side: 'GIR' = alınan (tahsilat), 'CIK' = verilen (ödeme).
 // taksit = satışın taksit sayısı, taksitNo = bu satır kaçıncı taksit (visa dışında yok).
+// islem = işlem günü (yalnız visa; vadesi olmayan satışa kural uygulamak için).
+// Visa'da taksit sayısı PORTFOYNO'da (satış şekli); boşsa TAKSITSAYISI (czgr'de 2 satır).
+const VISA_TAKSIT = 'CASE WHEN ISNULL(d.PORTFOYNO, 0) > 1 THEN d.PORTFOYNO ELSE d.TAKSITSAYISI END';
 const DOC_TYPES = [
-    { id: 'cek', label: 'Çek', gir: 'TBLCEKGIRIS', cik: 'TBLCEKCIKIS', ek: 'd.SUBE', taksit: 'NULL', taksitNo: 'NULL' },
-    { id: 'senet', label: 'Senet', gir: 'TBLSENETGIRIS', cik: 'TBLSENETCIKIS', ek: 'd.KESIDEEDEN', taksit: 'NULL', taksitNo: 'NULL' },
+    { id: 'cek', label: 'Çek', gir: 'TBLCEKGIRIS', cik: 'TBLCEKCIKIS', ek: 'd.SUBE', taksit: 'NULL', taksitNo: 'NULL', islem: 'NULL' },
+    { id: 'senet', label: 'Senet', gir: 'TBLSENETGIRIS', cik: 'TBLSENETCIKIS', ek: 'd.KESIDEEDEN', taksit: 'NULL', taksitNo: 'NULL', islem: 'NULL' },
     // Visa'da BANKAADI canlıda çoğu satırda NULL; kart adı (GARANTI/ISBANK/MAİLORDER) dolu.
     // PORTFOYNO = satış şekli (taksit sayısı), LN = taksit no — bkz. başlıktaki VİSA notu.
-    { id: 'visa', label: 'Kredi Kartı', gir: 'TBLVISAGIRIS', cik: null, ek: 'ISNULL(d.BANKAADI, d.KARTADI)', taksit: 'd.PORTFOYNO', taksitNo: 'd.LN' },
-    { id: 'taksit', label: 'Taksit', gir: 'TBLTAKSITGIRIS', cik: null, ek: 'NULL', taksit: 'NULL', taksitNo: 'NULL' },
+    { id: 'visa', label: 'Kredi Kartı', gir: 'TBLVISAGIRIS', cik: null, ek: 'ISNULL(d.BANKAADI, d.KARTADI)', taksit: VISA_TAKSIT, taksitNo: 'd.LN', islem: 'd.ISLEMTARIHI' },
+    { id: 'taksit', label: 'Taksit', gir: 'TBLTAKSITGIRIS', cik: null, ek: 'NULL', taksit: 'NULL', taksitNo: 'NULL', islem: 'NULL' },
 ];
 
-// Visa satırı için ek filtre: tahsil edilmemiş (27), vadesi işlem gününden sonra,
-// istenirse yalnız taksitli satış (PORTFOYNO>1). Bkz. başlıktaki VİSA notu.
-function visaFilter(onlyTaksit) {
-    return ' AND h.STATUS = 27'
-        + ' AND h.VADE >= DATEADD(day, 1, CAST(d.ISLEMTARIHI AS date))'
-        + (onlyTaksit ? ' AND ISNULL(d.PORTFOYNO, 0) > 1' : '');
+// Visa satırı için ek filtre: tahsil edilmemiş (27), istenirse yalnız taksitli satış.
+// Vega vadesi olan satır: VADE işlem gününden sonra. Vadesi olmayan (VADE = işlem günü)
+// bölünmemiş satış ayrı dalda kuralla açılır (noVade). Bkz. başlıktaki VİSA notları.
+function visaFilter(onlyTaksit, noVade) {
+    const base = ' AND h.STATUS = 27' + (onlyTaksit ? ` AND ISNULL(${VISA_TAKSIT}, 0) > 1` : '');
+    if (!noVade) return base + ' AND h.VADE >= DATEADD(day, 1, CAST(d.ISLEMTARIHI AS date))';
+    return base + ' AND h.VADE < DATEADD(day, 1, CAST(d.ISLEMTARIHI AS date))'
+        + ' AND ISNULL(d.LN, 0) <= 1'
+        + ' AND NOT EXISTS (SELECT 1 FROM [{DOC}] d2 WHERE d2.EVRAKNO = d.EVRAKNO AND d2.LN > 1)';
 }
+
+// Vadesi olmayan kart satışı için kullanıcının kuralı: ilk ödeme kaç gün sonra (boş = kural
+// yok, bu satışlar alınmaz), taksitler kaç gün arayla (0 = hepsi ilk ödemeyle tek seferde).
+function visaRule() {
+    const first = parseInt(config.visaRuleFirst, 10);
+    if (!Number.isFinite(first) || first < 0) return null;
+    const every = parseInt(config.visaRuleEvery, 10);
+    return { first: Math.min(365, first), every: Number.isFinite(every) ? Math.min(120, Math.max(0, every)) : 30 };
+}
+const MAX_TAKSIT = 36;   // kural dalında geriye bakış sınırı (taksit sayısı en çok bu kadar sayılır)
 const typeLabel = (id) => (DOC_TYPES.find(t => t.id === id) || {}).label || id;
 
 const DEFAULT_TEMPLATE =
@@ -150,8 +176,12 @@ const DEFAULT_CONFIG = {
     // Visa varsayılan KAPALI: peşin kart çekimi de bu tabloda ve "vade"si banka
     // blokajı (0..9 gün) — bildirim kalabalığı yapar. Bkz. başlıktaki VİSA notu.
     types: { cek: true, senet: true, visa: false, taksit: false },
-    // Visa açıksa: yalnız TAKSITSAYISI>1 olan (taksitli/vadeli) işlemler alınsın.
+    // Visa açıksa: yalnız taksitli satışlar alınsın (peşin kart çekimi alınmasın).
     visaOnlyTaksit: true,
+    // Vega'da vadesi olmayan kart satışı (VADE = işlem günü) için ödeme kuralı.
+    // visaRuleFirst boş/null = kural yok → bu satışlar alınmaz. Bkz. visaRule().
+    visaRuleFirst: null,
+    visaRuleEvery: 30,
     // 'alinan' = müşteriden alınan (tahsilat), 'verilen' = bizim ödediğimiz, 'ikisi'.
     direction: 'ikisi',
     // Bu tutarın altındaki belgeleri bildirme (0 = hepsi).
@@ -328,6 +358,7 @@ const scanOpts = () => ({
     types: activeTypes(),
     direction: config.direction,
     visaOnlyTaksit: config.visaOnlyTaksit !== false,
+    visaRule: visaRule(),
 });
 
 async function tableExists(pool, name) {
@@ -387,11 +418,21 @@ async function buildQuery(pool, opts) {
                 missing.push(full);
                 continue;
             }
-            const extra = t.id === 'visa' ? visaFilter(opts.visaOnlyTaksit !== false) : '';
-            parts.push(`
+            // kural=1: Vega'da vadesi olmayan visa satışı — vade JS'te kuraldan hesaplanır,
+            // bu yüzden pencere VADE'ye değil işlem gününe (@if..@it) uygulanır.
+            const branches = [{ kural: 0 }];
+            if (t.id === 'visa' && opts.visaRule) branches.push({ kural: 1 });
+            for (const br of branches) {
+                const extra = t.id === 'visa'
+                    ? visaFilter(opts.visaOnlyTaksit !== false, br.kural === 1).replace('{DOC}', full) : '';
+                const window = br.kural
+                    ? 'd.ISLEMTARIHI >= CAST(@if AS date) AND d.ISLEMTARIHI < DATEADD(day, 1, CAST(@it AS date))'
+                    : 'h.VADE >= CAST(@f AS date) AND h.VADE < DATEADD(day, 1, CAST(@t AS date))';
+                parts.push(`
                 SELECT '${t.id}' AS TUR, '${side === 'GIR' ? 'alinan' : 'verilen'}' AS YON,
                        h.IND AS HIND, h.BELGELINK AS DIND, h.EVRAKNO AS FISIND,
                        h.VADE AS VADE, CONVERT(char(10), h.VADE, 23) AS VADEYMD,
+                       CONVERT(char(10), ${t.islem}, 23) AS ISLEMYMD, ${br.kural} AS KURAL,
                        h.TUTAR AS TUTAR, h.PARABIRIMI AS PARABIRIMI,
                        h.FIRMANO AS FIRMANO, h.BELGENO AS BELGENO,
                        CAST(${t.ek} AS nvarchar(120)) AS EK,
@@ -402,12 +443,31 @@ async function buildQuery(pool, opts) {
                 FROM [${harTbl}] h
                 JOIN [${full}] d ON d.IND = h.BELGELINK AND d.EVRAKNO = h.EVRAKNO
                 LEFT JOIN [${basTbl}] b ON b.IND = h.EVRAKNO${bankaJoin}
-                WHERE h.VADE >= CAST(@f AS date) AND h.VADE < DATEADD(day, 1, CAST(@t AS date))
+                WHERE ${window}
                   AND ISNULL(b.IPTAL, 0) = 0${extra}`);
+            }
         }
     }
     if (!parts.length) return { sql: null, missing };
     return { sql: parts.join('\nUNION ALL\n') + '\nORDER BY VADE ASC, TUTAR DESC', missing };
+}
+
+// Vadesi olmayan bölünmemiş kart satışını kurala göre ödeme parçalarına açar — Vega'nın
+// kendi formülü: işlem + ilk + (k-1) × aralık. Yalnız [from, to] içine düşenler döner.
+// Aralık 0 ya da peşin satış → tek ödeme, tutarın tamamı. Kuruş farkı son taksitte.
+function expandByRule(d, rule, from, to) {
+    if (!rule || !d.islem) return [];
+    const n = Math.min(MAX_TAKSIT, Math.max(1, Math.round(d.taksit || 1)));
+    const one = n === 1 || rule.every === 0;
+    const part = one ? d.tutar : Math.round((d.tutar / n) * 100) / 100;
+    const out = [];
+    for (let k = 1; k <= (one ? 1 : n); k++) {
+        const vade = addDaysYmd(d.islem, rule.first + (k - 1) * rule.every);
+        if (vade < from || vade > to) continue;
+        const tutar = one || k < n ? part : Math.round((d.tutar - part * (n - 1)) * 100) / 100;
+        out.push({ ...d, vade, kalanGun: daysUntil(vade), tutar, taksitNo: one ? null : k });
+    }
+    return out;
 }
 
 // Vadesi [bugün, bugün+maxDays] aralığında olan belgeler.
@@ -417,12 +477,17 @@ async function fetchDueDocs(pool, maxDays, opts) {
     if (!q.sql) throw new Error('İzlenecek belge tablosu bulunamadı (seçilen tipler bu dönemde yok).');
 
     const from = localYmd();
+    const to = addDaysYmd(from, maxDays);
+    const rule = opts.visaRule || null;
     const r = pool.request();
     r.input('f', deps.sql.NVarChar, from);
-    r.input('t', deps.sql.NVarChar, addDaysYmd(from, maxDays));
+    r.input('t', deps.sql.NVarChar, to);
+    // Kural dalı: son taksiti pencereye düşebilecek, ilk ödemesi pencereyi geçmeyen satışlar.
+    r.input('if', deps.sql.NVarChar, addDaysYmd(from, -(rule ? rule.first + (MAX_TAKSIT - 1) * rule.every : 0)));
+    r.input('it', deps.sql.NVarChar, addDaysYmd(to, -(rule ? rule.first : 0)));
     const rows = (await r.query(q.sql)).recordset;
 
-    const docs = rows.map(row => ({
+    const raw = rows.map(row => ({
         tur: row.TUR,
         turAdi: typeLabel(row.TUR),
         yon: row.YON,
@@ -441,7 +506,15 @@ async function fetchDueDocs(pool, maxDays, opts) {
         taksit: row.TAKSIT == null ? null : Number(row.TAKSIT),
         taksitNo: row.TAKSITNO == null ? null : Number(row.TAKSITNO),
         fisno: row.FISNO || '',
+        islem: row.ISLEMYMD || null,
+        kural: row.KURAL === 1,
     }));
+    const docs = [];
+    for (const d of raw) {
+        if (!d.kural) docs.push(d);
+        else docs.push(...expandByRule(d, rule, from, to));
+    }
+    docs.sort((a, b) => (a.vade < b.vade ? -1 : a.vade > b.vade ? 1 : b.tutar - a.tutar));
 
     // Aynı belge birden çok ödeme satırıyla gelebilir (fiş düzenlenip satırlar yeniden
     // yazıldığında / aynı çek iki satıra bölündüğünde) → kimliğe göre tekille.
@@ -467,8 +540,10 @@ function docIdentity(d) {
 }
 const docKey = (d, esik) => `${docIdentity(d)}:${esik}`;
 // Güncellemeden önce yazılmış defter kayıtları da saysın (geçişte ikinci mesaj gitmesin).
+// Kuralla açılan visa parçalarında yok: eski anahtarda vade olmadığından bütün taksitler
+// aynı anahtara düşer, ilki "gönderildi" diye hepsi susardı.
 const legacyKey = (d, esik) => `${prefix()}:${d.yon}:${d.tur}:${d.dind}:${d.hind}:${esik}`;
-const wasSent = (d, esik) => !!(sentKeys[docKey(d, esik)] || sentKeys[legacyKey(d, esik)]);
+const wasSent = (d, esik) => !!(sentKeys[docKey(d, esik)] || (!d.kural && sentKeys[legacyKey(d, esik)]));
 
 function pruneSent() {
     const cut = Date.now() - SENT_WINDOW_MS;
@@ -773,6 +848,15 @@ function setConfig(patch) {
     const next = { ...config, ...patch };
     if (patch && patch.types) next.types = { ...config.types, ...patch.types };
     if (patch && patch.days !== undefined) next.days = normalizeDays(patch.days);
+    // Kural alanları UI'dan metin gelir: boş = kural yok (null), aralık boşsa 30.
+    if (patch && 'visaRuleFirst' in patch) {
+        const v = parseInt(patch.visaRuleFirst, 10);
+        next.visaRuleFirst = Number.isFinite(v) && v >= 0 ? Math.min(365, v) : null;
+    }
+    if (patch && 'visaRuleEvery' in patch) {
+        const v = parseInt(patch.visaRuleEvery, 10);
+        next.visaRuleEvery = Number.isFinite(v) && v >= 0 ? Math.min(120, v) : 30;
+    }
     config = next;
     saveConfig();
     return getConfig();
@@ -786,6 +870,8 @@ function getStatus() {
         days: config.days,
         types: activeTypes(),
         visaOnlyTaksit: config.visaOnlyTaksit !== false,
+        visaRuleFirst: config.visaRuleFirst,
+        visaRuleEvery: config.visaRuleEvery,
         direction: config.direction,
         minAmount: config.minAmount || 0,
         groupMessages: config.groupMessages !== false,
@@ -826,13 +912,51 @@ async function listUpcoming(days) {
         const c = contacts.get(d.firmano) || {};
         return {
             tur: d.tur, turAdi: d.turAdi, yon: d.yon, yonAdi: d.yonAdi,
-            belgeno: d.belgeno, banka: d.ek, taksit: d.taksit, taksitStr: taksitLabel(d),
+            belgeno: d.belgeno, banka: d.ek, taksit: d.taksit, taksitStr: taksitLabel(d), kural: !!d.kural,
             firma: c.firma || c.name || String(d.firmano), kod: c.kod || '',
             vade: d.vade, vadeStr: trDate(d.vade), kalanGun: d.kalanGun, kalan: kalanLabel(d.kalanGun),
             tutar: d.tutar, tutarStr: fmtAmount(d.tutar),
             bildirildi: config.days.some(t => wasSent(d, t)),
         };
     });
+}
+
+// UI önizleme: seçili dönemdeki kart satışlarının dökümü — visa neden gelmiyor sorusunun
+// cevabı. Satır = TBLVISAGIRIS parçası (bölünmüş satışta taksit başına bir satır).
+// Visa kapalıysa / tablo yoksa null.
+async function visaSummary() {
+    const P = prefix();
+    if (!P || !config.types.visa || config.direction === 'verilen') return null;
+    const pool = deps.getPool();
+    if (!pool || !pool.connected) return null;
+    const docTbl = `${P}TBLVISAGIRIS`, harTbl = `${P}TBLCARGIRHAREKET`, basTbl = `${P}TBLCARGIRBASLIK`;
+    for (const t of [docTbl, harTbl, basTbl]) if (!(await tableExists(pool, t))) return null;
+    const vadeli = 'h.VADE >= DATEADD(day, 1, CAST(d.ISLEMTARIHI AS date))';
+    const pesin = `ISNULL(${VISA_TAKSIT}, 0) <= 1`;
+    const r = pool.request();
+    r.input('f', deps.sql.NVarChar, localYmd());
+    const row = (await r.query(`
+        SELECT COUNT(*) AS TOPLAM,
+               SUM(CASE WHEN h.STATUS = 27 THEN 1 ELSE 0 END) AS ACIK,
+               SUM(CASE WHEN h.STATUS = 27 AND ${vadeli} THEN 1 ELSE 0 END) AS VADELI,
+               SUM(CASE WHEN h.STATUS = 27 AND ${vadeli} AND h.VADE >= CAST(@f AS date) THEN 1 ELSE 0 END) AS ILERI,
+               SUM(CASE WHEN h.STATUS = 27 AND ${pesin} THEN 1 ELSE 0 END) AS PESIN
+        FROM [${harTbl}] h
+        JOIN [${docTbl}] d ON d.IND = h.BELGELINK AND d.EVRAKNO = h.EVRAKNO
+        LEFT JOIN [${basTbl}] b ON b.IND = h.EVRAKNO
+        WHERE ISNULL(b.IPTAL, 0) = 0`)).recordset[0] || {};
+    const n = (k) => Number(row[k]) || 0;
+    const rule = visaRule();
+    return {
+        toplam: n('TOPLAM'),
+        acik: n('ACIK'),                       // tahsil edilmemiş (STATUS=27)
+        vadeli: n('VADELI'),                   // Vega'da vadesi var
+        ileri: n('ILERI'),                     //   … ve vadesi bugün ya da sonra
+        vadesiz: n('ACIK') - n('VADELI'),      // Vega'da vade = işlem günü
+        pesin: n('PESIN'),                     // tahsil edilmemiş peşin satış
+        onlyTaksit: config.visaOnlyTaksit !== false,
+        rule,
+    };
 }
 
 // UI "Test mesajı gönder": vadesi en yakın gerçek belgeyi (yoksa örneği) şablonla yollar.
@@ -884,5 +1008,5 @@ async function sendTest() {
 module.exports = {
     configure, autoStart, start, stop,
     getConfig, setConfig, getStatus, getLog, resetLedger,
-    pollOnce, listUpcoming, sendTest, clearPending,
+    pollOnce, listUpcoming, visaSummary, sendTest, clearPending,
 };
