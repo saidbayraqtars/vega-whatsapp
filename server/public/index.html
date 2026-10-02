@@ -152,6 +152,16 @@
                     <label class="check"><input type="checkbox" id="wc_verify" checked /> Numara WhatsApp'ta mı kontrol et</label>
                     <label class="check"><input type="checkbox" id="wc_typing" checked /> "Yazıyor..." göster</label>
                     <div class="field" style="max-width:220px; margin-top:8px"><label>Tarama sıklığı (sn)</label><input id="wc_interval" type="number" value="30" min="10" /></div>
+
+                    <div class="sep"></div>
+                    <label class="check"><input type="checkbox" id="wc_slow" /> <b>Yoğun trafik modu</b> — mesajları sıraya al, uzun aralıklarla gönder</label>
+                    <div class="grid2" style="margin-top:8px">
+                        <div><label>Mesajlar arası en az (dk)</label><input id="wc_slowMin" type="number" min="1" max="120" value="5" /></div>
+                        <div><label>En çok (dk)</label><input id="wc_slowMax" type="number" min="1" max="240" value="15" /></div>
+                        <div><label>Gönderim başlangıç</label><input id="wc_slowStart" type="time" value="08:00" /></div>
+                        <div><label>Bitiş</label><input id="wc_slowEnd" type="time" value="20:00" /></div>
+                    </div>
+                    <div class="hint">Bekleme bu aralıkta rastgele seçilir. Sıra güne sığmıyorsa en aza yaklaşır, altına inmez. Bitiş saatinde gönderilemeyen mesajlar silinir. Günler Ayarlar'daki gönderim günlerinden gelir.</div>
                 </div>
             </details>
 

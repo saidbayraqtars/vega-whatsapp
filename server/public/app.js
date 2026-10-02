@@ -1517,6 +1517,11 @@ async function loadWatcherConfig() {
     $('wc_watchEdits').checked = s.watchEdits === true;
     $('wc_watchDeletes').checked = s.watchDeletes === true;
     $('wc_editTemplate').value = s.editTemplate || '';
+    $('wc_slow').checked = s.slowMode === true;
+    $('wc_slowMin').value = s.slowMinMin ?? 5;
+    $('wc_slowMax').value = s.slowMaxMin ?? 15;
+    $('wc_slowStart').value = s.slowStart || '08:00';
+    $('wc_slowEnd').value = s.slowEnd || '20:00';
     mountTemplateEditor($('wc_editTemplate'), ['{firma}', '{evrak}', '{eskiTutar}', '{yeniTutar}', '{tarih}', '{bakiye}', '{durum}']);
     renderWatcherRules(s.rules || []);
     renderWatcherState(s);
@@ -1710,6 +1715,11 @@ function renderWatcherState(s) {
     const parts = [];
     if (s.lastError) parts.push(`⚠ ${s.lastError}`);
     if (s.pendingCount > 0) parts.push(`${s.pendingCount} mesaj sırada bekliyor`);
+    if (s.slow) {
+        const hm = (iso) => new Date(iso).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' });
+        parts.push(s.slow.nextAt ? `Yoğun trafik modu · sıradaki gönderim ${hm(s.slow.nextAt)}`
+            : s.slow.open ? 'Yoğun trafik modu' : `Yoğun trafik modu · ${s.slow.start}–${s.slow.end} arası gönderilir`);
+    }
     if (s.lastPollAt) parts.push(`Son kontrol ${new Date(s.lastPollAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}`);
     if (s.lastResult?.note && !s.lastError) parts.push(s.lastResult.note);
     $('wc_status').textContent = parts.join(' · ') || (on ? 'Çalışıyor' : 'Kapalı — başlatmak için Kaydet ve Başlat');
@@ -1751,6 +1761,11 @@ function collectWatcherConfig() {
         watchEdits: $('wc_watchEdits').checked,
         watchDeletes: $('wc_watchDeletes').checked,
         editTemplate: $('wc_editTemplate').value,
+        slowMode: $('wc_slow').checked,
+        slowMinMin: $('wc_slowMin').value,
+        slowMaxMin: $('wc_slowMax').value,
+        slowStart: $('wc_slowStart').value,
+        slowEnd: $('wc_slowEnd').value,
         rules: collectRules(),
     };
 }

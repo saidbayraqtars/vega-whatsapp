@@ -151,6 +151,14 @@ const DEFAULT_CONFIG = {
     watchDeletes: false,
     editScanSec: 60,
     editTemplate: 'Sayın {firma}, {tarih} tarihli {evrak} no.lu belgeniz güncellendi. Yeni tutar: {yeniTutar} TL (önceki {eskiTutar} TL). Güncel bakiyeniz: {bakiye} TL ({durum}).',
+    // ── Yoğun trafik modu (bkz. "YOĞUN TRAFİK MODU" notu) ──
+    // Mesajlar sıraya girer, aralarında slowMinMin..slowMaxMin dk rastgele beklenir,
+    // yalnız slowStart–slowEnd arasında gönderilir; bitişte kalan sıra silinir.
+    slowMode: false,
+    slowMinMin: 5,
+    slowMaxMin: 15,
+    slowStart: '08:00',
+    slowEnd: '20:00',
     // Belge tipi kuralları. loadConfig ilk açılışta PRESET_RULES ile doldurur.
     //   { id, docType, name, enabled, izahatCodes:[], direction:'alacak'|'borc'|'any',
     //     minAmount, excludeFatura, template, media:{path,mime,kind,name}|null }
@@ -480,8 +488,12 @@ const ledgerBase = (e) => ({
 });
 
 // Kuyruğa ekle (ind+phone tekilliği). mediaDesc kuralın görselidir (kalıcı yeniden okuma için).
-function enqueue(base, phone, text, reason, mediaDesc) {
-    if (pending.some(p => p.ind === base.ind && p.phone === phone)) return;
+// Düzenleme mesajının ind'i yok (null): aynı cariye iki farklı belgenin "güncellendi"
+// mesajı birbirini yutmasın diye orada metin de karşılaştırılır.
+// silent: yoğun trafik modunda her belge sıraya girer — "kuyrukta" satırı günlüğü
+// (200 kayıt) yarım günde doldururdu; sıradaki sayısı durum satırında görünür.
+function enqueue(base, phone, text, reason, mediaDesc, silent) {
+    if (pending.some(p => p.ind === base.ind && p.phone === phone && (base.ind != null || p.text === text))) return;
     pending.push({
         ind: base.ind, cariInd: base.cariInd, name: base.name, firma: base.firma, kod: base.kod,
         tutar: base.tutar, evrak: base.evrak, bakiye: base.bakiye, bakiyeDurum: base.bakiyeDurum,
@@ -492,7 +504,102 @@ function enqueue(base, phone, text, reason, mediaDesc) {
         attempts: 0, noWaCount: 0, queuedAt: new Date().toISOString(), lastError: reason,
     });
     savePending();
-    pushLog({ ...base, phone, status: 'queued', error: reason, message: text });
+    if (!silent) pushLog({ ...base, phone, status: 'queued', error: reason, message: text });
+}
+
+// ─── YOĞUN TRAFİK MODU (2026-10-02) ──────────────────────────────────────────
+// Günde 150–200 cari girişi olan kurulumlarda her belge bulunduğu an (8–20 sn arayla)
+// gidince numara banlanıyordu. Mod açıkken:
+//   • tarama aynı sıklıkta sürer; bulunan belgenin mesajı ANINDA gitmez, sıraya girer;
+//   • sıradan bir turda en çok BİR mesaj gider; sonraki slowMinMin..slowMaxMin dk sonra
+//     (rastgele). Sıra pencerenin kalanına sığmıyorsa üst sınır kısalır (sıra güne
+//     yayılır) ama alt sınırın altına HİÇ inilmez;
+//   • yalnız slowStart–slowEnd arasında gönderilir (günler genel gönderim penceresinden);
+//   • pencere kapanınca o güne düşen ve gönderilemeyen mesajlar SİLİNİR — sıkıştırıp peş
+//     peşe göndermek tam da ban sebebi. Pencere kapalıyken gelen belge sonraki açık
+//     günün penceresine kalır. Bekleme anı state'te (yeniden açılışta sıfırlanmasın).
+const slowOn = () => config.slowMode === true;
+const clampInt = (v, lo, hi, def) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def; };
+const hhmmToMin = (t, def) => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '')); return m && +m[1] < 24 && +m[2] < 60 ? +m[1] * 60 + +m[2] : def; };
+const minToHhmm = (m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+
+function slowCfg() {
+    const min = clampInt(config.slowMinMin, 1, 120, 5);
+    const max = Math.max(min, clampInt(config.slowMaxMin, 1, 240, 15));
+    let start = hhmmToMin(config.slowStart, 8 * 60), end = hhmmToMin(config.slowEnd, 20 * 60);
+    if (end <= start) { start = 8 * 60; end = 20 * 60; }      // gece yarısını aşan pencere yok
+    return { min, max, start, end };
+}
+// Gün seçimi genel gönderim penceresinden (Ayarlar); pencere kapalıysa her gün açık.
+function slowOpenDay(d) {
+    const w = antiban.getSendWindow();
+    return !w.enabled || w.days.includes(d.getDay());
+}
+const atMinute = (d, m) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), Math.floor(m / 60), m % 60, 0, 0);
+
+function slowWindowNow(now = new Date()) {
+    const { start, end } = slowCfg();
+    if (!slowOpenDay(now)) return { open: false };
+    const s = atMinute(now, start), e = atMinute(now, end);
+    return now >= s && now < e ? { open: true, endAt: e.getTime() } : { open: false };
+}
+
+// Bu anda sıraya giren mesajın son gönderim anı: içinde bulunulan ya da sonraki ilk açık
+// günün pencere kapanışı. Saklanmaz, her seferinde hesaplanır (saat ayarı değişebilir).
+function slowDeadline(from) {
+    const { end } = slowCfg();
+    const t = new Date(from);
+    if (!Number.isFinite(t.getTime())) return null;
+    for (let i = 0; i < 8; i++) {
+        const day = new Date(t.getFullYear(), t.getMonth(), t.getDate() + i);
+        if (!slowOpenDay(day)) continue;
+        const e = atMinute(day, end).getTime();
+        if (e > t.getTime()) return e;
+    }
+    return null;                                           // hiç açık gün seçilmemiş
+}
+
+function dropExpiredSlow(now = Date.now()) {
+    let n = 0;
+    for (const item of [...pending]) {
+        const dl = slowDeadline(item.queuedAt);
+        if (dl == null || now < dl) continue;
+        pending = pending.filter(p => p !== item);
+        pushLog({ ...pendingBase(item), status: 'cleared', error: 'Gün sonu: gönderim saati bitti, sırada kalan mesaj silindi (yoğun trafik modu)', message: item.text });
+        n++;
+    }
+    if (n) {
+        savePending();
+        console.log(`[Watcher] yoğun trafik modu: gün sonu, ${n} mesaj sıradan silindi`);
+    }
+    return n;
+}
+
+// Sonraki mesaja kadar bekleme: [min, hi] arası düz rastgele (ortalama (min+hi)/2).
+// fit = sıranın pencerenin kalanına sığması için mesaj başı süre. hi = 2·fit − min →
+// ortalama tam fit olur. hi aralığın ortasının altına inmez: sabit 5,0 dk'lık ritim de
+// bot imzası (ilk denemede yük altında bütün aralıklar 5,0 çıktı). Olgun yükte 5–15 dk,
+// ağır yükte 5–10 dk (08–20 arası en çok ~96 mesaj); sığmayan gün sonunda silinir.
+function slowGapMs(now = Date.now()) {
+    const { min, max } = slowCfg();
+    let hi = max;
+    const w = slowWindowNow(new Date(now));
+    if (w.open && pending.length) {
+        const fit = (w.endAt - now) / pending.length / 60000;
+        hi = Math.min(max, Math.max(min + (max - min) / 2, 2 * fit - min));
+    }
+    return Math.round((min + Math.random() * (hi - min)) * 60000);
+}
+
+function slowStatus() {
+    if (!slowOn()) return null;
+    const { min, max, start, end } = slowCfg();
+    const w = slowWindowNow();
+    const next = Math.max(Date.now(), state.slowNextAt || 0);
+    return {
+        minMin: min, maxMin: max, start: minToHhmm(start), end: minToHhmm(end), open: w.open,
+        nextAt: w.open && pending.length ? new Date(next).toISOString() : null,
+    };
 }
 
 const pendingBase = (p) => ({
@@ -501,7 +608,11 @@ const pendingBase = (p) => ({
 });
 
 async function processPending() {
+    // Yoğun trafik: gün sonu temizliği WhatsApp bağlı olmasa da yapılır; gönderim yalnız
+    // pencere açıkken ve bekleme dolmuşsa (DB'ye de ancak o zaman gidilir).
+    if (slowOn()) dropExpiredSlow();
     if (!pending.length || !deps.waStatus().ready) return 0;
+    if (slowOn() && (Date.now() < (state.slowNextAt || 0) || !slowWindowNow().open)) return 0;
     let sentCount = 0;
 
     // Kuyruktaki carileri DB'de YENİDEN doğrula: kuyruk phone+text snapshot tutar ve
@@ -529,7 +640,8 @@ async function processPending() {
         }
         if (!deps.waStatus().ready) break;
         // Gece penceresi: gönderim saati dışında kuyrukta beklesin (gece mesaj atma).
-        if (antiban.inQuietHours()) break;
+        // Yoğun trafik modunda modun kendi saatleri geçerli.
+        if (slowOn() ? !slowWindowNow().open : antiban.inQuietHours()) break;
         // Anti-ban tavanı doldu → kuyrukta kalsın, sonraki turda (saat/gün dönünce) dene.
         if (!gateSend('belge').ok) break;
         // Pasif/silinmiş cariyi kuyruktan at (doğrulama yapılabildiyse).
@@ -573,6 +685,12 @@ async function processPending() {
                 pushLog({ ...pendingBase(item), status: 'failed', error: `${res.error} (${MAX_SEND_ATTEMPTS} deneme sonrası vazgeçildi)`, message: item.text });
             }
             savePending();
+        }
+        // Yoğun trafik: bu turda tek mesaj; sonraki için uzun, rastgele bekleme.
+        if (slowOn()) {
+            state.slowNextAt = Date.now() + slowGapMs();
+            saveState();
+            break;
         }
         await sleep(rand(8000, 20000));
     }
@@ -909,6 +1027,7 @@ async function handleEdited(pool, tbl, key, e, curAmount) {
         bakiye: bakiyeStr, durum,
     });
 
+    if (slowOn()) { enqueue(base, c.phone, text, 'Yoğun trafik modu — sırayla gönderilecek', null, true); return; }
     if (antiban.inQuietHours()) { enqueue(base, c.phone, text, antiban.quietReason(), null); return; }
     if (!deps.waStatus().ready) {
         enqueue(base, c.phone, text, 'WhatsApp bağlı değil — düzenleme mesajı kuyruğa alındı', null);
@@ -1146,6 +1265,8 @@ async function pollOnce() {
 
             const targets = (config.sendAllPhones && Array.isArray(c.phones) && c.phones.length) ? c.phones : [c.phone];
             for (const phone of targets) {
+                // Yoğun trafik: hiçbir mesaj anında gitmez; processPending aralıklı gönderir.
+                if (slowOn()) { enqueue(base, phone, text, 'Yoğun trafik modu — sırayla gönderilecek', rule.media, true); queued++; continue; }
                 // Gece penceresi: saat dışındaysa kuyruğa al, pencere açılınca gönderilir.
                 if (antiban.inQuietHours()) { enqueue(base, phone, text, antiban.quietReason(), rule.media); queued++; continue; }
                 if (!deps.waStatus().ready) {
@@ -1220,7 +1341,11 @@ function setConfig(patch) {
         const arr = Array.isArray(patch.rules) ? patch.rules : [];
         next.rules = arr.map(r => normalizeRule(r, prevRules.find(p => p.id === r.id)));
     }
+    if ('slowMode' in patch) next.slowMode = patch.slowMode === true;
     config = next;
+    // Yoğun trafik alanları normalize (UI metin gönderir); slowCfg aynı sınırları kullanır.
+    const sc = slowCfg();
+    Object.assign(config, { slowMinMin: sc.min, slowMaxMin: sc.max, slowStart: minToHhmm(sc.start), slowEnd: minToHhmm(sc.end) });
     saveConfig();
     return getConfig();
 }
@@ -1235,6 +1360,9 @@ function getStatus() {
         cariType: config.cariType || 'hepsi', sendAlacakli: config.sendAlacakli !== false,
         watchEdits: config.watchEdits === true, watchDeletes: config.watchDeletes === true,
         editScanSec: config.editScanSec || 60, editTemplate: config.editTemplate || DEFAULT_CONFIG.editTemplate,
+        slowMode: slowOn(), slowMinMin: slowCfg().min, slowMaxMin: slowCfg().max,
+        slowStart: minToHhmm(slowCfg().start), slowEnd: minToHhmm(slowCfg().end),
+        slow: slowStatus(),
         docsCount: Object.values(docs).reduce((n, b) => n + Object.keys(b).length, 0),
         rules: (config.rules || []).map(r => ({
             id: r.id, docType: r.docType, name: r.name, enabled: r.enabled, izahatCodes: r.izahatCodes,
