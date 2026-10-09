@@ -1669,6 +1669,8 @@ app.post('/api/firma/info', (req, res) => {
     const allowed = ['name', 'phone', 'email', 'web', 'address', 'taxOffice', 'taxNo', 'iban', 'legalTerms'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    // Ekstre başlığında yalnız firma adı (adres/telefon/vergi/IBAN gizli).
+    if ('headerNameOnly' in req.body) patch.headerNameOnly = req.body.headerNameOnly === true;
     saveFirmaOverride(firmaNo, patch);
     res.json({ success: true });
 });
@@ -2152,6 +2154,7 @@ async function fetchFirmaInfo(firmaNo) {
         const merged = { ...db };
         for (const [k, v] of Object.entries(ov)) if (v != null && String(v).trim() !== '') merged[k] = v;
         merged.iban = ov.iban || ''; // IBAN yalnız override'dan
+        merged.headerNameOnly = ov.headerNameOnly === true;
         return merged;
     } catch (e) {
         console.error('fetchFirmaInfo:', e.message);

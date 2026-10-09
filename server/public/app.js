@@ -3415,6 +3415,7 @@ async function loadFirmaInfo() {
     $('fi_taxNo').value = i.taxNo || '';
     $('fi_iban').value = i.iban || '';
     $('fi_legal').value = i.legalTerms || '';
+    $('fi_headerNameOnly').checked = i.headerNameOnly === true;
     renderFirmaLogo(r.hasLogo, firmaNo);
 }
 
@@ -3440,6 +3441,7 @@ async function saveFirmaInfo() {
         taxNo: $('fi_taxNo').value.trim(),
         iban: $('fi_iban').value.trim(),
         legalTerms: $('fi_legal').value.trim(),
+        headerNameOnly: $('fi_headerNameOnly').checked,
     };
     const r = await api('/firma/info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     if (r.success) {

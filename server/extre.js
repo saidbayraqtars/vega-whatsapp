@@ -63,6 +63,9 @@ function buildExtrePdf(data = {}) {
 
             // ─── Marka başlık (logo + firma bilgileri) ───
             // Logo varsa sol üstte; firma adı + iletişim/vergi/IBAN bilgileri yanında.
+            // headerNameOnly (Firma Bilgileri'nde işaretlenir): yalnız logo + firma adı.
+            // Meşeliler 2026-10-06: "WhatsApp'a giden ekstrede adres/VKN olmasın".
+            const yalnizAd = firma.headerNameOnly === true;
             let logoW = 0;
             const headTop = 38;
             if (data.logo) {
@@ -74,20 +77,20 @@ function buildExtrePdf(data = {}) {
             doc.font(BOLD).fontSize(15).fillColor('#111')
                 .text(firma.name || data.firmaName || 'HESAP EKSTRESİ', infoX, headTop, { width: infoW });
             doc.font(REG).fontSize(8.5).fillColor('#555');
-            const line2 = [firma.address].filter(Boolean).join('');
+            const line2 = yalnizAd ? '' : [firma.address].filter(Boolean).join('');
             if (line2) doc.text(line2, infoX, doc.y + 1, { width: infoW });
-            const line3 = [
+            const line3 = yalnizAd ? '' : [
                 firma.phone ? `Tel: ${firma.phone}` : null,
                 firma.email || null,
                 firma.web || null,
             ].filter(Boolean).join('   ');
             if (line3) doc.text(line3, infoX, doc.y + 1, { width: infoW });
-            const line4 = [
+            const line4 = yalnizAd ? '' : [
                 firma.taxOffice ? `V.D.: ${firma.taxOffice}` : null,
                 firma.taxNo ? `VKN/TCKN: ${firma.taxNo}` : null,
             ].filter(Boolean).join('   ');
             if (line4) doc.text(line4, infoX, doc.y + 1, { width: infoW });
-            if (firma.iban) doc.text(`IBAN: ${firma.iban}`, infoX, doc.y + 1, { width: infoW });
+            if (firma.iban && !yalnizAd) doc.text(`IBAN: ${firma.iban}`, infoX, doc.y + 1, { width: infoW });
 
             // Sağ üst köşe: belge tipi etiketi
             doc.font(BOLD).fontSize(10).fillColor('#888')
