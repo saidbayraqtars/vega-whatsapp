@@ -29,6 +29,20 @@ const WARMUP_RAMP = [20, 40, 60, 90, 130, 170, 200];
 // warm-up günlük tavanına oranla küçültülür (bkz. effectiveHourlyCap).
 const HOURLY_CAP = 40;
 
+// Kanal-özel sınırlar (hesap tavanlarına EK). 'reminder' = bakiye/borç
+// hatırlatması: istenmeden, toplu ve para/IBAN içeriğiyle gider — WhatsApp'ın
+// spam/dolandırıcılık profiline en çok uyan kanal. Canlı vaka (Expert Bilişim,
+// 2026-10): 1 Eki'de 87 kişiye 25 sn arayla 90 borç hatırlatması → 9 Eki'de 403.
+// Kanal-başı günlük tavan 200 olduğu için hiçbir sınır devreye girmemişti.
+// Kalan cariler sonraki günlere kalır (reminders kaldığı yerden sürer).
+const CHANNEL_LIMITS = { reminder: { daily: 25, hourly: 10 } };
+
+// Aynı bilgisayardaki bir numara 403 yediyse diğer numaralar da bu süre boyunca
+// taze numara gibi (ısınma 1. gün tavanı) davranır. WhatsApp hesapları cihaz/IP
+// üzerinden ilişkilendirebiliyor: canlı vakada 1. numara 403 aldıktan sonra yeni
+// eklenen 2. numara 5 mesajla 2 gün içinde 403 aldı.
+const MACHINE_CAUTION_MS = 7 * 24 * 60 * 60 * 1000;
+
 // ─── Kullanıcı ayarlı sınırlar (kalıcı) ───────────────────────────────────────
 // userDailyCap: warm-up rampına EK üst sınır (kullanıcı 200'ü fazla bulursa 150'ye
 //   çeker). null = yalnız ramp geçerli. Ramp ile küçüğü uygulanır.
@@ -151,6 +165,8 @@ function touch(accountId, channel = 'default') {
     if (!acc.hour || acc.hour.key !== hr) acc.hour = { key: hr, count: 0 };
     let ch = acc.channels[channel];
     if (!ch || ch.date !== today) { ch = { date: today, count: 0 }; acc.channels[channel] = ch; }
+    // Kanal-özel saatlik sayaç (CHANNEL_LIMITS); hesap-geneli saatlik ayrıca acc.hour.
+    if (!ch.hour || ch.hour.key !== hr) ch.hour = { key: hr, count: 0 };
     return { acc, ch };
 }
 // Hesabın bugün TÜM kanallardaki toplam gönderimi (UI göstergesi için).
@@ -163,6 +179,22 @@ function totalDaySent(acc) {
 function rampDailyCap(acc) {
     const idx = Math.min(daysBetween(acc.firstActiveDate, dayKey()), WARMUP_RAMP.length - 1);
     return WARMUP_RAMP[idx];
+}
+
+// Bu bilgisayarda BAŞKA bir numara yakın zamanda 403 aldı mı? (bkz. MACHINE_CAUTION_MS)
+function machineCaution(key, now = Date.now()) {
+    const f = state.lastForbidden;
+    return !!(f && f.account !== key && now - Number(f.at) < MACHINE_CAUTION_MS);
+}
+
+// Hesabın günlük tavanı: ısınma rampı, kullanıcı sınırları ve makine temkini.
+function accountDailyCap(acc, key, userDailyCap) {
+    const lim = getLimits();
+    const caps = [rampDailyCap(acc)];
+    if (Number(userDailyCap) > 0) caps.push(Number(userDailyCap));
+    if (lim.userDailyCap) caps.push(lim.userDailyCap);
+    if (machineCaution(key)) caps.push(WARMUP_RAMP[0]);
+    return Math.min(...caps);
 }
 
 // Saatlik tavanı günlük tavana oranla — taze numara günlük hakkını tek saatte
@@ -197,15 +229,15 @@ function gate(accountId, userDailyCap, channel = 'default') {
         return { ok: true, bypass: true, dailyCap: null, daySent: ch.count, hourCap: null, hourSent: acc.hour.count, dayIndex: 0, channel };
     }
     rememberAccount(accountId);
-    const { acc, ch } = touch(resolveAccount(accountId), channel);
+    const key = resolveAccount(accountId);
+    const { acc, ch } = touch(key, channel);
     const dayIndex = daysBetween(acc.firstActiveDate, dayKey());
-    const rampCap = rampDailyCap(acc);
     const lim = getLimits();
-    const caps = [rampCap];
-    if (Number(userDailyCap) > 0) caps.push(Number(userDailyCap));
-    if (lim.userDailyCap) caps.push(lim.userDailyCap);                       // kullanıcı üst sınırı
-    const dailyCap = Math.min(...caps);
+    const dailyCap = accountDailyCap(acc, key, userDailyCap);
+    // Hesap TOPLAMI için kanal parametresi (userDailyCap) değil, hesabın kendi tavanı.
+    const totalCap = accountDailyCap(acc, key, null);
     const hourCap = effectiveHourlyCap(dailyCap);
+    const caution = machineCaution(key) ? ', bu bilgisayarda başka numara 403 aldı' : '';
 
     // Ban-şüphesi soğuması aktifse hiç gönderme — flaglenen numarayı dövme.
     const now = Date.now();
@@ -235,9 +267,25 @@ function gate(accountId, userDailyCap, channel = 'default') {
         }
     }
 
+    // Kanallar birbirinin günlük sayacını yemez, ama hesabın TOPLAMI da tavanı
+    // aşamaz: taze numarada kanal başı 20 × 5 kanal = 100 mesaj gidebiliyordu.
+    const total = totalDaySent(acc);
+    if (total >= totalCap) {
+        return { ok: false, capType: 'daily', channel, reason: `Günlük toplam tavan doldu (${total}/${totalCap}${dayIndex < WARMUP_RAMP.length - 1 ? ', ısınma günü ' + (dayIndex + 1) : ''}${caution})`,
+            dailyCap: totalCap, daySent: total, hourCap, hourSent: acc.hour.count, dayIndex };
+    }
     if (ch.count >= dailyCap) {
-        return { ok: false, capType: 'daily', channel, reason: `Günlük tavan doldu (${ch.count}/${dailyCap}${dayIndex < WARMUP_RAMP.length - 1 ? ', ısınma günü ' + (dayIndex + 1) : ''})`,
+        return { ok: false, capType: 'daily', channel, reason: `Günlük tavan doldu (${ch.count}/${dailyCap}${dayIndex < WARMUP_RAMP.length - 1 ? ', ısınma günü ' + (dayIndex + 1) : ''}${caution})`,
             dailyCap, daySent: ch.count, hourCap, hourSent: acc.hour.count, dayIndex };
+    }
+    const cl = CHANNEL_LIMITS[channel];
+    if (cl && ch.count >= cl.daily) {
+        return { ok: false, capType: 'daily', channel, reason: `Hatırlatma günlük tavanı doldu (${ch.count}/${cl.daily}) — kalanlar yarın sürer`,
+            dailyCap: cl.daily, daySent: ch.count, hourCap, hourSent: acc.hour.count, dayIndex };
+    }
+    if (cl && ch.hour.count >= cl.hourly) {
+        return { ok: false, capType: 'hourly', channel, reason: `Hatırlatma saatlik tavanı doldu (${ch.hour.count}/${cl.hourly}) — sonraki saat sürer`,
+            dailyCap, daySent: ch.count, hourCap: cl.hourly, hourSent: ch.hour.count, dayIndex };
     }
     if (acc.hour.count >= hourCap) {
         return { ok: false, capType: 'hourly', channel, reason: `Saatlik tavan doldu (${acc.hour.count}/${hourCap}) — sonraki saat sürer`,
@@ -252,6 +300,7 @@ function recordSent(accountId, channel = 'default') {
     rememberAccount(accountId);
     const { acc, ch } = touch(resolveAccount(accountId), channel);
     ch.count++;
+    ch.hour.count++;
     acc.hour.count++;
     save();
 }
@@ -315,7 +364,10 @@ function noteDisconnect(accountId, statusCode, errMsg, conflictHint) {
     // 'open' olmaya ve mesaj iletmeye devam etti → 11 Tem'de "Hesap gözden geçiriliyor".
     // Yani flaglenen numara bağlanabiliyor: 'open' sağlamlık kanıtı DEĞİL. Bunu bir kez
     // yanlış varsayıp soğumayı open'da kaldırmıştık; koruma o sırada devre dışı kalıyordu.)
-    else if (code === 403) { ms = COOLDOWN_FORBIDDEN_MS; reason = 'hesap kısıtlı (403)'; resetWarmup = true; sticky = true; }
+    else if (code === 403) {
+        ms = COOLDOWN_FORBIDDEN_MS; reason = 'hesap kısıtlı (403)'; resetWarmup = true; sticky = true;
+        state.lastForbidden = { account: normAccount(resolveAccount(accountId)), at: now };
+    }
     else if (code === 401) { ms = COOLDOWN_LOGGEDOUT_MS; reason = 'oturum düşürüldü (401)'; resetWarmup = true; sticky = true; }
     else if (acc.cooldownUntil && acc.cooldownUntil > now) {
         return null; // zaten soğumada — fırtına sayımıyla disk churn yapma
@@ -477,14 +529,11 @@ function applySpintax(text) {
 // UI / teşhis için anlık durum (gönderime etkisi yok). daySent = TÜM kanal toplamı.
 function snapshot(accountId, userDailyCap) {
     if (!STATE_PATH) return { dayIndex: 0, warmup: false, dailyCap: null, daySent: 0, hourCap: HOURLY_CAP, hourSent: 0, warnAt: 0, warnPending: false, warnLevel: 0 };
-    const { acc } = touch(resolveAccount(accountId), 'default');
+    const key = resolveAccount(accountId);
+    const { acc } = touch(key, 'default');
     const dayIndex = daysBetween(acc.firstActiveDate, dayKey());
-    const rampCap = rampDailyCap(acc);
     const lim = getLimits();
-    const caps = [rampCap];
-    if (Number(userDailyCap) > 0) caps.push(Number(userDailyCap));
-    if (lim.userDailyCap) caps.push(lim.userDailyCap);
-    const dailyCap = Math.min(...caps);
+    const dailyCap = accountDailyCap(acc, key, userDailyCap);
     const total = totalDaySent(acc);
     let warnPending = false, warnLevel = 0;
     if (lim.warnAt > 0) {
@@ -498,7 +547,8 @@ function snapshot(accountId, userDailyCap) {
         cooldownUntil: (acc.cooldownUntil && acc.cooldownUntil > Date.now()) ? acc.cooldownUntil : null,
         cooldownReason: (acc.cooldownUntil && acc.cooldownUntil > Date.now()) ? acc.cooldownReason : null,
         warnAt: lim.warnAt, warnPending, warnLevel,
+        machineCaution: machineCaution(key),
     };
 }
 
-module.exports = { configure, setBypass, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, noteSessionRevoked, clearCooldown, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP };
+module.exports = { configure, setBypass, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, noteSessionRevoked, clearCooldown, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP, CHANNEL_LIMITS, MACHINE_CAUTION_MS };

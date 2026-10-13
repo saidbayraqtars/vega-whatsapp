@@ -12,6 +12,7 @@
     "start": "electron .",
     "dist": "electron-builder --win",
     "release": "electron-builder --win --publish always",
+    "test:antiban": "node --test \"server/test/*.test.js\"",
     "test:efatura": "node integrations/efatura/test/smoke.js",
     "test:efatura-pdf": "electron integrations/efatura/test/electron-pdf-smoke.js",
     "test:efatura-testmode": "node integrations/efatura/test/testmode.js",

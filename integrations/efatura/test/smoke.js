@@ -113,6 +113,58 @@ async function main() {
         fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
+    // Duzeltme yatisma: arka arkaya duzeltilen fatura tek guncelleme olarak gider,
+    // belge MAX_UPDATES kezden fazla sil-gonder yapmaz (ban korumasi).
+    const settleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vega-efatura-settle-'));
+    const origStates = db.documentStates;
+    try {
+        const { UPDATE_SETTLE_MS, MAX_UPDATES } = require('../index');
+        const ctx = { firmaNo: '0103', donemNo: '0015' };
+        const integration = new Integration({
+            manifest: { settings: {} }, dataDir: settleDir, integrationDir: root,
+            gate: () => ({ ok: true }), waSend: async () => ({ success: true, id: 'x' }),
+        });
+        const key = integration.documentKey(ctx, baseRow);
+        integration.state.setDoc(key, {
+            status: 'sent', contextKey: 'F0103D0015', ind: 99, belgeNo: baseRow.BELGENO,
+            sentAt: new Date().toISOString(), fingerprint: fingerprint(baseRow), revision: 1,
+        });
+        const updates = [];
+        integration.processOne = async (_ctx, row, mode) => {
+            updates.push(mode);
+            integration.state.setDoc(key, { fingerprint: fingerprint(row), revision: Number(integration.state.doc(key).revision || 1) + 1 });
+            return { sent: true, updated: true };
+        };
+        let current = { ...baseRow, TUTAR: 150 };
+        db.documentStates = async () => [current];
+        const age = (ms) => integration.state.setDoc(key, { pendingSince: new Date(Date.now() - ms).toISOString() });
+
+        await integration.reconcileSent({}, ctx);                  // ilk gorus: yalniz bekler
+        assert.deepEqual(updates, []);
+        current = { ...baseRow, TUTAR: 175 };                       // yatismadan yine degisti
+        await integration.reconcileSent({}, ctx);
+        age(UPDATE_SETTLE_MS - 60000);
+        await integration.reconcileSent({}, ctx);
+        assert.deepEqual(updates, []);
+        age(UPDATE_SETTLE_MS + 1000);                               // 15 dk ayni kaldi → tek guncelleme
+        await integration.reconcileSent({}, ctx);
+        assert.deepEqual(updates, ['update']);
+        assert.equal(integration.state.doc(key).pendingFingerprint, null);
+
+        for (let i = 2; i <= MAX_UPDATES + 1; i++) {
+            current = { ...baseRow, TUTAR: 200 + i };
+            await integration.reconcileSent({}, ctx);
+            age(UPDATE_SETTLE_MS + 1000);
+            await integration.reconcileSent({}, ctx);
+        }
+        assert.equal(updates.length, MAX_UPDATES);                  // tavandan sonrasi gonderilmez
+        assert.equal(integration.state.doc(key).fingerprint, fingerprint(current));
+        assert.ok(integration.state.doc(key).updateSkippedAt);
+    } finally {
+        db.documentStates = origStates;
+        fs.rmSync(settleDir, { recursive: true, force: true });
+    }
+
     // Batch siniri dolunca imlec islenmeyen satirlarin uzerinden atlamamali.
     const cursorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vega-efatura-cursor-'));
     try {

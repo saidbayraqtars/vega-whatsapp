@@ -328,6 +328,8 @@ const totalDailySent = () => [...sessions.values()].reduce((n, s) => n + s.getDa
 // Tekil hesap işlemleri (UI düğmeleri).
 const initializeOne = (id) => { const s = get(id); return s ? s.initialize() : Promise.resolve(null); };
 const refreshOne = (id) => { const s = get(id); return s ? s.refresh() : Promise.resolve(null); };
+// 403 durdurmasını kaldırıp oturumu silmeden yeniden bağlan.
+const resumeOne = (id) => { const s = get(id); return s ? s.resume() : Promise.resolve(null); };
 const logoutOne = (id) => { const s = get(id); return s ? s.logout() : Promise.resolve(null); };
 
 // Tüm hesaplar (eski tekil davranış: hepsini yenile/çıkış).
@@ -338,7 +340,7 @@ module.exports = {
     configure, start, list, get, count, add, remove, rename,
     send, checkOnWhatsApp, deleteMessage, gate, pick,
     status, waitForReady, totalDailySent,
-    initializeOne, refreshOne, logoutOne, refreshAll, logoutAll,
+    initializeOne, refreshOne, resumeOne, logoutOne, refreshAll, logoutAll,
     setSticky, getSticky,
     MAX_ACCOUNTS,
 };

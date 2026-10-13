@@ -511,9 +511,11 @@ async function _runReminder(rem, opts = {}) {
         }
         saveConfig(); // perCariLastSent / perCariTried kalıcı
         // Anti-ban: tahsilat mesajı yüksek riskli → insansı, yavaş tempo. Her mesaj arası
-        // 12-30 sn; her 20 başarılı gönderimde 1-2.5 dk mola.
-        if (res.success && sent % 20 === 0) await sleep(rand(60000, 150000));
-        else await sleep(rand(12000, 30000));
+        // 1.5-4 dk; her 5 başarılı gönderimde 6-12 dk mola. Eski 12-30 sn tempo, canlıda
+        // 87 kişiye ~25 sn arayla giden 90 borç mesajı üretti ve numara 403 yedi. Saatlik
+        // 10 / günlük 25 tavanı antiban.CHANNEL_LIMITS uygular; kalanlar sonraki güne kalır.
+        if (res.success && sent % 5 === 0) await sleep(rand(360000, 720000));
+        else await sleep(rand(90000, 240000));
     }
     const note = `${sent} gönderildi${skipped ? `, ${skipped} atlandı` : ''}${interrupted ? ` (durdu${stopReason ? ': ' + stopReason : ''}, sürecek)` : ''}`;
     lastResult = { id: rem.id, sent, skipped, total: cands.length, interrupted, stopReason, note, at: new Date().toISOString() };

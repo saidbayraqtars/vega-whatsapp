@@ -62,6 +62,14 @@ function caption(template, row, contact) {
     return Object.entries(values).reduce((s, [k, v]) => s.split(k).join(v), String(template || ''));
 }
 
+// Düzeltme yatışma süresi: kullanıcı faturayı Vega'da arka arkaya düzeltirken her
+// kayıt yeni bir PDF + eskisini geri çekme üretiyordu (canlı vaka: aynı fatura 6
+// dakikada 3 kez sil-gönder, 3 numaraya). Değişiklik bu süre boyunca aynı kalınca
+// tek güncelleme gider. Ayrıca bir belge en çok MAX_UPDATES kez güncellenir;
+// sonrası yalnız kayda geçer (sürekli sil-gönder spam/flag sinyali).
+const UPDATE_SETTLE_MS = 15 * 60 * 1000;
+const MAX_UPDATES = 2;
+
 function fingerprint(row) {
     const values = [
         row.BELGENO, row.TARIH instanceof Date ? row.TARIH.toISOString() : row.TARIH,
@@ -439,7 +447,23 @@ class Integration {
                     this.state.setDoc(doc.key, { fingerprint: currentFingerprint });
                     continue;
                 }
-                if (doc.fingerprint !== currentFingerprint) results.push(await this.processOne(ctx, row, 'update'));
+                if (doc.fingerprint !== currentFingerprint) {
+                    const now = Date.now();
+                    if (doc.pendingFingerprint !== currentFingerprint) {
+                        this.state.setDoc(doc.key, { pendingFingerprint: currentFingerprint, pendingSince: new Date(now).toISOString() });
+                        continue;
+                    }
+                    if (now - Date.parse(doc.pendingSince) < UPDATE_SETTLE_MS) continue;
+                    if (Number(doc.revision || 1) - 1 >= MAX_UPDATES) {
+                        this.state.setDoc(doc.key, { fingerprint: currentFingerprint, pendingFingerprint: null, pendingSince: null, updateSkippedAt: new Date(now).toISOString() });
+                        this.log('INFO', `${doc.belgeNo || doc.ind} ${MAX_UPDATES} kez guncellendi; yeni degisiklik musteriye gonderilmedi`);
+                        this.uiLog({ status: 'info', name: doc.contactName || 'e-Fatura', evrak: doc.belgeNo || String(doc.ind), error: `Belge ${MAX_UPDATES} kez guncellendi; yeni degisiklik ban korumasi icin gonderilmedi` });
+                        continue;
+                    }
+                    const r = await this.processOne(ctx, row, 'update');
+                    if (r && r.sent) this.state.setDoc(doc.key, { pendingFingerprint: null, pendingSince: null });
+                    results.push(r);
+                }
             } catch (e) {
                 this.state.setDoc(doc.key, { lastChangeError: e.message, changeAttempts: Number(doc.changeAttempts || 0) + 1 });
                 this.lastError = e.message;
@@ -581,4 +605,4 @@ class Integration {
     }
 }
 
-module.exports = { create: host => new Integration(host), Integration, State, caption, fingerprint };
+module.exports = { UPDATE_SETTLE_MS, MAX_UPDATES, create: host => new Integration(host), Integration, State, caption, fingerprint };

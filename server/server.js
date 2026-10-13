@@ -2735,7 +2735,7 @@ app.get('/api/wa/status', async (req, res) => {
         for (const a of st.accounts || []) {
             accs.push({
                 id: a.id, label: a.label, ready: a.ready, initializing: a.initializing,
-                hasQr: a.hasQr, me: a.me, error: a.error, revoked: a.revoked, daySent: a.daySent,
+                hasQr: a.hasQr, me: a.me, error: a.error, revoked: a.revoked, forbidden: a.forbidden || null, daySent: a.daySent,
                 qrImage: a.qr ? await QRCode.toDataURL(a.qr, { margin: 2, width: 240 }) : null,
                 // Hesap-başı anti-ban: ısınma günü, tavan doluluğu, soğuma.
                 antiban: a.me ? antiban.snapshot(a.me, DEFAULT_PACING.dailyCap) : null,
@@ -2775,6 +2775,13 @@ app.post('/api/wa/accounts', (req, res) => {
 
 app.post('/api/wa/accounts/:id/refresh', async (req, res) => {
     try { await accounts.refreshOne(req.params.id); res.json({ success: true }); }
+    catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// 403 (hesap kısıtlı) ile durdurulan bağlantıyı, numara telefonda açıldıktan sonra
+// oturumu silmeden yeniden dene. Otomatik yol 24 saatte bir denemeyle sınırlı.
+app.post('/api/wa/accounts/:id/resume', async (req, res) => {
+    try { await accounts.resumeOne(req.params.id); res.json({ success: true }); }
     catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 

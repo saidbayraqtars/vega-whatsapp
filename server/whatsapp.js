@@ -165,6 +165,34 @@ function createSession({ id, authDir, label = '' }) {
     let qrCycles = 0;
     const MAX_QR_CYCLES = 5;
 
+    // ─── 403 (hesap kısıtlı) sonrası bağlanma durdurma ────────────────────────
+    // Eski davranış: 403'te de backoff ile (en çok 60 sn) sonsuza dek yeniden
+    // bağlanıyordu. Canlı vaka (Expert Bilişim, 9-10 Eki 2026): 403'ten sonra 30
+    // saatte 820 bağlantı denemesi. Kısıtlı numarayı dövmek incelemeyi kalıcı bana
+    // çevirir. Artık 403'te otomatik bağlanma durur; kayıt oturum klasöründe
+    // tutulur, böylece uygulama yeniden başlasa da (güncelleme, Windows açılışı,
+    // durum yoklamasındaki initialize) FORBIDDEN_HOLD_MS dolmadan bağlanmaz. Süre
+    // dolunca TEK deneme yapılır; yine 403 gelirse bekleme yenilenir. Kullanıcı
+    // telefonda numaranın açıldığını görünce "Yeniden bağlan" (resume) ile kaldırır.
+    const FORBIDDEN_HOLD_MS = 24 * 60 * 60 * 1000;
+    const FORBIDDEN_PATH = path.join(AUTH_DIR, 'forbidden.json');
+    const FORBIDDEN_TEXT = 'WhatsApp bu numarayı kısıtladı (403). Otomatik bağlanma durduruldu — numarayı telefonda kontrol edin, açıldıysa "Yeniden bağlan"a basın.';
+    const readForbidden = () => {
+        try {
+            const f = JSON.parse(fs.readFileSync(FORBIDDEN_PATH, 'utf8'));
+            return f && Number(f.at) > 0 ? f : null;
+        } catch { return null; }
+    };
+    const forbiddenActive = () => {
+        const f = readForbidden();
+        return f && Date.now() - Number(f.at) < FORBIDDEN_HOLD_MS ? f : null;
+    };
+    const markForbidden = () => {
+        try { ensureDir(AUTH_DIR); fs.writeFileSync(FORBIDDEN_PATH, JSON.stringify({ at: Date.now() })); }
+        catch { /* yazılamazsa bu çalışmada yine durur (retry kurulmuyor) */ }
+    };
+    const clearForbidden = () => { try { fs.rmSync(FORBIDDEN_PATH, { force: true }); } catch { /* yok say */ } };
+
     // ─── Gönderilen mesaj önbelleği (retry/yeniden şifreleme için) ───────────
     // WhatsApp karşı taraf mesajı çözemeyince retry ister; Baileys getMessage(key)
     // ile orijinali isteyip YENİDEN şifreler. undefined dönersek mesaj karşıda
@@ -252,6 +280,7 @@ function createSession({ id, authDir, label = '' }) {
         error: lastError,
         me: meId,
         revoked: sessionRevoked,
+        forbidden: (() => { const f = forbiddenActive(); return f ? { at: f.at, until: Number(f.at) + FORBIDDEN_HOLD_MS } : null; })(),
         daySent: getDailySent(),
     });
 
@@ -284,6 +313,8 @@ function createSession({ id, authDir, label = '' }) {
 
     const initialize = async () => {
         if (disposed || isReady || isInitializing) return getStatus();
+        // 403 bekleme süresi dolmadıysa hiç el sıkışma yapma (bkz. FORBIDDEN_HOLD_MS).
+        if (forbiddenActive()) { lastError = FORBIDDEN_TEXT; currentQR = null; return getStatus(); }
 
         isInitializing = true;
         lastError = null;
@@ -473,6 +504,18 @@ function createSession({ id, authDir, label = '' }) {
                     const isBadSession = statusCode === DisconnectReason.badSession;
                     if (isBadSession) badSessionFails++;
                     else badSessionFails = 0; // araya başka kod girerse "üst üste" sıfırlanır
+                    // 403 = hesap kısıtlı: oturumu SİLME (yeni QR = yeni cihaz slotu) ve
+                    // yeniden bağlanma kurma. Kayıt diske yazılır (bkz. FORBIDDEN_HOLD_MS).
+                    if (statusCode === 403 && !conflict) {
+                        markForbidden();
+                        isInitializing = false;
+                        currentQR = null;
+                        clearRetry();
+                        lastError = FORBIDDEN_TEXT;
+                        waEvent('forbidden-stopped');
+                        return;
+                    }
+
                     const shouldWipe = !conflict && (
                         statusCode === DisconnectReason.loggedOut ||
                         statusCode === 401 ||
@@ -529,6 +572,22 @@ function createSession({ id, authDir, label = '' }) {
         }
 
         return getStatus();
+    };
+
+    // 403 sonrası elle yeniden bağlanma: oturum SİLİNMEZ (QR gerekmez, yeni cihaz
+    // slotu açılmaz). Kullanıcı numaranın telefonda açıldığını doğruladığında.
+    const resume = async () => {
+        console.log(`[WhatsApp:${id}] Elle yeniden bağlanma (403 durdurması kaldırıldı).`);
+        clearForbidden();
+        clearRetry();
+        cleanupSocket();
+        clearQrTimer();
+        isReady = false;
+        isInitializing = false;
+        lastError = null;
+        reconnectFails = 0;
+        waEvent('forbidden-resume');
+        return initialize();
     };
 
     const refresh = async () => {
@@ -690,6 +749,7 @@ function createSession({ id, authDir, label = '' }) {
         authDir: AUTH_DIR,
         initialize,
         refresh,
+        resume,
         logout,
         getStatus,
         sendMessage,

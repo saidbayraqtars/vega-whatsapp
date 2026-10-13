@@ -623,6 +623,11 @@ function renderWaCard(a) {
         const sent = ab && ab.daySent != null ? ab.daySent : (a.daySent || 0);
         body = `<p class="waMe">${esc(phone)}</p>
                 <p class="muted" style="font-size:12px">Bugün: <b>${sent}</b>${cap} mesaj${ab && ab.warmup ? ` · ısınma günü ${ab.dayIndex + 1}` : ''}</p>`;
+    } else if (a.forbidden) {
+        state = 'Kısıtlandı (403)'; stateCls = 'bad';
+        const until = new Date(a.forbidden.until).toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+        body = `<p class="nophone" style="font-size:12.5px">WhatsApp bu numarayı kısıtladı. Otomatik bağlanma durduruldu; numarayı dövmemek için ${esc(until)} öncesi tekrar denenmez.</p>
+                <p class="muted" style="font-size:12px">Telefonda WhatsApp'ı açıp numaranın durumuna bakın. "Sıfırla"ya basmayın — yeni QR yeni cihaz bağlantısı demek.</p>`;
     } else if (a.qrImage) {
         state = 'QR bekliyor'; stateCls = '';
         body = `<img src="${a.qrImage}" alt="QR" />
@@ -645,6 +650,7 @@ function renderWaCard(a) {
         ${cooldown}
         <div class="waActs">
             <button class="btn ghost sm" data-wa="rename" data-id="${esc(a.id)}">Ad</button>
+            ${a.forbidden ? `<button class="btn ghost sm" data-wa="resume" data-id="${esc(a.id)}">Yeniden bağlan</button>` : ''}
             <button class="btn ghost sm" data-wa="refresh" data-id="${esc(a.id)}">Sıfırla</button>
             ${a.id === 'main' ? '' : `<button class="btn ghost sm" data-wa="remove" data-id="${esc(a.id)}">Kaldır</button>`}
         </div>
@@ -663,6 +669,7 @@ $('waContent').addEventListener('click', (e) => {
     else if (btn.dataset.wa === 'refresh') waRefreshAcc(id);
     else if (btn.dataset.wa === 'remove') waRemoveAcc(id, label);
     else if (btn.dataset.wa === 'clearCooldown') waClearCooldown(id, label);
+    else if (btn.dataset.wa === 'resume') waResumeAcc(id, label);
 });
 
 // Ban-şüphesi soğumasını elle kaldır. WhatsApp numarayı flaglemişse mesajlar yine
@@ -694,6 +701,17 @@ $('waClearPending').onclick = async () => {
         btn.disabled = false;
     }
 };
+
+// 403 sonrası elle yeniden bağlan: oturum silinmez, QR gerekmez. Numara hâlâ
+// kısıtlıysa yine 403 gelir ve 24 saatlik bekleme yenilenir.
+async function waResumeAcc(id, label) {
+    if (!confirm(`"${label}" numarası yeniden bağlanacak.\n\nYalnız telefonda WhatsApp'ın normal açıldığını gördüyseniz devam edin. Kısıtlı numaraya tekrar tekrar bağlanmak hesabın tamamen kapanmasına yol açabilir. Devam?`)) return;
+    try {
+        const r = await api(`/wa/accounts/${id}/resume`, { method: 'POST' });
+        if (!r.success) alert(r.message || 'Bağlanılamadı.');
+    } catch (e) { alert('Hata: ' + e.message); }
+    setTimeout(pollWa, 1200);
+}
 
 // Oturumu sıfırla: o numaranın auth'u silinir, yeni QR çıkar. Diğer numaralar etkilenmez.
 async function waRefreshAcc(id) {
