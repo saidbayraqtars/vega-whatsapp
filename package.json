@@ -1,6 +1,6 @@
 {
   "name": "vega-whatsapp-desktop",
-  "version": "1.10.7",
+  "version": "1.10.8",
   "description": "Vega WhatsApp — masaüstü (Electron). Toplu mesaj + otomatik tahsilat takibi.",
   "main": "electron/main.js",
   "author": "Vega",
@@ -41,7 +41,8 @@
       "!server/node_modules/**",
       "!server/config.json",
       "!server/server.log",
-      "!server/_x/**"
+      "!server/_x/**",
+      "!server/test/**"
     ],
     "extraFiles": [
       {
