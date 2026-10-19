@@ -72,6 +72,7 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.18",
+    "baileys7": "npm:@whiskeysockets/baileys@7.0.0-rc14",
     "cors": "^2.8.5",
     "electron-updater": "^6.8.9",
     "express": "^4.21.0",

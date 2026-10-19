@@ -67,11 +67,43 @@ const saveCachedVersion = (version) => {
     catch { /* yok say */ }
 };
 
-// Baileys ESM modülü tüm oturumlarda ORTAK yüklenir (tek import).
-let _baileys = null;
-const loadBaileys = async () => {
-    if (!_baileys) _baileys = await import('@whiskeysockets/baileys');
-    return _baileys;
+// ─── WhatsApp motoru (Baileys sürümü) ────────────────────────────────────────
+// 'v6' = @whiskeysockets/baileys 6.7 (varsayılan). 'v7' = Baileys 7 (npm takma adı
+// baileys7). Gizli numara (LID) düzenine geçmiş hesaplarda 6.7 mesajı eski tip
+// (telefon numaralı) oturumla şifreliyor; karşı telefon çözemiyor ve mesaj
+// "Mesaj bekleniyor" diye takılıyor (canlı: Ekmel Çeyiz 2026-10, 276 mesajın hiçbiri
+// teslim alındısı almadı). Baileys 7 LID eşleme deposu ve LID oturumları getiriyor.
+// Henüz sürüm adayı (rc) olduğu için müşteri başına Ayarlar'dan açılır; motor
+// değişince oturumlar SİLİNMEDEN yeniden bağlanır (restart).
+const ENGINES = { v6: '@whiskeysockets/baileys', v7: 'baileys7' };
+let engine = 'v6';
+const setEngine = (e) => { engine = ENGINES[e] ? e : 'v6'; return engine; };
+const getEngine = () => engine;
+
+// Baileys ESM modülü tüm oturumlarda ORTAK yüklenir (motor başına tek import).
+const _baileys = {};
+const loadBaileys = async (eng) => {
+    if (!_baileys[eng]) _baileys[eng] = await import(ENGINES[eng]);
+    return _baileys[eng];
+};
+
+// v7'ye ilk geçişte oturum klasörünü yedekle. Baileys 7 klasöre yeni anahtarlar
+// (lid-mapping) ve LID oturumları yazar; 6.7'ye dönüşte sorun çıkarsa yedekten elle
+// geri yüklenebilsin. İşaret dosyası (.engine) klasörü en son hangi motorun
+// kullandığını tutar; v6→v7 her geçişte yedek tazelenir.
+const ENGINE_MARK = '.engine';
+const prepareAuthForEngine = (authDir, eng, log) => {
+    try {
+        const mark = path.join(authDir, ENGINE_MARK);
+        const prev = fs.existsSync(mark) ? fs.readFileSync(mark, 'utf8').trim() : 'v6';
+        if (eng === 'v7' && prev !== 'v7' && fs.existsSync(path.join(authDir, 'creds.json'))) {
+            const bak = `${authDir}-v6-yedek`;
+            fs.rmSync(bak, { recursive: true, force: true });
+            fs.cpSync(authDir, bak, { recursive: true });
+            log(`engine-backup ${path.basename(bak)}`);
+        }
+        if (prev !== eng || !fs.existsSync(mark)) { ensureDir(authDir); fs.writeFileSync(mark, eng); }
+    } catch (err) { log(`engine-backup-fail ${err.message}`); }
 };
 
 const makeLogger = () => {
@@ -126,6 +158,8 @@ function createSession({ id, authDir, label = '' }) {
     let currentQR = null;
     let qrTimer = null;
     let meId = null;
+    // Açık soketin hangi motorla kurulduğu (durum + günlük için).
+    let sockEngine = null;
     // Hesap kaldırıldı mı? Kaldırma sırasında sock.logout() bir 'close' olayı
     // üretiyor, o da 401'i "gerçek logout" sayıp scheduleInit ile YENİDEN bağlanma
     // kuruyordu → silinen numara hayalet oturum olarak QR döngüsüne giriyordu.
@@ -282,6 +316,7 @@ function createSession({ id, authDir, label = '' }) {
         revoked: sessionRevoked,
         forbidden: (() => { const f = forbiddenActive(); return f ? { at: f.at, until: Number(f.at) + FORBIDDEN_HOLD_MS } : null; })(),
         daySent: getDailySent(),
+        engine: sockEngine || engine,
     });
 
     // Diskteki oturumda bağlı bir kimlik var mı? (creds.json → me.id) Baileys QR
@@ -323,10 +358,23 @@ function createSession({ id, authDir, label = '' }) {
         console.log(`[WhatsApp:${id}] Başlatılıyor...`);
 
         try {
-            const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } =
-                await loadBaileys();
+            let eng = engine;
+            let lib;
+            try {
+                lib = await loadBaileys(eng);
+            } catch (err) {
+                if (eng === 'v6') throw err;
+                // v7 yüklenemedi (eksik/bozuk paket): hesabı WhatsApp'sız bırakma, 6.7 ile aç.
+                console.error(`[WhatsApp:${id}] Yeni motor yüklenemedi, 6.7 ile devam:`, err.message);
+                waEvent(`engine-load-fail v7 ${err.message}`);
+                eng = 'v6';
+                lib = await loadBaileys(eng);
+            }
+            sockEngine = eng;
+            const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = lib;
 
             ensureDir(AUTH_DIR);
+            prepareAuthForEngine(AUTH_DIR, eng, waEvent);
             const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
             let version;
@@ -354,6 +402,10 @@ function createSession({ id, authDir, label = '' }) {
                 // program yine sessizce mesaj gönderir/alır.
                 markOnlineOnConnect: false,
                 browser: ['Vega Toplu Mesaj', 'Chrome', '120.0'],
+                // Geçmiş sohbetleri telefondan çekme. 6.7'de varsayılan false, Baileys 7'de
+                // true: eşleşmede telefon tüm geçmişi göndermeye çalışır (büyük hesapta
+                // dakikalarca indirme/işleme). Programın geçmişe ihtiyacı yok.
+                syncFullHistory: false,
                 // Karşı taraf mesajı çözemeyince (yeni oturum/anahtar uyuşmazlığı) WA bir
                 // "retry receipt" gönderir; Baileys mesajı YENİDEN şifreleyip göndermek için
                 // getMessage(key) ile orijinal içeriği ister. Burada undefined dönersek
@@ -390,14 +442,21 @@ function createSession({ id, authDir, label = '' }) {
                         if (!m.message || m.key?.fromMe) continue;
                         const jid = m.key?.remoteJid || '';
                         // Birebir sohbet: @s.whatsapp.net VEYA @lid (WhatsApp gizli-numara /
-                        // Linked ID formatı). @lid'de gerçek telefon key.senderPn'de gelir.
+                        // Linked ID formatı). @lid'de gerçek telefon Baileys 6.7'de
+                        // key.senderPn'de, Baileys 7'de key.remoteJidAlt'ta gelir; ikisi de
+                        // yoksa v7'nin LID eşleme deposuna sorulur.
                         // Grup(@g.us)/broadcast/status hariç.
                         let phone = null;
                         if (jid.endsWith('@s.whatsapp.net')) {
                             phone = jid.split('@')[0];
                         } else if (jid.endsWith('@lid')) {
-                            const pn = m.key?.senderPn || m.key?.participantPn || '';
-                            if (pn.includes('@')) phone = pn.split('@')[0];
+                            let pn = m.key?.remoteJidAlt || m.key?.senderPn || m.key?.participantPn || '';
+                            if (!pn.endsWith('@s.whatsapp.net')) {
+                                try { pn = (await sock?.signalRepository?.lidMapping?.getPNForLID?.(jid)) || ''; }
+                                catch { pn = ''; }
+                            }
+                            // Cihaz son eki olabilir (905xx:12@s.whatsapp.net) → yalnız numara.
+                            if (pn.includes('@')) phone = pn.split('@')[0].split(':')[0];
                         } else {
                             continue;
                         }
@@ -453,7 +512,7 @@ function createSession({ id, authDir, label = '' }) {
                     qrCycles = 0;
                     clearQrTimer();
                     console.log(`[WhatsApp:${id}] Bağlantı kuruldu!`, meId || '');
-                    waEvent(`open ${meId || ''}`);
+                    waEvent(`open ${meId || ''} engine=${sockEngine}`);
                     // Anti-ban: açılış = önceki 403/401 yanlış alarmdı → soğumayı kaldır.
                     try { openHandler && openHandler(meId); } catch { /* yok say */ }
                     notifyReady();
@@ -488,10 +547,12 @@ function createSession({ id, authDir, label = '' }) {
                     }
 
                     // Anti-ban: ban-şüpheli kapanış / fırtına → gönderim soğuması. meId
-                    // kapanışta korunur; oturum hiç açılmadıysa (connect'te 403) null gider
-                    // ve anti-ban son bilinen numaraya yazar. Çakışma kararını BURADA
-                    // çözüp geçiriyoruz — antiban tek mesaja bakarak aynı hatayı yapmasın.
-                    try { disconnectHandler && disconnectHandler(statusCode, meId, errMsg, conflict); } catch { /* yok say */ }
+                    // kapanışta korunur; oturum hiç açılmadıysa (connect'te 403) diskteki
+                    // kimlik gider. Anti-ban'ın "son bilinen numara" yedeği çok hesapta
+                    // BAŞKA hattı soğutuyordu (canlı 12 Eki: ana hattın 403'ü ikinci
+                    // numaraya yazıldı). Çakışma kararını BURADA çözüp geçiriyoruz —
+                    // antiban tek mesaja bakarak aynı hatayı yapmasın.
+                    try { disconnectHandler && disconnectHandler(statusCode, meId || credsIdentity(), errMsg, conflict); } catch { /* yok say */ }
 
                     // Okutulmayan QR turu: Baileys süre dolunca 408 "QR refs attempts ended"
                     // ile kapanıyor. Eski kod bunu sonsuza dek yeniden deniyordu (tek
@@ -607,6 +668,20 @@ function createSession({ id, authDir, label = '' }) {
         qrCycles = 0;
         lastConflictAt = 0;
         wipeAuth();
+        return initialize();
+    };
+
+    // Oturumu SİLMEDEN yeniden bağlan (motor değişimi). Yeni QR istemez; disk
+    // oturumu yeni motorla açılır. Zamanlanmış yeniden denemeyi kırar.
+    const restart = async () => {
+        if (disposed) return getStatus();
+        clearRetry();
+        clearQrTimer();
+        cleanupSocket();
+        isReady = false;
+        isInitializing = false;
+        currentQR = null;
+        waEvent(`restart engine=${engine}`);
         return initialize();
     };
 
@@ -750,6 +825,7 @@ function createSession({ id, authDir, label = '' }) {
         initialize,
         refresh,
         resume,
+        restart,
         logout,
         getStatus,
         sendMessage,
@@ -765,4 +841,4 @@ function createSession({ id, authDir, label = '' }) {
     };
 }
 
-module.exports = { createSession, toJid, baseDir, DATA_DIR };
+module.exports = { createSession, toJid, baseDir, DATA_DIR, setEngine, getEngine, ENGINES, prepareAuthForEngine };

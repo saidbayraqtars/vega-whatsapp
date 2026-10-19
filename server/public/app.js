@@ -622,7 +622,7 @@ function renderWaCard(a) {
         const cap = ab && ab.dailyCap != null ? ` / ${ab.dailyCap}` : '';
         const sent = ab && ab.daySent != null ? ab.daySent : (a.daySent || 0);
         body = `<p class="waMe">${esc(phone)}</p>
-                <p class="muted" style="font-size:12px">Bugün: <b>${sent}</b>${cap} mesaj${ab && ab.warmup ? ` · ısınma günü ${ab.dayIndex + 1}` : ''}</p>`;
+                <p class="muted" style="font-size:12px">Bugün: <b>${sent}</b>${cap} mesaj${ab && ab.warmup ? ` · ısınma günü ${ab.dayIndex + 1}` : ''}${a.engine === 'v7' ? ' · yeni motor' : ''}</p>`;
     } else if (a.forbidden) {
         state = 'Kısıtlandı (403)'; stateCls = 'bad';
         const until = new Date(a.forbidden.until).toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
@@ -795,6 +795,7 @@ async function openSettings() {
         const w = await api('/settings/wa');
         if (w.success) {
             $('set_waMode').value = w.mode || 'local';
+            $('set_waEngine').value = w.engine === 'v7' ? 'v7' : 'v6';
             $('set_relayTarget').value = w.relayTarget || '';
             $('set_relayToken').value = '';
             $('set_relayToken').placeholder = w.hasToken ? '(kayıtlı — değişmeyecekse boş bırak)' : 'ortak gizli parola';
@@ -906,6 +907,9 @@ function toggleRelayFields() {
     if (rel) rel.style.display = (mode === 'relay') ? '' : 'none';
     const cl = $('set_cloudFields');
     if (cl) cl.style.display = (mode === 'cloud') ? '' : 'none';
+    // Motor seçimi yalnız bu PC kendi WhatsApp oturumunu tutuyorsa (yerel mod) anlamlı.
+    const ew = $('set_engineWrap');
+    if (ew) ew.style.display = (mode === 'local') ? '' : 'none';
     // Relay parolası yerel (ana PC kabul eder) ve relay (ikinci PC bağlanır) içindir; Cloud'da anlamsız.
     const tw = $('set_relayTokenWrap');
     if (tw) tw.style.display = (mode === 'cloud') ? 'none' : '';
@@ -1070,6 +1074,7 @@ $('set_saveWa').onclick = async () => {
     try {
         const body = {
             mode: $('set_waMode').value,
+            engine: $('set_waEngine').value,
             relayTarget: $('set_relayTarget').value.trim(),
             relayToken: $('set_relayToken').value,
             ...cloudBody(),
@@ -1090,7 +1095,9 @@ $('set_saveWa').onclick = async () => {
                     ? `✓ Cloud API kaydedildi — bağlı (${(r.cloud.info && r.cloud.info.displayPhone) || r.cloud.me}).`
                     : `Kaydedildi ama Meta doğrulamadı: ${(r.cloud && r.cloud.error) || 'bilinmiyor'}`;
             } else {
-                box.textContent = '✓ Yerel mod kaydedildi (bu PC WhatsApp oturumu tutar).';
+                box.textContent = r.engine === 'v7'
+                    ? '✓ Yerel mod kaydedildi — yeni WhatsApp motoru (deneme) açık.'
+                    : '✓ Yerel mod kaydedildi (bu PC WhatsApp oturumu tutar).';
             }
             $('set_relayToken').value = '';
             $('set_cloudToken').value = '';

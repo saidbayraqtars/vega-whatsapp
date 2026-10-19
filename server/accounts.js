@@ -335,12 +335,14 @@ const logoutOne = (id) => { const s = get(id); return s ? s.logout() : Promise.r
 // Tüm hesaplar (eski tekil davranış: hepsini yenile/çıkış).
 const refreshAll = () => Promise.all([...sessions.values()].map((s) => s.refresh().catch(() => { })));
 const logoutAll = () => Promise.all([...sessions.values()].map((s) => s.logout().catch(() => { })));
+// Motor (Baileys sürümü) değişince: oturumlar SİLİNMEDEN yeni motorla yeniden bağlanır.
+const restartAll = () => Promise.all([...sessions.values()].map((s) => s.restart().catch(() => { })));
 
 module.exports = {
     configure, start, list, get, count, add, remove, rename,
     send, checkOnWhatsApp, deleteMessage, gate, pick,
     status, waitForReady, totalDailySent,
-    initializeOne, refreshOne, resumeOne, logoutOne, refreshAll, logoutAll,
+    initializeOne, refreshOne, resumeOne, logoutOne, refreshAll, logoutAll, restartAll,
     setSticky, getSticky,
     MAX_ACCOUNTS,
 };

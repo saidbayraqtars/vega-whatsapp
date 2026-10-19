@@ -237,6 +237,10 @@ function readStoredConfig() {
 let waCfg = (loadConfigFile() || {}).wa || { mode: 'local' };
 const isRelay = () => !!waCfg && waCfg.mode === 'relay' && !!waCfg.relayTarget;
 const isCloud = () => !!waCfg && waCfg.mode === 'cloud';
+// WhatsApp motoru (Baileys sürümü): 'v6' varsayılan, 'v7' gizli numara (LID) sorunu
+// olan hesaplar için Ayarlar'dan açılır. Oturumlar kurulmadan ÖNCE uygulanmalı.
+const waEngine = () => (waCfg && waCfg.engine === 'v7' ? 'v7' : 'v6');
+require('./whatsapp').setEngine(waEngine());
 
 // Cloud modda Baileys'e özgü ban korumalarını (ısınma rampı, saatlik tavan, 403
 // soğuması) kapat. watcher/hatırlatma/sipariş antiban.gate'i DOĞRUDAN çağırıyor;
@@ -611,6 +615,7 @@ app.get('/api/settings/wa', (req, res) => {
     res.json({
         success: true,
         mode: (waCfg && waCfg.mode) || 'local',
+        engine: waEngine(),
         relayTarget: (waCfg && waCfg.relayTarget) || '',
         hasToken: !!(waCfg && waCfg.relayToken),
         relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null,
@@ -687,7 +692,10 @@ app.post('/api/settings/wa', async (req, res) => {
         if (!cloud.phoneNumberId) return res.status(400).json({ success: false, message: 'Telefon Numarası Kimliği (Phone Number ID) gerekli — Meta panelinde WhatsApp > API Kurulumu altında.' });
         if (!cloud.token) return res.status(400).json({ success: false, message: 'Erişim anahtarı (Access Token) gerekli.' });
     }
-    const next = { mode, relayTarget: relayTarget || '', relayToken, cloud };
+    // Motor alanı gönderilmediyse mevcut korunur (eski arayüz kaydı v7'yi sıfırlamasın).
+    const engine = ['v6', 'v7'].includes(b.engine) ? b.engine : waEngine();
+    const engineChanged = engine !== waEngine();
+    const next = { mode, relayTarget: relayTarget || '', relayToken, cloud, engine };
     try {
         const existing = loadConfigFile() || {};
         existing.wa = next;
@@ -698,12 +706,18 @@ app.post('/api/settings/wa', async (req, res) => {
     } catch (e) {
         return res.status(500).json({ success: false, message: 'Ayar kaydedilemedi: ' + e.message });
     }
+    // Motor değişti: oturumlar SİLİNMEDEN yeni motorla yeniden bağlanır (QR istemez).
+    if (engineChanged) {
+        require('./whatsapp').setEngine(engine);
+        console.log(`[WhatsApp] Motor değişti → ${engine}; oturumlar yeniden bağlanıyor.`);
+        if (!isRelay() && !isCloud()) accounts.restartAll().catch(() => { });
+    }
     // Relay'e geçildiyse hemen durum çek + otomasyon zaten relay guard'ıyla susar.
     if (isRelay()) { try { await pollRelayStatus(); } catch { /* yok say */ } }
     let cloudStatus = null;
     if (isCloud()) { try { cloudStatus = await cloudapi.refreshStatus(true); } catch { /* yok say */ } }
     res.json({
-        success: true, mode, relayTarget: next.relayTarget,
+        success: true, mode, engine, relayTarget: next.relayTarget,
         relay: isRelay() ? { ready: relayStatus.ready, me: relayStatus.me, error: relayStatus.error } : null,
         cloud: cloudStatus ? { ready: cloudStatus.ready, me: cloudStatus.me, error: cloudStatus.error, info: cloudStatus.cloud } : null,
     });
@@ -2735,7 +2749,7 @@ app.get('/api/wa/status', async (req, res) => {
         for (const a of st.accounts || []) {
             accs.push({
                 id: a.id, label: a.label, ready: a.ready, initializing: a.initializing,
-                hasQr: a.hasQr, me: a.me, error: a.error, revoked: a.revoked, forbidden: a.forbidden || null, daySent: a.daySent,
+                hasQr: a.hasQr, me: a.me, error: a.error, revoked: a.revoked, forbidden: a.forbidden || null, daySent: a.daySent, engine: a.engine,
                 qrImage: a.qr ? await QRCode.toDataURL(a.qr, { margin: 2, width: 240 }) : null,
                 // Hesap-başı anti-ban: ısınma günü, tavan doluluğu, soğuma.
                 antiban: a.me ? antiban.snapshot(a.me, DEFAULT_PACING.dailyCap) : null,

@@ -857,6 +857,16 @@
                         <option value="cloud">Meta resmî WhatsApp (Cloud API)</option>
                     </select>
                 </div>
+                <div id="set_engineWrap">
+                    <div class="field">
+                        <label>WhatsApp motoru</label>
+                        <select id="set_waEngine">
+                            <option value="v6">Standart (varsayılan)</option>
+                            <option value="v7">Yeni motor — deneme</option>
+                        </select>
+                    </div>
+                    <div class="hint">Yalnız karşı tarafta mesajlar "Mesaj bekleniyor" diye kalıyorsa açın. Değişince QR istemeden yeniden bağlanır.</div>
+                </div>
                 <div class="field" id="set_relayTokenWrap"><label>Ortak parola (iki bilgisayar kullanılıyorsa, ikisinde aynı)</label><input id="set_relayToken" type="password" placeholder="(değişmeyecekse boş bırak)" /></div>
                 <div id="set_relayFields" style="display:none">
                     <div class="field"><label>Ana bilgisayarın IP adresi</label><input id="set_relayTarget" placeholder="192.168.0.99" /></div>
