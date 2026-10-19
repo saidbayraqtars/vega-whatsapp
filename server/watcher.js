@@ -492,15 +492,17 @@ const ledgerBase = (e) => ({
 // mesajı birbirini yutmasın diye orada metin de karşılaştırılır.
 // silent: yoğun trafik modunda her belge sıraya girer — "kuyrukta" satırı günlüğü
 // (200 kayıt) yarım günde doldururdu; sıradaki sayısı durum satırında görünür.
-function enqueue(base, phone, text, reason, mediaDesc, silent) {
+// render: metnin yeniden kurulma tarifi ({ kind, tpl, vars, ... }); gönderim anında
+// refreshQueued güncel tutar/bakiyeyle metni bundan yeniden üretir.
+function enqueue(base, phone, text, reason, mediaDesc, silent, render) {
     if (pending.some(p => p.ind === base.ind && p.phone === phone && (base.ind != null || p.text === text))) return;
     pending.push({
         ind: base.ind, cariInd: base.cariInd, name: base.name, firma: base.firma, kod: base.kod,
         tutar: base.tutar, evrak: base.evrak, bakiye: base.bakiye, bakiyeDurum: base.bakiyeDurum,
-        ruleName: base.ruleName, phone, text, media: mediaDesc || null,
+        ruleName: base.ruleName, phone, text, media: mediaDesc || null, render: render || null,
         // Defter alanları: kuyruktan gönderilince recordSentDoc bunlarla işler.
         docType: base.docType, ruleId: base.ruleId, amountNum: base.amountNum,
-        direction: base.direction, tarihISO: base.tarihISO,
+        direction: base.direction, tarihISO: base.tarihISO, tbl: tableName(),
         attempts: 0, noWaCount: 0, queuedAt: new Date().toISOString(), lastError: reason,
     });
     savePending();
@@ -607,6 +609,91 @@ const pendingBase = (p) => ({
     tutar: p.tutar, evrak: p.evrak, bakiye: p.bakiye, bakiyeDurum: p.bakiyeDurum, ruleName: p.ruleName,
 });
 
+// Sıradaki belge mesajını gönderim anındaki veriyle tazele. Metin sıraya girdiği anın
+// görüntüsüdür; mesaj saatlerce bekleyebilir (yoğun trafik modu, gece, WA kopukluğu).
+// Beklerken belge silinmişse mesajı gönderip sonra geri çekmek, tutar değişmişse eski
+// tutarı gönderip ardından "güncellendi" yollamak, bakiye değişmişse eski bakiyeyi
+// yazmak yerine:
+//   • belge yok / tutarı sıfırlanmış → sıradan düşer;
+//   • tutar ve bakiye → metin render tarifinden güncel değerlerle yeniden kurulur.
+//     Tutar, defter ve düzenleme taramasındaki gibi belgenin o cariye o günkü tüm
+//     satırlarının toplamıdır (sil+ekle düzenlemesinde satırın IND'i değişir).
+// Dönüş: { drop: { status, error } } (düşür) | { fresh: true } (metin güncel veriyle
+// yeniden kuruldu) | {} (olduğu gibi gönder).
+// DB yoksa ya da sorgu patlarsa metin olduğu gibi gider (eski davranış). render alanı
+// olmayan eski sıra öğelerinde metne dokunulmaz, yalnız silme/sıfırlama/alacaklı bakılır.
+async function refreshQueued(pool, item) {
+    const tbl = tableName();
+    if (!pool || !pool.connected || !tbl || (item.tbl && item.tbl !== tbl)) return {};
+    const cariInd = parseInt(item.cariInd, 10);
+    if (!Number.isFinite(cariInd) || !item.evrak || !item.docType || !item.tarihISO) return {};
+
+    let doc = null, kalan = null;
+    try {
+        // Kimlik defterle aynı: cari + belge tarihi + evrak (bkz. docKeyOf, scanEditsDeletes).
+        const req = pool.request();
+        req.input('e', deps.sql.NVarChar, String(item.evrak));
+        const rows = (await req.query(`
+            SELECT CONVERT(date, TARIH) AS D,
+                   CAST(SUM(BORC) AS DECIMAL(18,2)) AS B,
+                   CAST(SUM(ALACAK) AS DECIMAL(18,2)) AS A
+            FROM [${tbl}] WHERE FIRMANO = ${cariInd} AND EVRAKNO = @e
+            GROUP BY CONVERT(date, TARIH)
+        `)).recordset;
+        doc = rows.find(r => dayOf(r.D) === dayOf(item.tarihISO)) || null;
+        const borcMap = await fetchKalanBorc(pool, tbl, [cariInd]);
+        if (borcMap.has(cariInd)) kalan = borcMap.get(cariInd);
+    } catch (e) { console.error('[Watcher] sıra tazeleme sorgusu:', e.message); return {}; }
+
+    if (!doc) return { drop: { status: 'dropped', error: 'Belge Vega\'da silinmiş — sıradaki mesaj gönderilmedi' } };
+    const B = Number(doc.B) || 0, A = Number(doc.A) || 0;
+    const cur = item.direction === 'alacak' ? A : item.direction === 'borc' ? B : (B > 0 ? B : A);
+    const r = item.render;
+    const isEdit = r ? r.kind === 'edit' : item.ind == null;
+
+    if (isEdit) {
+        if (r) {
+            // Defter müşterinin göreceği tutarı tutsun: bu mesaj cur'u bildirecek (ya da
+            // tutar eski hâline döndüyse hiç gitmeyecek); tarama aynı farkı yeniden yakalamasın.
+            const led = docs[tbl] && docs[tbl][docKeyOf(item.docType, item.cariInd, item.tarihISO, item.evrak)];
+            if (led && Math.abs((Number(led.amount) || 0) - cur) >= 0.01) { led.amount = cur; saveDocs(); }
+            if (Math.abs(cur - (Number(r.oldAmount) || 0)) < 0.01) {
+                return { drop: { status: 'dropped', error: 'Tutar eski hâline dönmüş — düzenleme mesajı gönderilmedi' } };
+            }
+        }
+    } else if (Number(item.amountNum) > 0 && !(cur > 0)) {
+        return { drop: { status: 'dropped', error: 'Belge tutarı sıfırlanmış — sıradaki mesaj gönderilmedi' } };
+    }
+    if (config.sendAlacakli === false && kalan != null && kalan < 0) {
+        return { drop: { status: 'alacakli', error: 'Cari alacaklı oldu — "alacaklılara da gönder" kapalı, sıradaki mesaj gönderilmedi' } };
+    }
+    if (!r) return {};
+
+    const bakiye = kalan != null ? fmtAmount(Math.abs(kalan)) : (r.vars.bakiye || '');
+    const durum = kalan != null ? (kalan > 0 ? 'Borç' : kalan < 0 ? 'Alacak' : '') : (r.vars.durum || '');
+    const vars = { ...r.vars, bakiye, durum };
+    if (isEdit) vars.yeniTutar = fmtAmount(cur); else vars.tutar = fmtAmount(cur);
+    let text = renderTemplate(r.tpl, vars);
+    if (!isEdit) {
+        if (r.withContent) {
+            let content = r.content || null;
+            if (typeof deps.buildDocContentText === 'function') {
+                try { content = (await deps.buildDocContentText(config.firmaNo, config.donemNo, item.docType, item.evrak, cur)) || content; }
+                catch (e) { console.error('[Watcher] sıra tazeleme, belge içeriği:', e.message); }
+            }
+            if (content) text += '\n\n' + content;
+        }
+        // "Numaramızı kaydedin" ricası gönderim anında: aynı yeni numaraya sırada iki
+        // mesaj varsa yalnız ilki sorsun.
+        if (deps.saveContactText && typeof deps.shouldAskSave === 'function' && deps.shouldAskSave(item.phone)) {
+            text += '\n\n' + deps.saveContactText;
+        }
+    }
+    Object.assign(item, { text, amountNum: cur, tutar: fmtAmount(cur), bakiye, bakiyeDurum: durum });
+    savePending();
+    return { fresh: true };
+}
+
 async function processPending() {
     // Yoğun trafik: gün sonu temizliği WhatsApp bağlı olmasa da yapılır; gönderim yalnız
     // pencere açıkken ve bekleme dolmuşsa (DB'ye de ancak o zaman gidilir).
@@ -658,6 +745,15 @@ async function processPending() {
                 continue;
             }
         }
+        // Beklerken silinen/değişen belge: düşür ya da metni güncel veriyle yeniden kur.
+        // Düşen mesaj yoğun trafik modunda gönderim hakkı yemez (sonraki öğeye geçilir).
+        const { drop, fresh } = await refreshQueued(pool, item);
+        if (!pending.includes(item)) continue;
+        if (drop) {
+            pending = pending.filter(p => p !== item); savePending();
+            pushLog({ ...pendingBase(item), ...drop });
+            continue;
+        }
         const media = loadMediaFromDescriptor(item.media);
         if (config.verifyOnWhatsApp) {
             const chk = await deps.checkOnWhatsApp(item.phone);
@@ -678,6 +774,18 @@ async function processPending() {
             recordSentDoc(tableName(), item, item.phone, res.id);
             pending = pending.filter(p => p !== item); savePending(); sentCount++;
             pushLog({ ...pendingBase(item), status: 'sent', message: item.text });
+            // Tazelenen tutar belgenin bu cariye o günkü TÜM satırlarının toplamıdır. Aynı
+            // belgenin sıradaki diğer satırları (çok satırlı fiş, Vega'nın sil+ekle
+            // düzenlemesi) aynı numaraya aynı toplamı ikinci kez göndermesin.
+            if (fresh && item.ind != null) {
+                const key = docKeyOf(item.docType, item.cariInd, item.tarihISO, item.evrak);
+                for (const p of pending.filter(p => p.ind != null && p.phone === item.phone
+                    && docKeyOf(p.docType, p.cariInd, p.tarihISO, p.evrak) === key)) {
+                    pending = pending.filter(x => x !== p);
+                    pushLog({ ...pendingBase(p), status: 'dropped', error: 'Aynı belge önceki mesajla toplam tutarıyla bildirildi' });
+                }
+                savePending();
+            }
         } else {
             item.attempts = (item.attempts || 0) + 1; item.lastError = res.error;
             if (item.attempts >= MAX_SEND_ATTEMPTS) {
@@ -1020,25 +1128,34 @@ async function handleEdited(pool, tbl, key, e, curAmount) {
     if (config.onlySmsGonder && !c.smsGonder) { pushLog({ ...base, status: 'noSmsConsent', error: 'SMS Gönder izni yok' }); return; }
     if (!c.phone || !c.valid) { pushLog({ ...base, status: 'noPhone', error: 'Geçerli telefon yok' }); return; }
 
-    const text = renderTemplate(config.editTemplate || DEFAULT_CONFIG.editTemplate, {
+    // Bu belgenin "güncellendi" mesajı zaten sıradaysa ikincisini ekleme: sıradaki mesaj
+    // gönderim anında güncel tutarla yeniden kurulur (refreshQueued) ve eski tutar olarak
+    // müşterinin gördüğü tutarı korur.
+    if (pending.some(p => p.render && p.render.kind === 'edit' && p.phone === c.phone
+        && docKeyOf(p.docType, p.cariInd, p.tarihISO, p.evrak) === key)) return;
+
+    const tpl = config.editTemplate || DEFAULT_CONFIG.editTemplate;
+    const vars = {
         ad: c.name, firma: c.firma, kod: c.kod, evrak: e.evrak, belge: e.ruleName,
         tarih: e.tarih ? new Date(e.tarih).toLocaleDateString('tr-TR') : '',
         eskiTutar: fmtAmount(oldAmount), yeniTutar: fmtAmount(curAmount),
         bakiye: bakiyeStr, durum,
-    });
+    };
+    const text = renderTemplate(tpl, vars);
+    const render = { kind: 'edit', tpl, vars, oldAmount };
 
-    if (slowOn()) { enqueue(base, c.phone, text, 'Yoğun trafik modu — sırayla gönderilecek', null, true); return; }
-    if (antiban.inQuietHours()) { enqueue(base, c.phone, text, antiban.quietReason(), null); return; }
+    if (slowOn()) { enqueue(base, c.phone, text, 'Yoğun trafik modu — sırayla gönderilecek', null, true, render); return; }
+    if (antiban.inQuietHours()) { enqueue(base, c.phone, text, antiban.quietReason(), null, false, render); return; }
     if (!deps.waStatus().ready) {
-        enqueue(base, c.phone, text, 'WhatsApp bağlı değil — düzenleme mesajı kuyruğa alındı', null);
+        enqueue(base, c.phone, text, 'WhatsApp bağlı değil — düzenleme mesajı kuyruğa alındı', null, false, render);
         return;
     }
     const g = gateSend('belge');
-    if (!g.ok) { enqueue(base, c.phone, text, `Gönderim tavanı: ${g.reason} — kuyruğa alındı`, null); return; }
+    if (!g.ok) { enqueue(base, c.phone, text, `Gönderim tavanı: ${g.reason} — kuyruğa alındı`, null, false, render); return; }
     if (config.verifyOnWhatsApp) {
         const chk = await deps.checkOnWhatsApp(c.phone);
         if (!chk.exists) {
-            if (chk.transient) enqueue(base, c.phone, text, `Doğrulanamadı (${chk.error || 'geçici hata'}) — kuyruğa alındı`, null);
+            if (chk.transient) enqueue(base, c.phone, text, `Doğrulanamadı (${chk.error || 'geçici hata'}) — kuyruğa alındı`, null, false, render);
             else pushLog({ ...base, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' });
             return;
         }
@@ -1049,7 +1166,7 @@ async function handleEdited(pool, tbl, key, e, curAmount) {
         if (res.id) { e.waMsgs.push({ phone: c.phone, id: res.id }); saveDocs(); }  // sonraki silmede bu da geri çekilir
         pushLog({ ...base, status: 'edited', message: text, error: `Tutar ${fmtAmount(oldAmount)} → ${fmtAmount(curAmount)} TL` });
     } else {
-        enqueue(base, c.phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`, null);
+        enqueue(base, c.phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`, null, false, render);
     }
 }
 
@@ -1239,19 +1356,23 @@ async function pollOnce() {
                 skipped++; pushLog({ ...base, status: 'noReply', error: 'Üst üste yanıt yok — dönüş-budama ile atlandı (Anti-ban)' }); continue;
             }
 
-            let text = renderTemplate(rule.template, {
+            const vars = {
                 ad: c.name, firma: c.firma, tutar: fmtAmount(amount), kod: c.kod, evrak: row.EVRAKNO || '',
                 belge: rule.name, firmaadi: bizFirma,
                 tarih: row.TARIH ? new Date(row.TARIH).toLocaleDateString('tr-TR') : '',
                 bakiye: bakiyeStr, durum,
-            });
+            };
+            let text = renderTemplate(rule.template, vars);
+            // Sıraya girerse gönderim anında bu tarifle yeniden kurulur (refreshQueued);
+            // "numaramızı kaydedin" satırı tarife girmez, o an yeniden değerlendirilir.
+            const render = { kind: 'doc', tpl: rule.template, vars, withContent: rule.includeContent === true, content: null };
             // Seçenek açıksa O AN kesilen belgenin (EVRAKNO) kalemlerini mesaja ekle.
             if (rule.includeContent && typeof deps.buildDocContentText === 'function') {
                 try {
                     // amount = BORC/ALACAK = belgenin KDV DAHİL genel toplamı → içerik
                     // bloğundaki "Toplam" bununla yazılsın (kalem toplamı iskontoda sapar).
                     const content = await deps.buildDocContentText(config.firmaNo, config.donemNo, rule.docType, row.EVRAKNO, amount);
-                    if (content) text += '\n\n' + content;
+                    if (content) { text += '\n\n' + content; render.content = content; }
                     else if (!(amount > 0)) {
                         skipped++; pushLog({ ...base, status: 'info', error: 'Tutarsız stok çıkışı — ürün satırı bulunamadı, gönderilmedi' }); continue;
                     }
@@ -1266,29 +1387,29 @@ async function pollOnce() {
             const targets = (config.sendAllPhones && Array.isArray(c.phones) && c.phones.length) ? c.phones : [c.phone];
             for (const phone of targets) {
                 // Yoğun trafik: hiçbir mesaj anında gitmez; processPending aralıklı gönderir.
-                if (slowOn()) { enqueue(base, phone, text, 'Yoğun trafik modu — sırayla gönderilecek', rule.media, true); queued++; continue; }
+                if (slowOn()) { enqueue(base, phone, text, 'Yoğun trafik modu — sırayla gönderilecek', rule.media, true, render); queued++; continue; }
                 // Gece penceresi: saat dışındaysa kuyruğa al, pencere açılınca gönderilir.
-                if (antiban.inQuietHours()) { enqueue(base, phone, text, antiban.quietReason(), rule.media); queued++; continue; }
+                if (antiban.inQuietHours()) { enqueue(base, phone, text, antiban.quietReason(), rule.media, false, render); queued++; continue; }
                 if (!deps.waStatus().ready) {
-                    enqueue(base, phone, text, 'WhatsApp bağlı değil — kuyruğa alındı, bağlanınca gönderilecek', rule.media); queued++; continue;
+                    enqueue(base, phone, text, 'WhatsApp bağlı değil — kuyruğa alındı, bağlanınca gönderilecek', rule.media, false, render); queued++; continue;
                 }
                 // Anti-ban tavanı (warm-up/saatlik/günlük) doldu → kuyruğa al, gönderme.
                 // Sonraki turlarda gate açılınca processPending gönderir.
                 const g = gateSend('belge');
                 if (!g.ok) {
-                    enqueue(base, phone, text, `Gönderim tavanı: ${g.reason} — kuyruğa alındı`, rule.media); queued++; continue;
+                    enqueue(base, phone, text, `Gönderim tavanı: ${g.reason} — kuyruğa alındı`, rule.media, false, render); queued++; continue;
                 }
                 if (config.verifyOnWhatsApp) {
                     const chk = await deps.checkOnWhatsApp(phone);
                     if (!chk.exists) {
-                        if (chk.transient) { enqueue(base, phone, text, `Doğrulanamadı (${chk.error || 'geçici hata'}) — kuyruğa alındı`, rule.media); queued++; }
+                        if (chk.transient) { enqueue(base, phone, text, `Doğrulanamadı (${chk.error || 'geçici hata'}) — kuyruğa alındı`, rule.media, false, render); queued++; }
                         else { skipped++; pushLog({ ...base, phone, status: 'notOnWhatsApp', error: 'WhatsApp kullanıcısı değil' }); }
                         continue;
                     }
                 }
                 const res = await deps.waSend(phone, text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400), channel: 'belge' });
                 if (res.success) { noteSent('belge'); recordSentDoc(tbl, base, phone, res.id); sent++; pushLog({ ...base, phone, status: 'sent', message: text }); }
-                else { enqueue(base, phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`, rule.media); queued++; }
+                else { enqueue(base, phone, text, `Gönderilemedi (${res.error}) — kuyruğa alındı`, rule.media, false, render); queued++; }
                 await sleep(rand(8000, 20000));
             }
         }
