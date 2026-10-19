@@ -5,7 +5,7 @@ const os = require('os');
 const db = require('../db');
 const exporter = require('../console-export');
 const renderer = require('../renderer');
-const { Integration, fingerprint } = require('../index');
+const { Integration, fingerprint, FP_VERSION } = require('../index');
 
 const root = path.join(__dirname, '..');
 const xml = fs.readFileSync(path.join(__dirname, 'fixture-invoice.xml'), 'utf8');
@@ -85,6 +85,10 @@ async function main() {
         DOCUMENT_TYPE: 'earsiv',
     };
     assert.notEqual(fingerprint(baseRow), fingerprint({ ...baseRow, LINE_CHECKSUM: 124 }));
+    assert.notEqual(fingerprint(baseRow), fingerprint({ ...baseRow, TUTAR: 101 }));
+    // Vega'da acip kaydetmek (LADATE) ya da GIB durumu degisikligi yeniden gonderim sebebi degil.
+    assert.equal(fingerprint(baseRow), fingerprint({ ...baseRow, LADATE: new Date('2026-09-08T10:00:00Z') }));
+    assert.equal(fingerprint(baseRow), fingerprint({ ...baseRow, EFATURA: true, EFATURAUUID: 'baska' }));
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vega-efatura-test-'));
     const calls = { send: 0, del: 0 };
@@ -106,63 +110,90 @@ async function main() {
         const doc = integration.state.docsForContext('F0103D0015')[0];
         const cancelled = await integration.cancelOne(ctx, doc, { ...baseRow, IPTAL: true }, 'iptal');
         assert(cancelled.cancelled);
-        assert.equal(calls.del, 1);
+        assert.equal(calls.del, 0, 'iptalde eski PDF herkesten silinmemeli');
         assert.equal(calls.send, 1);
         assert.equal(integration.state.doc(key).status, 'cancelled');
     } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
-    // Duzeltme yatisma: arka arkaya duzeltilen fatura tek guncelleme olarak gider,
-    // belge MAX_UPDATES kezden fazla sil-gonder yapmaz (ban korumasi).
-    const settleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vega-efatura-settle-'));
+    // Degisiklik: eski parmak izi sessizce yenilenir, degisiklik sabitlenene kadar
+    // beklenir, fatura basina tek guncelleme gider.
+    const changeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vega-efatura-change-'));
     const origStates = db.documentStates;
     try {
-        const { UPDATE_SETTLE_MS, MAX_UPDATES } = require('../index');
         const ctx = { firmaNo: '0103', donemNo: '0015' };
         const integration = new Integration({
-            manifest: { settings: {} }, dataDir: settleDir, integrationDir: root,
-            gate: () => ({ ok: true }), waSend: async () => ({ success: true, id: 'x' }),
+            manifest: { settings: { updateSettleMinutes: 15, maxUpdates: 1 } }, dataDir: changeDir, integrationDir: root,
+            gate: () => ({ ok: true }),
+            waDelete: async () => { throw new Error('geri cekme cagrilmamali'); },
+            waSend: async () => ({ success: true, id: 'x' }),
         });
         const key = integration.documentKey(ctx, baseRow);
         integration.state.setDoc(key, {
             status: 'sent', contextKey: 'F0103D0015', ind: 99, belgeNo: baseRow.BELGENO,
-            sentAt: new Date().toISOString(), fingerprint: fingerprint(baseRow), revision: 1,
+            phone: '905551112233', waMessageId: 'pdf-msg', sentAt: new Date().toISOString(),
+            fingerprint: 'v1-eski-parmak-izi',
         });
+        let row = { ...baseRow };
+        db.documentStates = async () => [row];
         const updates = [];
-        integration.processOne = async (_ctx, row, mode) => {
+        integration.processOne = async (_ctx, r, mode) => {
             updates.push(mode);
-            integration.state.setDoc(key, { fingerprint: fingerprint(row), revision: Number(integration.state.doc(key).revision || 1) + 1 });
+            integration.state.setDoc(key, { fingerprint: fingerprint(r), updates: 1, pendingFingerprint: null, pendingSince: null });
             return { sent: true, updated: true };
         };
-        let current = { ...baseRow, TUTAR: 150 };
-        db.documentStates = async () => [current];
-        const age = (ms) => integration.state.setDoc(key, { pendingSince: new Date(Date.now() - ms).toISOString() });
 
-        await integration.reconcileSent({}, ctx);                  // ilk gorus: yalniz bekler
-        assert.deepEqual(updates, []);
-        current = { ...baseRow, TUTAR: 175 };                       // yatismadan yine degisti
+        // v1 kaydi: gonderim yok, yeni parmak izine gecer.
+        assert.deepEqual(await integration.reconcileSent({}, ctx), []);
+        assert.equal(integration.state.doc(key).fpVersion, FP_VERSION);
+        assert.equal(integration.state.doc(key).fingerprint, fingerprint(baseRow));
+
+        // Yalniz LADATE degisti: hicbir sey olmaz.
+        row = { ...baseRow, LADATE: new Date('2026-09-09T10:00:00Z') };
         await integration.reconcileSent({}, ctx);
-        age(UPDATE_SETTLE_MS - 60000);
-        await integration.reconcileSent({}, ctx);
-        assert.deepEqual(updates, []);
-        age(UPDATE_SETTLE_MS + 1000);                               // 15 dk ayni kaldi → tek guncelleme
-        await integration.reconcileSent({}, ctx);
-        assert.deepEqual(updates, ['update']);
         assert.equal(integration.state.doc(key).pendingFingerprint, null);
 
-        for (let i = 2; i <= MAX_UPDATES + 1; i++) {
-            current = { ...baseRow, TUTAR: 200 + i };
-            await integration.reconcileSent({}, ctx);
-            age(UPDATE_SETTLE_MS + 1000);
-            await integration.reconcileSent({}, ctx);
-        }
-        assert.equal(updates.length, MAX_UPDATES);                  // tavandan sonrasi gonderilmez
-        assert.equal(integration.state.doc(key).fingerprint, fingerprint(current));
-        assert.ok(integration.state.doc(key).updateSkippedAt);
+        // Tutar degisti: once bekler, 15 dk dolmadan gondermez.
+        row = { ...baseRow, TUTAR: 150 };
+        await integration.reconcileSent({}, ctx);
+        assert.deepEqual(updates, []);
+        assert.equal(integration.state.doc(key).pendingFingerprint, fingerprint(row));
+        await integration.reconcileSent({}, ctx);
+        assert.deepEqual(updates, []);
+
+        // Bekleme sirasinda yine degisti: sayac bastan baslar.
+        row = { ...baseRow, TUTAR: 175 };
+        await integration.reconcileSent({}, ctx);
+        assert.equal(integration.state.doc(key).pendingFingerprint, fingerprint(row));
+        assert.deepEqual(updates, []);
+
+        // Sabit kaldi ve sure doldu: tek guncelleme gider.
+        integration.state.setDoc(key, { pendingSince: new Date(Date.now() - 16 * 60000).toISOString() });
+        await integration.reconcileSent({}, ctx);
+        assert.deepEqual(updates, ['update']);
+
+        // Sinir dolu: sonraki degisiklik sessiz kalir, yeni parmak izi kabul edilir.
+        row = { ...baseRow, TUTAR: 200 };
+        await integration.reconcileSent({}, ctx);
+        integration.state.setDoc(key, { pendingSince: new Date(Date.now() - 60 * 60000).toISOString() });
+        await integration.reconcileSent({}, ctx);
+        assert.deepEqual(updates, ['update']);
+        assert.equal(integration.state.doc(key).fingerprint, fingerprint(row));
+
+        // v1.10.8'de guncellenmis belge (revision 2, updates alani yok): sinir dolu sayilir.
+        integration.state.setDoc(key, { updates: undefined, revision: 2 });
+        row = { ...baseRow, TUTAR: 250 };
+        await integration.reconcileSent({}, ctx);
+        assert.deepEqual(updates, ['update']);
+        assert.equal(integration.state.doc(key).fingerprint, fingerprint(row));
+
+        // Yalniz ana numara: "tum telefonlar" ayari PDF'i katlamaz.
+        assert.deepEqual(integration.recipients({ phone: '905551112233', phones: ['905551112233', '905551112244'] }), ['905551112233']);
+        assert.deepEqual(integration.recipients(null), []);
     } finally {
         db.documentStates = origStates;
-        fs.rmSync(settleDir, { recursive: true, force: true });
+        fs.rmSync(changeDir, { recursive: true, force: true });
     }
 
     // Batch siniri dolunca imlec islenmeyen satirlarin uzerinden atlamamali.

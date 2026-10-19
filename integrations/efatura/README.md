@@ -63,10 +63,18 @@ gercek cariye tekrar gitmez.
 
 ## Degisiklik ve iptal
 
-Gonderilen bir fatura sonraki 7 gun icinde degistirilirse yeni PDF gonderilir ve
-eski PDF mesaji geri cekilmeye calisilir. Fatura `IPTAL=1` olursa veya kaydi
-silinirse eski PDF geri cekilir ve musteriye iptal bildirimi gider. WhatsApp'in
-geri cekme suresi asilmissa iptal bildirimi yine gonderilir.
+PDF yalniz carinin ana cep numarasina gider; watcher'in "tum telefonlara gonder"
+ayari burada uygulanmaz.
+
+Gonderilen bir faturanin tutari, carisi, tarihi veya satirlari sonraki 7 gun
+icinde degisirse guncel PDF gonderilir. Vega'da acip kaydetmek (`LADATE`) ya da
+GIB durumu degisiklik sayilmaz. Degisiklik `updateSettleMinutes` (15 dk) sabit
+kalmadan gitmez; ard arda duzeltmeler tek mesaja iner. Fatura basina en fazla
+`maxUpdates` (1) guncelleme gider, sonrasi sessiz kalir. Fatura `IPTAL=1` olursa
+veya kaydi silinirse musteriye iptal bildirimi gider.
+
+Eski PDF mesaji hicbir durumda geri cekilmez ("herkesten sil"). Alicida "Bu mesaj
+silindi" yigini birakiyordu ve ban sinyaliydi (Expert hatti, 9 Eki 2026).
 
 ## Guvenlik ve dogruluk
 

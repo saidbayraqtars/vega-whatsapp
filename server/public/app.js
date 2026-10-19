@@ -1839,7 +1839,7 @@ async function refreshWatcherLog() {
         const box = $('wc_log');
         if (!r.log.length) { box.innerHTML = '<div class="muted" style="padding:10px">Henüz otomatik gönderim yok.</div>'; return; }
         wcLogEntries = r.log;
-        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', noSmsConsent: 'SMS izni yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta', pasif: 'Cari pasif', wrongType: 'Tip dışı', alacakli: 'Alacaklı (atlandı)', dropped: 'Düşürüldü', edited: 'Güncellendi', recalled: 'Geri çekildi', recallExpired: 'Geri çekilemedi (2 gün)', cleared: 'Temizlendi', info: 'Bilgi' };
+        const labels = { sent: 'Gönderildi', failed: 'Başarısız', noPhone: 'Telefon yok', noSmsConsent: 'SMS izni yok', notOnWhatsApp: 'WA yok', waOffline: 'WA kapalı', queued: 'Kuyrukta', pasif: 'Cari pasif', wrongType: 'Tip dışı', alacakli: 'Alacaklı (atlandı)', dropped: 'Düşürüldü', edited: 'Güncellendi', recalled: 'Geri çekildi', cancelled: 'İptal bildirildi', recallExpired: 'Geri çekilemedi (2 gün)', cleared: 'Temizlendi', info: 'Bilgi' };
         box.innerHTML = r.log.map((e, i) => `
             <div class="logline">
                 <span>${esc(e.name || '')} <span class="muted">${esc(e.phone || '')}</span>
@@ -1850,7 +1850,7 @@ async function refreshWatcherLog() {
                     <span class="muted" style="font-size:11px">${e.at ? new Date(e.at).toLocaleTimeString('tr-TR') : ''}</span>
                     ${e.message ? `<a href="#" class="wc_msg" data-i="${i}">mesajı gör</a>` : ''}
                 </span>
-                <span class="st ${['sent', 'edited', 'recalled'].includes(e.status) ? 'sent' : (['failed', 'recallExpired'].includes(e.status) ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>
+                <span class="st ${['sent', 'edited', 'recalled', 'cancelled'].includes(e.status) ? 'sent' : (['failed', 'recallExpired'].includes(e.status) ? 'failed' : 'info')}">${labels[e.status] || e.status}</span>
             </div>`).join('');
         box.querySelectorAll('.wc_msg').forEach(a => a.onclick = (ev) => {
             ev.preventDefault();

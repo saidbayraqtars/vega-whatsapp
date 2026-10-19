@@ -58,6 +58,8 @@ async function maxInvoiceInd(pool, ctx) {
     return Number(rs.recordset[0].maxInd) || 0;
 }
 
+// Satir checksum'ina satirin kendi IND'i girmez: Vega kayitta satirlari silip
+// yeniden yazarsa IND degisir, icerik ayni kalir (gereksiz "fatura degisti").
 const snapshotSelect = n => `
     SELECT
         b.IND, b.BELGENO, b.TARIH, b.TUTAR, b.PARABIRIMI,
@@ -70,7 +72,7 @@ const snapshotSelect = n => `
     OUTER APPLY (
         SELECT COUNT_BIG(*) AS LINE_COUNT,
                CHECKSUM_AGG(BINARY_CHECKSUM(
-                   h.IND,h.SATIRNO,h.STOKNO,h.STOKKODU,h.MALINCINSI,
+                   h.SATIRNO,h.STOKNO,h.STOKKODU,h.MALINCINSI,
                    h.MIKTAR,h.BIRIMMIKTAR,h.BIRIM,h.KDV,h.KDVTUTARI,
                    h.ISK1,h.ISK2,h.ISK3,h.ISK4,h.ISK5,h.ISK6,
                    h.FIYATI,h.GERCEKTOPLAM,h.ACIKLAMA,h.PARABIRIMI,h.KUR

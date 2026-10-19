@@ -107,21 +107,21 @@ app.whenReady().then(async () => {
         assert.equal(again.skipped, 'sent');
         assert.equal(sends.length, 1);
 
-        // 3) Tutar degisti -> guncel PDF gider, eski mesaj geri cekilir.
+        // 3) Tutar degisti -> guncel PDF gider; eski mesaj geri CEKILMEZ (ban sinyali).
         const changed = { ...row, TUTAR: 2000, LINE_CHECKSUM: 78 };
         const upd = await integration.processOne(ctx, changed, 'update');
         assert.equal(upd.updated, true);
         assert.equal(sends.length, 2);
         assert(sends[1].text.includes('2.000,00 TL'));
-        assert.equal(deletes.length, 1);
-        assert.equal(deletes[0].id, 'wa-1');
+        assert.equal(deletes.length, 0);
         assert.equal(integration.state.doc(key).revision, 2);
+        assert.equal(integration.state.doc(key).updates, 1);
 
-        // 4) Iptal: PDF geri cekilir, musteriye iptal bildirimi gider (eksiz).
+        // 4) Iptal: musteriye iptal bildirimi gider (eksiz); PDF geri cekilmez.
         const doc = integration.state.docsForContext(integration.key(ctx)).find(d => d.ind === 4210);
         const cancelled = await integration.cancelOne(ctx, doc, { ...changed, IPTAL: true }, 'iptal');
         assert.equal(cancelled.cancelled, true);
-        assert.equal(deletes.length, 2);
+        assert.equal(deletes.length, 0);
         assert.equal(sends[2].media, null);
         assert(sends[2].text.includes('iptal edildi'));
         assert.equal(integration.state.doc(key).status, 'cancelled');
@@ -154,56 +154,29 @@ app.whenReady().then(async () => {
         assert.equal(integration.setTestMode({ phone: '' }).testPhone, null);
         assert.throws(() => integration.setTestMode({ phone: '123' }), /gecersiz/i);
 
-        // 8) "Carideki tum telefonlara gonder" acik: ayni PDF her numaraya gider;
-        // guncelleme ve iptal de hepsine uygulanir.
+        // 8) "Carideki tum telefonlara gonder" acik olsa da PDF yalniz ana numaraya gider
+        // (her tekrar her numaraya katlaniyordu).
         allPhones = true;
         const multiRow = { ...row, IND: 4214 };
-        const multiKey = integration.documentKey(ctx, multiRow);
         let base = sends.length;
         const multi = await integration.processOne(ctx, multiRow);
-        assert.deepEqual(multi.phones, ['905551112233', '905551112244', '905551112255']);
-        assert.equal(sends.length, base + 3);
-        const pdfs = sends.slice(base);
-        assert.deepEqual(pdfs.map(x => x.phone), multi.phones);
-        assert(pdfs.every(x => x.media.buffer === pdfs[0].media.buffer), 'PDF bir kez uretilip hepsine gitmeli');
-        assert.equal(integration.state.doc(multiKey).sends.length, 3);
-        assert.equal(integration.state.doc(multiKey).phone, '905551112233');
+        assert.deepEqual(multi.phones, ['905551112233']);
+        assert.equal(sends.length, base + 1);
 
-        base = sends.length;
-        let delBase = deletes.length;
-        const multiChanged = { ...multiRow, TUTAR: 3000, LINE_CHECKSUM: 79 };
-        await integration.processOne(ctx, multiChanged, 'update');
-        assert.equal(sends.length, base + 3);
-        assert.deepEqual(deletes.slice(delBase).map(d => d.id), pdfs.map((_, i) => 'wa-' + (base - 2 + i)));
-        assert.deepEqual(deletes.slice(delBase).map(d => d.phone), multi.phones);
-
-        base = sends.length; delBase = deletes.length;
-        const multiDoc = integration.state.docsForContext(integration.key(ctx)).find(d => d.ind === 4214);
-        await integration.cancelOne(ctx, multiDoc, { ...multiChanged, IPTAL: true }, 'iptal');
-        assert.equal(deletes.length, delBase + 3);
-        assert.deepEqual(sends.slice(base).map(x => x.phone), multi.phones);
-        assert(sends.slice(base).every(x => x.media === null && x.text.includes('iptal edildi')));
-
-        // Bir numara kapaliysa digerlerine gider, belge gonderildi sayilir (tekrar denenirse
-        // gidenlere ikinci PDF atilirdi). Hicbirine gitmezse hata: sonraki turda denenir.
-        failPhones.add('905551112244');
-        base = sends.length;
-        const partial = await integration.processOne(ctx, { ...row, IND: 4215 });
-        assert.deepEqual(partial.phones, ['905551112233', '905551112255']);
-        assert.equal(partial.failed, 1);
-        assert.equal(integration.state.doc(integration.documentKey(ctx, { ...row, IND: 4215 })).failedPhones[0].phone, '905551112244');
-        for (const p of multi.phones) failPhones.add(p);
+        // Ana numaraya gitmezse hata: sonraki turda denenir.
+        failPhones.add('905551112233');
         await assert.rejects(() => integration.processOne(ctx, { ...row, IND: 4216 }), /numara kapali/);
         assert.notEqual(integration.state.doc(integration.documentKey(ctx, { ...row, IND: 4216 }))?.status, 'sent');
         failPhones.clear();
 
-        // Test modu tum telefonlar acikken de yalniz test numarasina, basliga tum gercek numaralar.
+        // Test modu: yalniz test numarasina, baslikta gercek alici.
         integration.setTestMode({ phone: '905350786101', minutes: 60 });
         base = sends.length;
         await integration.processOne(ctx, { ...row, IND: 4217 });
         assert.equal(sends.length, base + 1);
         assert.equal(sends[base].phone, '905350786101');
-        assert(sends[base].text.includes('905551112233, 905551112244, 905551112255'));
+        assert(sends[base].text.includes('905551112233'));
+        assert(!sends[base].text.includes('905551112244'));
         integration.setTestMode({ phone: '' });
         allPhones = false;
 

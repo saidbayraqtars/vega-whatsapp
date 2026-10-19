@@ -62,23 +62,19 @@ function caption(template, row, contact) {
     return Object.entries(values).reduce((s, [k, v]) => s.split(k).join(v), String(template || ''));
 }
 
-// Düzeltme yatışma süresi: kullanıcı faturayı Vega'da arka arkaya düzeltirken her
-// kayıt yeni bir PDF + eskisini geri çekme üretiyordu (canlı vaka: aynı fatura 6
-// dakikada 3 kez sil-gönder, 3 numaraya). Değişiklik bu süre boyunca aynı kalınca
-// tek güncelleme gider. Ayrıca bir belge en çok MAX_UPDATES kez güncellenir;
-// sonrası yalnız kayda geçer (sürekli sil-gönder spam/flag sinyali).
-const UPDATE_SETTLE_MS = 15 * 60 * 1000;
-const MAX_UPDATES = 2;
-
+// Yalniz musterinin PDF'te gordugu icerik. v1 LADATE (son islem tarihi), ETTN ve
+// e-Fatura bayragini da iceriyordu: fatura Vega'da acilip kaydedilince ya da GIB
+// durumu degisince "degisti" sayilip ayni PDF yeniden gonderiliyor, eskisi herkesten
+// siliniyordu. Canli 7 Eki 2026: ayni fatura 3 numaraya gunde 4 kez + 28 geri cekme;
+// 9 Eki'de Expert hatti banlandi. Iptal/iade ayri kontrol edilir (reconcileSent).
+const FP_VERSION = 2;
 function fingerprint(row) {
     const values = [
         row.BELGENO, row.TARIH instanceof Date ? row.TARIH.toISOString() : row.TARIH,
         String(row.TUTAR == null ? '' : row.TUTAR), row.PARABIRIMI, row.CARIIND,
-        !!row.EFATURA, row.EFATURAUUID, row.BELGETIPI, !!row.IPTAL, !!row.IADE,
-        row.LADATE instanceof Date ? row.LADATE.toISOString() : row.LADATE,
         String(row.LINE_COUNT == null ? 0 : row.LINE_COUNT), row.LINE_CHECKSUM || 0,
     ];
-    return crypto.createHash('sha256').update(JSON.stringify(values)).digest('hex');
+    return crypto.createHash('sha256').update(JSON.stringify([FP_VERSION, ...values])).digest('hex');
 }
 
 class State {
@@ -110,6 +106,11 @@ class Integration {
         fs.mkdirSync(host.dataDir, { recursive: true });
         this.settings = {
             pollSeconds: 30, batchLimit: 5, changeWindowDays: 7,
+            // Degisiklik bu kadar dakika sabit kalmadan guncel PDF gitmez: Vega'da
+            // ard arda yapilan duzeltmeler tek mesaja iner.
+            updateSettleMinutes: 15,
+            // Bir faturaya en fazla bu kadar guncel PDF gider; sonrasi sessiz kalir.
+            maxUpdates: 1,
             ...(host.manifest.settings || {}), ...readLocalSettings(host.dataDir),
         };
         // TEST MODU: dolu ise butun PDF/iptal mesajlari cari yerine bu numaraya gider.
@@ -219,29 +220,14 @@ class Integration {
         return doc.phone ? [{ phone: doc.phone, waMessageId: doc.waMessageId || null }] : [];
     }
 
-    async recallMessage(doc) {
-        const targets = Integration.deliveries(doc).filter(s => s.waMessageId);
-        if (!targets.length || !this.host.waDelete) return { skipped: true };
-        const errors = [];
-        for (const s of targets) {
-            try {
-                const result = await this.host.waDelete(s.phone, s.waMessageId);
-                if (!result || result.success === false) throw new Error((result && (result.error || result.message)) || 'mesaj geri cekilemedi');
-            } catch (e) {
-                errors.push(`${s.phone}: ${e.message}`);
-            }
-        }
-        if (!errors.length) return { success: true };
-        this.log('WARN', `${doc.belgeNo || doc.ind} onceki PDF geri cekilemedi: ${errors.join('; ')}`);
-        return { success: false, error: errors.join('; ') };
-    }
+    // Eski mesaj geri CEKILMEZ: "herkesten sil" alicida "Bu mesaj silindi" yigini
+    // birakiyor ve resmi olmayan istemcide ban sinyali. Guncelleme/iptal yeni bir
+    // mesajla bildirilir; metin onceki PDF'in gecersiz oldugunu soyler.
 
-    // Watcher'daki "Carideki tum telefonlara gonder" ayari PDF icin de gecerli.
+    // PDF yalniz carinin ana cep numarasina gider. Watcher'in "tum telefonlara gonder"
+    // ayari burada uygulanmaz: her tekrar her numaraya katlaniyordu.
     recipients(contact) {
-        const opts = typeof this.host.getWatcherOptions === 'function' ? (this.host.getWatcherOptions() || {}) : {};
-        const phones = opts.sendAllPhones && contact && Array.isArray(contact.phones) && contact.phones.length
-            ? contact.phones : [contact && contact.phone];
-        return [...new Set(phones.filter(Boolean))];
+        return contact && contact.phone ? [contact.phone] : [];
     }
 
     // Ayni cariye art arda numaralar arasinda kisa bekleme (anti-ban, watcher gibi).
@@ -332,14 +318,14 @@ class Integration {
                 cariInd: row.CARIIND, design: rendered.design, testMode: !!this.testPhone,
                 contactName: who.name || '', invoiceDate: row.TARIH, amount: row.TUTAR,
                 currency: row.PARABIRIMI || 'TL', fingerprint: fingerprint(row),
-                waMessageId: sends[0].waMessageId,
+                waMessageId: sends[0].waMessageId, fpVersion: FP_VERSION,
                 revision: mode === 'update' ? Number((old && old.revision) || 1) + 1 : 1,
+                updates: mode === 'update' ? Number((old && old.updates) || 0) + 1 : 0,
+                pendingFingerprint: null, pendingSince: null,
                 pdfBytes: rendered.pdf.length, exportMode: exported.mode,
             });
-            let recalled = null;
-            if (mode === 'update' && old && Integration.deliveries(old).some(s => s.waMessageId)) {
-                recalled = await this.recallMessage(old);
-                this.state.setDoc(itemKey, { previousRecall: recalled, previousWaMessageId: old.waMessageId, previousSends: Integration.deliveries(old) });
+            if (mode === 'update' && old) {
+                this.state.setDoc(itemKey, { previousWaMessageId: old.waMessageId, previousSends: Integration.deliveries(old) });
             }
             const name = (this.testPhone ? '[TEST] ' : '') + (who.name || 'e-Fatura');
             for (const s of sends) {
@@ -354,7 +340,7 @@ class Integration {
                 this.log('WARN', `${row.BELGENO} PDF ${f.phone} numarasina gonderilemedi: ${f.error}`);
             }
             this.log('INFO', `${row.BELGENO} ${row.DOCUMENT_TYPE} PDF ${mode === 'update' ? 'guncellenerek ' : ''}gonderildi (${rendered.design}, ${rendered.pdf.length} bayt) → ${sends.map(s => s.phone).join(', ')}${this.testPhone ? ' [TEST]' : ''}`);
-            return { sent: true, updated: mode === 'update', recalled, belgeNo: row.BELGENO, type: row.DOCUMENT_TYPE, design: rendered.design, phones: sends.map(s => s.phone), failed: failures.length };
+            return { sent: true, updated: mode === 'update', belgeNo: row.BELGENO, type: row.DOCUMENT_TYPE, design: rendered.design, phones: sends.map(s => s.phone), failed: failures.length };
         } finally {
             try { fs.unlinkSync(htmlPath); } catch { /* gecici dosya yok */ }
             try { fs.unlinkSync(exported.xmlPath); } catch { /* Vega temp temizligi kritik degil */ }
@@ -379,7 +365,6 @@ class Integration {
         const gate = this.host.gate ? this.host.gate('watcher') : { ok: true };
         if (gate && gate.ok === false) return { paused: gate.reason || 'gonderim limiti', belgeNo: doc.belgeNo };
 
-        const recalled = await this.recallMessage(doc);
         const invoice = row || {
             BELGENO: doc.belgeNo, TARIH: doc.invoiceDate, TUTAR: doc.amount,
             PARABIRIMI: doc.currency, DOCUMENT_TYPE: doc.type,
@@ -404,17 +389,37 @@ class Integration {
         if (errors.length) this.log('WARN', `${doc.belgeNo || doc.ind} iptal bildirimi bazi numaralara gitmedi: ${errors.join('; ')}`);
         this.state.setDoc(doc.key, {
             status: reason === 'silindi' ? 'deleted' : 'cancelled',
-            cancelledAt: new Date().toISOString(), cancelReason: reason, recalled,
+            cancelledAt: new Date().toISOString(), cancelReason: reason,
             cancelMessageId: notified[0].waMessageId, cancelSends: notified,
         });
         for (const n of notified) {
             this.uiLog({
-                status: 'recalled', name: doc.contactName || 'e-Fatura', phone: n.phone,
+                status: 'cancelled', name: doc.contactName || 'e-Fatura', phone: n.phone,
                 evrak: doc.belgeNo || String(doc.ind), error: `fatura ${reason}; musteriye iptal bildirimi gonderildi`,
             });
         }
         this.log('INFO', `${doc.belgeNo || doc.ind} ${reason}; musteriye iptal bildirimi gonderildi`);
         return { cancelled: true, reason, belgeNo: doc.belgeNo };
+    }
+
+    // Degisen faturaya guncel PDF gitsin mi? 'send' disinda hep sessiz kalir.
+    // Sinir dolduysa yeni parmak izi kabul edilir ki her turda yeniden sorulmasin.
+    updateDecision(doc, currentFingerprint, now = Date.now()) {
+        const maxUpdates = Math.max(0, Number(this.settings.maxUpdates ?? 1));
+        // v1.10.8 'updates' tutmuyordu; orada yapilan guncellemeler revision'da sayili.
+        const used = Math.max(Number(doc.updates || 0), Number(doc.revision || 1) - 1);
+        if (used >= maxUpdates) {
+            this.state.setDoc(doc.key, { fingerprint: currentFingerprint, pendingFingerprint: null, pendingSince: null });
+            this.log('INFO', `${doc.belgeNo || doc.ind} yine degisti; guncelleme siniri (${maxUpdates}) dolu, PDF gonderilmedi`);
+            this.uiLog({ status: 'info', name: doc.contactName || 'e-Fatura PDF', evrak: doc.belgeNo || String(doc.ind), error: 'Fatura yine degisti; guncelleme siniri dolu, musteriye yeni PDF gonderilmedi' });
+            return 'limit';
+        }
+        if (doc.pendingFingerprint !== currentFingerprint) {
+            this.state.setDoc(doc.key, { pendingFingerprint: currentFingerprint, pendingSince: new Date(now).toISOString() });
+            return 'wait';
+        }
+        const settleMs = Math.max(0, Number(this.settings.updateSettleMinutes ?? 15)) * 60000;
+        return now - Date.parse(doc.pendingSince) >= settleMs ? 'send' : 'wait';
     }
 
     async reconcileSent(pool, ctx) {
@@ -443,27 +448,17 @@ class Integration {
                 }
                 if (String(row.BELGENO || '').trim().length !== 16) continue;
                 const currentFingerprint = fingerprint(row);
-                if (!doc.fingerprint) {
-                    this.state.setDoc(doc.key, { fingerprint: currentFingerprint });
+                // Eski surum (v1) parmak izi yeni hesapla karsilastirilamaz: sessizce
+                // yenile. Yoksa guncellemeden sonra izlenen her fatura "degisti" sayilirdi.
+                if (!doc.fingerprint || doc.fpVersion !== FP_VERSION) {
+                    this.state.setDoc(doc.key, { fingerprint: currentFingerprint, fpVersion: FP_VERSION, pendingFingerprint: null, pendingSince: null });
                     continue;
                 }
-                if (doc.fingerprint !== currentFingerprint) {
-                    const now = Date.now();
-                    if (doc.pendingFingerprint !== currentFingerprint) {
-                        this.state.setDoc(doc.key, { pendingFingerprint: currentFingerprint, pendingSince: new Date(now).toISOString() });
-                        continue;
-                    }
-                    if (now - Date.parse(doc.pendingSince) < UPDATE_SETTLE_MS) continue;
-                    if (Number(doc.revision || 1) - 1 >= MAX_UPDATES) {
-                        this.state.setDoc(doc.key, { fingerprint: currentFingerprint, pendingFingerprint: null, pendingSince: null, updateSkippedAt: new Date(now).toISOString() });
-                        this.log('INFO', `${doc.belgeNo || doc.ind} ${MAX_UPDATES} kez guncellendi; yeni degisiklik musteriye gonderilmedi`);
-                        this.uiLog({ status: 'info', name: doc.contactName || 'e-Fatura', evrak: doc.belgeNo || String(doc.ind), error: `Belge ${MAX_UPDATES} kez guncellendi; yeni degisiklik ban korumasi icin gonderilmedi` });
-                        continue;
-                    }
-                    const r = await this.processOne(ctx, row, 'update');
-                    if (r && r.sent) this.state.setDoc(doc.key, { pendingFingerprint: null, pendingSince: null });
-                    results.push(r);
+                if (doc.fingerprint === currentFingerprint) {
+                    if (doc.pendingFingerprint) this.state.setDoc(doc.key, { pendingFingerprint: null, pendingSince: null });
+                    continue;
                 }
+                if (this.updateDecision(doc, currentFingerprint) === 'send') results.push(await this.processOne(ctx, row, 'update'));
             } catch (e) {
                 this.state.setDoc(doc.key, { lastChangeError: e.message, changeAttempts: Number(doc.changeAttempts || 0) + 1 });
                 this.lastError = e.message;
@@ -605,4 +600,4 @@ class Integration {
     }
 }
 
-module.exports = { UPDATE_SETTLE_MS, MAX_UPDATES, create: host => new Integration(host), Integration, State, caption, fingerprint };
+module.exports = { create: host => new Integration(host), Integration, State, caption, fingerprint, FP_VERSION };
