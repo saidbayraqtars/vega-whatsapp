@@ -84,6 +84,19 @@
 //
 //  ANTI-BAN: hedef az sayıda, kayıtlı, kendi numaramız → tavan uygulanmaz;
 //  yalnız 403/401 soğuması dinlenir (sipariş.js ile aynı gerekçe).
+//
+//  ─── İKİ KANAL (2026-10-23, Hakan Bey isteği) ────────────────────────────
+//  • İÇ NUMARA: alınan + verilen çek/senetten yalnız durumu "Portföyde" olanlar
+//    (onlyPortfoy). Vega sözlüğü (dbo.CARIISLEMTOSTR), ödeme satırının STATUS'ü:
+//      çek  1 = Portföyde · 2 ciro · 15 takasta · 17 bankadan tahsil · 23 ödenmiş · 34 iade
+//      senet 8 = Portföyde · 9 ciro · 11 tahsil · 19 takasta · 21 bankadan tahsil · 13 ödenmiş · 36 iade
+//    Verilen tarafta da 1/8 "Portföyde" = henüz ödenmedi. Visa/taksit bu filtreye girmez.
+//  • MÜŞTERİ: alınan çek/senedin tamamı (ciro, takas dahil) cari kartındaki tüm geçerli
+//    numaralara (TELEFON1/2/3…). Yalnız tahsil edilmiş ve iade edilmiş belge hariç —
+//    parası alınmış ya da geri verilmiş belge için müşteriye hatırlatma yanlış olur.
+//    Müşteri mesajı ANTI-BAN kapısından geçer (tavan + gönderim saati), aynı müşterinin
+//    aynı turdaki belgeleri tek mesajda toplanır. Ayrı eşik (customer.days) ve ayrı defter
+//    anahtarı (":m<eşik>") kullanır; iç bildirimle karışmaz.
 // ═══════════════════════════════════════════════════════════════════════════
 
 const fs = require('fs');
@@ -150,6 +163,18 @@ function visaRule() {
 const MAX_TAKSIT = 36;   // kural dalında geriye bakış sınırı (taksit sayısı en çok bu kadar sayılır)
 const typeLabel = (id) => (DOC_TYPES.find(t => t.id === id) || {}).label || id;
 
+// Ödeme satırı STATUS'ü (bkz. başlıktaki İKİ KANAL notu). Yalnız çek/senet.
+const PORTFOY_STATUS = { cek: 1, senet: 8 };
+const CLOSED_STATUS = { cek: [17, 34], senet: [11, 21, 36] };   // tahsil edilmiş + iade
+
+// Çek/senet satırına durum filtresi: 'portfoy' = yalnız portföydeki, 'acik' = tahsil/iade hariç.
+function statusFilter(typeId, mode) {
+    if (!PORTFOY_STATUS[typeId]) return '';
+    if (mode === 'portfoy') return ` AND h.STATUS = ${PORTFOY_STATUS[typeId]}`;
+    if (mode === 'acik') return ` AND ISNULL(h.STATUS, 0) NOT IN (${CLOSED_STATUS[typeId].join(', ')})`;
+    return '';
+}
+
 const DEFAULT_TEMPLATE =
     '⏰ *Vade Hatırlatma* — {kalan}\n' +
     '{tur} {belgeno} • {yon}\n' +
@@ -163,6 +188,15 @@ const DEFAULT_HEADER_TEMPLATE =
 
 const DEFAULT_LINE_TEMPLATE =
     '• {kalan} — {tur} {belgeno} — {firma} — {tutar} TL ({vade})';
+
+// Müşteriye giden mesaj. {liste} = müşterinin bu turda hatırlatılan belgeleri, satır satır.
+const DEFAULT_CUSTOMER_TEMPLATE =
+    'Sayın {firma},\n' +
+    'Firmamıza verdiğiniz çek/senedin vadesi yaklaşıyor:\n' +
+    '{liste}\n\n' +
+    'Bilgilerinize sunarız.\n' +
+    '{firmaadi}';
+const CUSTOMER_LINE = '• {tur} {belgeno} — Vade: {vade} ({kalan}) — {tutar} TL';
 
 const DEFAULT_CONFIG = {
     enabled: false,
@@ -184,6 +218,15 @@ const DEFAULT_CONFIG = {
     visaRuleEvery: 30,
     // 'alinan' = müşteriden alınan (tahsilat), 'verilen' = bizim ödediğimiz, 'ikisi'.
     direction: 'ikisi',
+    // İç numaraya çek/senette yalnız "Portföyde" olanlar (takas/ciro/tahsil/iade hariç).
+    onlyPortfoy: true,
+    // Alınan çek/senedi müşteriye de hatırlat (karttaki tüm geçerli numaralara).
+    customer: {
+        enabled: false,
+        days: [3],
+        template: DEFAULT_CUSTOMER_TEMPLATE,
+        verifyOnWhatsApp: true,
+    },
     // Bu tutarın altındaki belgeleri bildirme (0 = hepsi).
     minAmount: 0,
     // Aynı taramada birden çok belge çıkarsa TEK mesajda topla (mesaj yağmuru olmasın).
@@ -241,6 +284,8 @@ function loadAll() {
     if (raw && typeof raw === 'object') {
         config = { ...DEFAULT_CONFIG, ...raw, types: { ...DEFAULT_CONFIG.types, ...(raw.types || {}) } };
         config.days = normalizeDays(raw.days);
+        config.customer = { ...DEFAULT_CONFIG.customer, ...(raw.customer || {}) };
+        config.customer.days = normalizeDays(config.customer.days, DEFAULT_CONFIG.customer.days);
     }
     const sk = readJson(SENT_PATH, null);
     if (sk && typeof sk === 'object') sentKeys = sk;
@@ -271,7 +316,7 @@ function pushLog(entry) {
 
 // ─── Yardımcılar ──────────────────────────────────────────────────────────────
 // "7, 3, 1" / [7,3,1] / "3" → [1,3,7] (küçükten büyüğe, tekil, 0..365)
-function normalizeDays(raw) {
+function normalizeDays(raw, fallback = DEFAULT_CONFIG.days) {
     const arr = Array.isArray(raw) ? raw : String(raw == null ? '' : raw).split(/[,;\s]+/);
     const out = [];
     for (const v of arr) {
@@ -279,7 +324,7 @@ function normalizeDays(raw) {
         if (Number.isFinite(n) && n >= 0 && n <= 365 && !out.includes(n)) out.push(n);
     }
     out.sort((a, b) => a - b);
-    return out.length ? out : [...DEFAULT_CONFIG.days].sort((a, b) => a - b);
+    return out.length ? out : [...fallback].sort((a, b) => a - b);
 }
 
 const prefix = () => (config.firmaNo && config.donemNo ? `F${config.firmaNo}D${config.donemNo}` : null);
@@ -347,6 +392,7 @@ function renderTemplate(tpl, vars) {
         .replace(/\{toplam\}/gi, vars.toplam || '')
         .replace(/\{fisno\}/gi, vars.fisno || '')
         .replace(/\{firmaadi\}/gi, vars.firmaadi || '')
+        .replace(/\{liste\}/gi, vars.liste || '')
         .replace(/ ?\(\s*\)/g, '')
         .replace(/\n+\s*$/, '');
 }
@@ -359,7 +405,15 @@ const scanOpts = () => ({
     direction: config.direction,
     visaOnlyTaksit: config.visaOnlyTaksit !== false,
     visaRule: visaRule(),
+    status: config.onlyPortfoy !== false ? 'portfoy' : null,
 });
+// Müşteri kanalı: yalnız alınan çek/senet, tahsil edilmiş ve iade hariç.
+const customerScanOpts = () => ({
+    types: { cek: true, senet: true },
+    direction: 'alinan',
+    status: 'acik',
+});
+const customerOn = () => !!(config.customer && config.customer.enabled);
 
 async function tableExists(pool, name) {
     const r = pool.request();
@@ -423,8 +477,9 @@ async function buildQuery(pool, opts) {
             const branches = [{ kural: 0 }];
             if (t.id === 'visa' && opts.visaRule) branches.push({ kural: 1 });
             for (const br of branches) {
-                const extra = t.id === 'visa'
-                    ? visaFilter(opts.visaOnlyTaksit !== false, br.kural === 1).replace('{DOC}', full) : '';
+                const extra = (t.id === 'visa'
+                    ? visaFilter(opts.visaOnlyTaksit !== false, br.kural === 1).replace('{DOC}', full) : '')
+                    + statusFilter(t.id, opts.status);
                 const window = br.kural
                     ? 'd.ISLEMTARIHI >= CAST(@if AS date) AND d.ISLEMTARIHI < DATEADD(day, 1, CAST(@it AS date))'
                     : 'h.VADE >= CAST(@f AS date) AND h.VADE < DATEADD(day, 1, CAST(@t AS date))';
@@ -539,6 +594,8 @@ function docIdentity(d) {
     return `F${config.firmaNo}:${d.yon}:${d.tur}:${d.firmano}:${no}:${d.vade}`;
 }
 const docKey = (d, esik) => `${docIdentity(d)}:${esik}`;
+// Müşteri kanalının defter anahtarı: aynı belge iç numaraya bildirilmiş olsa da müşteriye ayrıca gider.
+const custKey = (d, esik) => `${docIdentity(d)}:m${esik}`;
 // Güncellemeden önce yazılmış defter kayıtları da saysın (geçişte ikinci mesaj gitmesin).
 // Kuralla açılan visa parçalarında yok: eski anahtarda vade olmadığından bütün taksitler
 // aynı anahtara düşer, ilki "gönderildi" diye hepsi susardı.
@@ -566,12 +623,19 @@ function pickThreshold(d) {
     return { esik: t0, alsoMark: cands.slice(1) };
 }
 
-function markSent(d, pick) {
+function markSent(d, pick, keyFn = docKey) {
     const at = new Date().toISOString();
     const vade = d.vade || null;
-    sentKeys[docKey(d, pick.esik)] = { at, vade };
-    for (const t of pick.alsoMark) sentKeys[docKey(d, t)] = { at, vade, skipped: true };
+    sentKeys[keyFn(d, pick.esik)] = { at, vade };
+    for (const t of pick.alsoMark) sentKeys[keyFn(d, t)] = { at, vade, skipped: true };
     saveSent();
+}
+
+// Müşteri kanalı için eşik seçimi — pickThreshold ile aynı mantık, ayrı eşik ve anahtar.
+function pickCustomerThreshold(d) {
+    const cands = config.customer.days.filter(t => d.kalanGun <= t);
+    if (!cands.length || sentKeys[custKey(d, cands[0])]) return null;
+    return { esik: cands[0], alsoMark: cands.slice(1) };
 }
 
 // ─── Gönderim ────────────────────────────────────────────────────────────────
@@ -729,6 +793,33 @@ async function pollOnce() {
         if (!pool || !pool.connected) throw new Error('Veritabanı bağlantısı yok.');
         pruneSent();
 
+        // İç numara turu (numara girilmemişse yalnız müşteri kanalı çalışır).
+        let note = '';
+        if (targetPhones().length) {
+            const r = await runInternal(pool);
+            sent += r.sent; queued += r.queued; skipped += r.skipped; found = r.found; due = r.due;
+            note = r.note;
+        }
+        let customer = null;
+        if (customerOn()) {
+            try { customer = await runCustomer(pool); }
+            catch (e) { customer = { sent: 0, skipped: 0, note: 'Hata: ' + e.message }; console.error('[Vade] müşteri turu hatası:', e.message); }
+        }
+        if (customer && customer.note) note = [note, `Müşteri: ${customer.note}`].filter(Boolean).join(' · ');
+        lastResult = { sent, queued, skipped, found, due, customer, note };
+    } catch (e) {
+        lastError = e.message;
+        lastResult = { sent, queued, skipped, found, due, note: 'Hata: ' + e.message };
+        console.error('[Vade] tarama hatası:', e.message);
+    } finally {
+        polling = false;
+    }
+}
+
+// İç numara(lar)a bildirim turu. Döner: { sent, queued, skipped, found, due, note }
+async function runInternal(pool) {
+    let sent = 0, queued = 0, skipped = 0, found = 0, due = 0;
+    {
         const maxDays = config.days[config.days.length - 1];
         const docs = await fetchDueDocs(pool, maxDays, scanOpts());
         found = docs.length;
@@ -749,8 +840,7 @@ async function pollOnce() {
         due = batch.length;
 
         if (!due) {
-            lastResult = { sent, queued, skipped, found, due: 0, note: bitsNote(sent, queued, skipped) || `Vadesi yaklaşan yeni belge yok (${found} belge izleniyor)` };
-            return;
+            return { sent, queued, skipped, found, due: 0, note: bitsNote(sent, queued, skipped) || `Vadesi yaklaşan yeni belge yok (${found} belge izleniyor)` };
         }
 
         const inds = [...new Set(batch.map(b => b.d.firmano).filter(v => v != null))];
@@ -796,14 +886,135 @@ async function pollOnce() {
             }
         }
 
-        lastResult = { sent, queued, skipped, found, due, note: bitsNote(sent, queued, skipped) };
-    } catch (e) {
-        lastError = e.message;
-        lastResult = { sent, queued, skipped, found, due, note: 'Hata: ' + e.message };
-        console.error('[Vade] tarama hatası:', e.message);
-    } finally {
-        polling = false;
+        return { sent, queued, skipped, found, due, note: bitsNote(sent, queued, skipped) };
     }
+}
+
+// ─── Müşteri kanalı ─────────────────────────────────────────────────────────
+// Karttaki tüm geçerli numaralar (TELEFON1/2/3…); DUR listesi ve dinlendirilen numara çıkar.
+function customerPhones(contact) {
+    if (!contact) return [];
+    const all = Array.isArray(contact.phones) && contact.phones.length ? contact.phones
+        : (contact.phone && contact.valid ? [contact.phone] : []);
+    return [...new Set(all)].filter(p =>
+        !(typeof deps.isOptedOut === 'function' && deps.isOptedOut(p)) &&
+        !(typeof deps.isSuspended === 'function' && deps.isSuspended(p)));
+}
+
+// null = gönderilebilir; aksi halde atlama sebebi.
+function customerBlock(contact) {
+    if (!contact) return 'Cari kartı bulunamadı';
+    if (contact.pasif) return 'Cari pasif';
+    if (!contact.phone || !contact.valid) return 'Geçerli telefon yok';
+    if (!customerPhones(contact).length) return 'Numaralar DUR listesinde ya da dinlendiriliyor';
+    return null;
+}
+
+// Geçici hata sayacı (bellekte): aynı müşteriye sonsuz yeniden deneme olmasın.
+const custAttempts = new Map();
+const MAX_CUSTOMER_ATTEMPTS = 5;
+const MAX_CUSTOMERS_PER_POLL = 15;
+
+// Hedef numaraların hepsine sırayla gönderir; en az biri giderse başarılı.
+// { ok, phones } | { ok:false, transient, error }
+async function sendToCustomer(contact, text) {
+    const phones = customerPhones(contact);
+    const sentTo = [], errors = [];
+    let transient = false;
+    for (const phone of phones) {
+        if (sentTo.length || errors.length) await sleep(rand(2000, 5000));
+        if (config.customer.verifyOnWhatsApp !== false && typeof deps.checkOnWhatsApp === 'function') {
+            const chk = await deps.checkOnWhatsApp(phone);
+            if (!chk.exists) {
+                if (chk.transient) transient = true;
+                errors.push(`${phone}: ${chk.transient ? 'WhatsApp doğrulaması geçici hata' : 'WhatsApp kullanıcısı değil'}`);
+                continue;
+            }
+        }
+        const res = await deps.waSend(phone, text, null, { simulateTyping: true, typingMs: rand(1200, 2400), channel: 'vade' });
+        if (res.success) sentTo.push(phone);
+        else { transient = true; errors.push(`${phone}: ${res.error || 'Gönderilemedi'}`); }
+    }
+    if (sentTo.length) return { ok: true, phones: sentTo, error: errors.length ? errors.join(' • ') : undefined };
+    return { ok: false, transient, error: errors.join(' • ') || 'Gönderilemedi' };
+}
+
+// Müşteri hatırlatma turu. Döner: { sent, skipped, found, due, note }
+async function runCustomer(pool) {
+    let sent = 0, skipped = 0, stopReason = null;
+    if (antiban.inQuietHours()) return { sent, skipped, note: antiban.quietReason() };
+
+    const days = config.customer.days;
+    const docs = await fetchDueDocs(pool, days[days.length - 1], customerScanOpts());
+    const groups = new Map();                       // cari IND → [{ d, pick }]
+    for (const d of docs) {
+        const pick = pickCustomerThreshold(d);
+        if (!pick) continue;
+        if (d.tutar < (config.minAmount || 0)) { markSent(d, pick, custKey); continue; }
+        if (!groups.has(d.firmano)) groups.set(d.firmano, []);
+        groups.get(d.firmano).push({ d, pick });
+    }
+    const due = groups.size;
+    if (!due) return { sent, skipped, found: docs.length, due, note: '' };
+
+    let contacts = new Map();
+    try { contacts = await deps.resolveCariContacts(config.firmaNo, [...groups.keys()]); }
+    catch (e) { console.error('[Vade] müşteri carisi çözümlenemedi:', e.message); return { sent, skipped, note: 'Cari okunamadı' }; }
+    const bizFirma = await getBizFirma();
+
+    let n = 0;
+    for (const [ind, items] of groups) {
+        if (n++ >= MAX_CUSTOMERS_PER_POLL) break;   // kalanlar sonraki turda
+        if (!deps.waStatus().ready) { stopReason = 'WhatsApp bağlı değil'; break; }
+        const g = gateSend('vade');
+        if (!g.ok) { stopReason = g.reason; break; }
+
+        const contact = contacts.get(ind) || null;
+        const markAll = () => items.forEach(x => markSent(x.d, x.pick, custKey));
+        const first = items[0].d;
+        const base = docVars(first, bizFirma, contact);
+        const toplam = items.reduce((s, x) => s + x.d.tutar, 0);
+        const logBase = {
+            key: `vade:m:${ind}`, kind: 'customer', hedef: 'musteri',
+            firma: base.firma, kod: base.kod, tur: [...new Set(items.map(x => x.d.turAdi))].join(' + '),
+            tutar: fmtAmount(toplam), kalan: base.kalan,
+            evrak: items.map(x => x.d.belgeno).filter(Boolean).join(', '),
+        };
+
+        const block = customerBlock(contact);
+        if (block) { markAll(); skipped++; pushLog({ ...logBase, status: 'skipped', error: block }); continue; }
+
+        const liste = items.map(x => renderTemplate(CUSTOMER_LINE, docVars(x.d, bizFirma, contact)).replace(/ {2,}/g, ' ')).join('\n');
+        const text = renderTemplate(config.customer.template || DEFAULT_CUSTOMER_TEMPLATE, {
+            ...base, liste, adet: items.length, toplam: fmtAmount(toplam),
+        });
+        const res = await sendToCustomer(contact, text);
+        const attemptKey = `${ind}:${items.map(x => custKey(x.d, x.pick.esik)).join('|')}`;
+        if (res.ok) {
+            markAll(); sent++; custAttempts.delete(attemptKey);
+            pushLog({ ...logBase, phone: res.phones.join(', '), status: 'sent', message: text, error: res.error });
+        } else if (res.transient) {
+            const a = (custAttempts.get(attemptKey) || 0) + 1;
+            custAttempts.set(attemptKey, a);
+            skipped++;
+            if (a >= MAX_CUSTOMER_ATTEMPTS) {
+                markAll(); custAttempts.delete(attemptKey);
+                pushLog({ ...logBase, status: 'failed', error: `${res.error} (${a} deneme sonrası vazgeçildi)` });
+            } else {
+                pushLog({ ...logBase, status: 'failed', error: `${res.error} — tekrar denenecek` });
+            }
+            if (!deps.waStatus().ready) { stopReason = 'WhatsApp bağlantısı koptu'; break; }
+        } else {
+            markAll(); skipped++;
+            pushLog({ ...logBase, status: 'skipped', error: res.error });
+        }
+        await sleep(rand(8000, 20000));
+    }
+    const bits = [];
+    if (sent) bits.push(`${sent} müşteriye gitti`);
+    if (skipped) bits.push(`${skipped} atlandı`);
+    if (stopReason) bits.push(`durdu: ${stopReason}`);
+    return { sent, skipped, found: docs.length, due, note: bits.join(', ') };
 }
 
 function bitsNote(sent, queued, skipped) {
@@ -817,9 +1028,9 @@ function bitsNote(sent, queued, skipped) {
 // ─── Yaşam döngüsü ────────────────────────────────────────────────────────────
 function start() {
     if (!config.firmaNo || !config.donemNo) { lastError = 'Firma/dönem seçilmemiş.'; return false; }
-    if (!targetPhones().length) { lastError = 'Geçerli bildirim numarası yok.'; return false; }
+    if (!targetPhones().length && !customerOn()) { lastError = 'Geçerli bildirim numarası yok.'; return false; }
     if (!config.days.length) { lastError = 'Kalan gün eşiği girilmemiş.'; return false; }
-    if (!Object.values(activeTypes()).some(Boolean)) { lastError = 'En az bir belge tipi seçin (çek/senet/visa).'; return false; }
+    if (targetPhones().length && !Object.values(activeTypes()).some(Boolean)) { lastError = 'En az bir belge tipi seçin (çek/senet/visa).'; return false; }
     stop();
     running = true;
     config.enabled = true;
@@ -827,7 +1038,7 @@ function start() {
     const ms = Math.max(60, config.intervalSec || 900) * 1000;
     pollOnce();
     timer = setInterval(pollOnce, ms);
-    console.log(`[Vade] başlatıldı → ${prefix()} • eşik ${config.days.join(',')} gün • ${targetPhones().join(', ')}`);
+    console.log(`[Vade] başlatıldı → ${prefix()} • eşik ${config.days.join(',')} gün • ${targetPhones().join(', ') || 'iç numara yok'}${customerOn() ? ` • müşteri ${config.customer.days.join(',')} gün` : ''}`);
     return true;
 }
 
@@ -839,7 +1050,7 @@ function stop() {
 }
 
 function autoStart() {
-    if (config.enabled && config.firmaNo && config.donemNo && targetPhones().length) start();
+    if (config.enabled && config.firmaNo && config.donemNo && (targetPhones().length || customerOn())) start();
 }
 
 function getConfig() { return { ...config }; }
@@ -848,6 +1059,11 @@ function setConfig(patch) {
     const next = { ...config, ...patch };
     if (patch && patch.types) next.types = { ...config.types, ...patch.types };
     if (patch && patch.days !== undefined) next.days = normalizeDays(patch.days);
+    if (patch && patch.customer) {
+        next.customer = { ...config.customer, ...patch.customer };
+        next.customer.days = normalizeDays(next.customer.days, DEFAULT_CONFIG.customer.days);
+        if (!String(next.customer.template || '').trim()) next.customer.template = DEFAULT_CUSTOMER_TEMPLATE;
+    }
     // Kural alanları UI'dan metin gelir: boş = kural yok (null), aralık boşsa 30.
     if (patch && 'visaRuleFirst' in patch) {
         const v = parseInt(patch.visaRuleFirst, 10);
@@ -873,6 +1089,12 @@ function getStatus() {
         visaRuleFirst: config.visaRuleFirst,
         visaRuleEvery: config.visaRuleEvery,
         direction: config.direction,
+        onlyPortfoy: config.onlyPortfoy !== false,
+        customer: {
+            enabled: customerOn(),
+            days: config.customer.days,
+            template: config.customer.template || DEFAULT_CUSTOMER_TEMPLATE,
+        },
         minAmount: config.minAmount || 0,
         groupMessages: config.groupMessages !== false,
         sendFromHour: config.sendFromHour, sendToHour: config.sendToHour,
@@ -903,22 +1125,32 @@ async function listUpcoming(days) {
     const pool = deps.getPool();
     if (!pool || !pool.connected) throw new Error('Veritabanı bağlantısı yok.');
     const maxDays = Math.min(365, Math.max(1, parseInt(days, 10) || 30));
-    const docs = await fetchDueDocs(pool, maxDays, scanOpts());
-    const inds = [...new Set(docs.map(d => d.firmano).filter(v => v != null))];
+    // İç liste + (açıksa) müşteri listesi; hedef alanı hangisi olduğunu söyler.
+    const lists = [];
+    if (targetPhones().length || !customerOn()) {
+        lists.push({ hedef: 'ic', docs: await fetchDueDocs(pool, maxDays, scanOpts()), sentFn: (d) => config.days.some(t => wasSent(d, t)) });
+    }
+    if (customerOn()) {
+        lists.push({ hedef: 'musteri', docs: await fetchDueDocs(pool, maxDays, customerScanOpts()), sentFn: (d) => config.customer.days.some(t => !!sentKeys[custKey(d, t)]) });
+    }
+    const inds = [...new Set(lists.flatMap(l => l.docs.map(d => d.firmano)).filter(v => v != null))];
     let contacts = new Map();
     try { contacts = await deps.resolveCariContacts(config.firmaNo, inds); }
     catch { /* isimsiz göster */ }
-    return docs.map(d => {
+    const out = [];
+    for (const l of lists) for (const d of l.docs) {
         const c = contacts.get(d.firmano) || {};
-        return {
+        out.push({
+            hedef: l.hedef,
             tur: d.tur, turAdi: d.turAdi, yon: d.yon, yonAdi: d.yonAdi,
             belgeno: d.belgeno, banka: d.ek, taksit: d.taksit, taksitStr: taksitLabel(d), kural: !!d.kural,
             firma: c.firma || c.name || String(d.firmano), kod: c.kod || '',
             vade: d.vade, vadeStr: trDate(d.vade), kalanGun: d.kalanGun, kalan: kalanLabel(d.kalanGun),
             tutar: d.tutar, tutarStr: fmtAmount(d.tutar),
-            bildirildi: config.days.some(t => wasSent(d, t)),
-        };
-    });
+            bildirildi: l.sentFn(d),
+        });
+    }
+    return out;
 }
 
 // UI önizleme: seçili dönemdeki kart satışlarının dökümü — visa neden gelmiyor sorusunun

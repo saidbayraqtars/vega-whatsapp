@@ -1473,11 +1473,19 @@ app.get('/api/vade', (req, res) => {
 
 app.post('/api/vade', (req, res) => {
     const allowed = ['firmaNo', 'donemNo', 'phone', 'days', 'types', 'visaOnlyTaksit', 'visaRuleFirst', 'visaRuleEvery',
-        'direction', 'minAmount',
+        'direction', 'minAmount', 'onlyPortfoy',
         'groupMessages', 'sendFromHour', 'sendToHour', 'intervalSec', 'respectSendWindow',
         'simulateTyping', 'template', 'headerTemplate', 'lineTemplate'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    // Müşteri kanalı: yalnız bilinen alanlar.
+    const c = req.body && req.body.customer;
+    if (c && typeof c === 'object') {
+        patch.customer = {};
+        if ('enabled' in c) patch.customer.enabled = !!c.enabled;
+        if ('days' in c) patch.customer.days = c.days;
+        if ('template' in c) patch.customer.template = String(c.template || '');
+    }
     vade.setConfig(patch);
     // Defter firma/dönem değişince SİLİNMEZ: anahtar belgenin doğal kimliğidir (firma+cari+
     // belge no+vade), dönemden bağımsız. Eskiden silinirdi ve önizle/test/kaydet her
@@ -3416,14 +3424,18 @@ siparis.configure({
     buildSiparisContentText,
 });
 
-// Vade takip: çek / senet / vadeli visa vadesine X gün kala TEK sabit numaraya haber ver.
+// Vade takip: çek / senet / vadeli visa vadesine X gün kala sabit numaraya haber ver;
+// istenirse alınan çek/senedi müşteriye de hatırlat (cari kartındaki numaralar).
 // (Vade cari giriş/çıkış fişinin ödeme satırındadır — TBLCAR{GIR|CIK}HAREKET.VADE.)
 vade.configure({
     getPool: () => pool,
     sql,
     resolveCariContacts,
     waSend: waSendX,
+    checkOnWhatsApp: waCheckX,
     waStatus: waStatusX,
+    isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
+    isOptedOut: (phone) => { try { return optout.has(phone); } catch { return false; } },
     gate: (ch) => gateX(ch, null),
     recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
     baseDir,

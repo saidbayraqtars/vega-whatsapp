@@ -61,11 +61,10 @@ function buildExtrePdf(data = {}) {
             const rows = Array.isArray(data.rows) ? data.rows : [];
             const firma = data.firma || {};
 
-            // ─── Marka başlık (logo + firma bilgileri) ───
-            // Logo varsa sol üstte; firma adı + iletişim/vergi/IBAN bilgileri yanında.
-            // headerNameOnly (Firma Bilgileri'nde işaretlenir): yalnız logo + firma adı.
-            // Meşeliler 2026-10-06: "WhatsApp'a giden ekstrede adres/VKN olmasın".
-            const yalnizAd = firma.headerNameOnly === true;
+            // ─── Marka başlık (logo + firma adı) ───
+            // Logo varsa sol üstte, firma adı yanında. Başka bilgi YAZILMAZ: adres, telefon,
+            // vergi ve IBAN 2026-10-23'ten beri başlıkta yok (önce Meşeliler 10-06'da seçenek
+            // olarak istedi, sonra Said hepsi için kaldırdı).
             let logoW = 0;
             const headTop = 38;
             if (data.logo) {
@@ -73,24 +72,9 @@ function buildExtrePdf(data = {}) {
                 catch { logoW = 0; }
             }
             const infoX = X0 + logoW;
-            const infoW = X1 - infoX;
+            const infoW = X1 - 170 - infoX;   // sağ üstteki "HESAP EKSTRESİ" etiketiyle çakışmasın
             doc.font(BOLD).fontSize(15).fillColor('#111')
                 .text(firma.name || data.firmaName || 'HESAP EKSTRESİ', infoX, headTop, { width: infoW });
-            doc.font(REG).fontSize(8.5).fillColor('#555');
-            const line2 = yalnizAd ? '' : [firma.address].filter(Boolean).join('');
-            if (line2) doc.text(line2, infoX, doc.y + 1, { width: infoW });
-            const line3 = yalnizAd ? '' : [
-                firma.phone ? `Tel: ${firma.phone}` : null,
-                firma.email || null,
-                firma.web || null,
-            ].filter(Boolean).join('   ');
-            if (line3) doc.text(line3, infoX, doc.y + 1, { width: infoW });
-            const line4 = yalnizAd ? '' : [
-                firma.taxOffice ? `V.D.: ${firma.taxOffice}` : null,
-                firma.taxNo ? `VKN/TCKN: ${firma.taxNo}` : null,
-            ].filter(Boolean).join('   ');
-            if (line4) doc.text(line4, infoX, doc.y + 1, { width: infoW });
-            if (firma.iban && !yalnizAd) doc.text(`IBAN: ${firma.iban}`, infoX, doc.y + 1, { width: infoW });
 
             // Sağ üst köşe: belge tipi etiketi
             doc.font(BOLD).fontSize(10).fillColor('#888')
@@ -188,6 +172,9 @@ function buildExtrePdf(data = {}) {
             }
 
             // ─── Dipnot ───
+            // Dipnot alt kenar boşluğunun içinde (y=812 > 842-40); boşluk sıfırlanmazsa pdfkit
+            // metni yeni sayfaya taşır ve her ekstre boş bir 2. sayfayla gider.
+            doc.page.margins.bottom = 0;
             doc.font(REG).fontSize(7.5).fillColor('#999')
                 .text('Bu ekstre bilgilendirme amaçlıdır. + Borç / − Alacak (sizin bize borcunuz pozitiftir).', X0, PAGE_BOTTOM + 12, { width: X1 - X0, align: 'center' });
 

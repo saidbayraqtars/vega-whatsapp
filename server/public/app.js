@@ -302,6 +302,7 @@ const TPL_FIELDS = {
     '{gun}': ['Kalan gün', '3'],
     '{adet}': ['Belge sayısı', '4'],
     '{toplam}': ['Toplam tutar', '85.000,00'],
+    '{liste}': ['Belge listesi', '• Çek 1234567 — Vade: ' + SAMPLE_TODAY + ' (3 gün kaldı) — 125.000,00 TL'],
 };
 
 function renderSample(text, overrides) {
@@ -2065,6 +2066,16 @@ async function loadVadeConfig() {
         ],
     });
     mountTemplateEditor($('vd_lineTemplate'), VD_FIELDS, VD_OPTS);
+    $('vd_portfoy').checked = s.onlyPortfoy !== false;
+    $('vd_cust').checked = s.customer?.enabled === true;
+    $('vd_cust').onchange = () => { $('vd_custBox').style.display = $('vd_cust').checked ? '' : 'none'; };
+    $('vd_cust').onchange();
+    $('vd_custDays').value = (s.customer?.days || [3]).join(', ');
+    $('vd_custTemplate').value = s.customer?.template || '';
+    mountTemplateEditor($('vd_custTemplate'), ['{firma}', '{liste}', '{tur}', '{belgeno}', '{vade}', '{kalan}', '{tutar}', '{adet}', '{toplam}', '{firmaadi}'], {
+        caption: 'Müşteri böyle görecek', labels: { '{kalan}': 'Kalan süre' },
+        overrides: { '{kalan}': '3 gün kaldı', '{firma}': 'ÖRNEK MÜŞTERİ A.Ş.', '{tutar}': '125.000,00' },
+    });
     $('vd_fromHour').value = s.sendFromHour ?? 9;
     $('vd_toHour').value = s.sendToHour ?? 20;
     $('vd_interval').value = s.intervalSec || 900;
@@ -2077,7 +2088,7 @@ function renderVadeState(s) {
     const on = s.running;
     $('vdDot').className = 'dot ' + (on ? 'on' : '');
     const kinds = [s.types?.cek && 'çek', s.types?.senet && 'senet', s.types?.visa && 'visa', s.types?.taksit && 'taksit'].filter(Boolean).join(', ');
-    $('vdState').textContent = on ? `Açık · ${(s.days || []).join(', ')} gün kala · ${kinds}` : 'Kapalı';
+    $('vdState').textContent = on ? `Açık · ${(s.days || []).join(', ')} gün kala · ${kinds}${s.customer?.enabled ? ' · müşteriye' : ''}` : 'Kapalı';
     $('vd_save').textContent = on ? 'Kaydet' : 'Kaydet ve Başlat';
     $('vd_stop').style.display = on ? '' : 'none';
     const parts = [];
@@ -2106,6 +2117,12 @@ function collectVadeConfig() {
         visaRuleFirst: $('vd_ruleFirst').value.trim(),
         visaRuleEvery: $('vd_ruleEvery').value.trim(),
         direction: $('vd_direction').value,
+        onlyPortfoy: $('vd_portfoy').checked,
+        customer: {
+            enabled: $('vd_cust').checked,
+            days: $('vd_custDays').value,
+            template: $('vd_custTemplate').value,
+        },
         minAmount: Math.max(0, +$('vd_min').value || 0),
         groupMessages: $('vd_group').checked,
         template: $('vd_template').value,
@@ -2121,10 +2138,12 @@ function collectVadeConfig() {
 
 function vadeValidate(cfg) {
     if (!cfg.firmaNo || !cfg.donemNo) return 'Sayfanın üstünden firma ve dönem seçin.';
-    if (!cfg.phone) return 'Haber verilecek numarayı girin.';
+    if (!cfg.phone && !cfg.customer.enabled) return 'Haber verilecek numarayı girin.';
     if (!/\d/.test(cfg.days)) return 'Kaç gün kala haber verileceğini girin (ör. 3, 0).';
-    if (!Object.values(cfg.types).some(Boolean)) return 'Çek, senet veya visadan en az birini seçin.';
-    if (!cfg.template.trim()) return 'Mesaj boş olamaz.';
+    if (cfg.phone && !Object.values(cfg.types).some(Boolean)) return 'Çek, senet veya visadan en az birini seçin.';
+    if (cfg.phone && !cfg.template.trim()) return 'Mesaj boş olamaz.';
+    if (cfg.customer.enabled && !/\d/.test(cfg.customer.days)) return 'Müşteriye kaç gün kala gideceğini girin (ör. 3).';
+    if (cfg.customer.enabled && !cfg.customer.template.trim()) return 'Müşteri mesajı boş olamaz.';
     return '';
 }
 
@@ -2185,6 +2204,7 @@ $('vd_preview').onclick = async () => {
                         <span class="muted">${esc(d.yonAdi)}</span>
                         — ${esc(d.firma)} <b>${esc(d.tutarStr)} TL</b>
                         <span class="muted">(${esc(d.vadeStr || '')})</span>
+                        ${d.hedef === 'musteri' ? '<span class="muted">· müşteriye</span>' : ''}
                     </span>
                     <span class="st ${d.bildirildi ? 'sent' : 'info'}">${d.bildirildi ? 'Bildirildi' : 'Bekliyor'}</span>
                 </div>`).join('');
@@ -2222,6 +2242,7 @@ async function refreshVadeLog() {
         box.innerHTML = r.log.map((e, i) => `
             <div class="logline">
                 <span>${esc(e.firma || '')}
+                    ${e.hedef === 'musteri' ? '<span class="muted">· müşteriye</span>' : ''}
                     ${e.tur ? `<span class="muted">${esc(e.tur)}</span>` : ''}
                     ${e.tutar ? `<b>${esc(e.tutar)} TL</b>` : ''}
                     ${e.kalan ? `<span class="muted">— ${esc(e.kalan)}</span>` : ''}
@@ -3432,15 +3453,7 @@ async function loadFirmaInfo() {
     if (!r.success) return;
     const i = r.info || {};
     $('fi_name').value = i.name || '';
-    $('fi_phone').value = i.phone || '';
-    $('fi_email').value = i.email || '';
-    $('fi_web').value = i.web || '';
-    $('fi_address').value = i.address || '';
-    $('fi_taxOffice').value = i.taxOffice || '';
-    $('fi_taxNo').value = i.taxNo || '';
-    $('fi_iban').value = i.iban || '';
     $('fi_legal').value = i.legalTerms || '';
-    $('fi_headerNameOnly').checked = i.headerNameOnly === true;
     renderFirmaLogo(r.hasLogo, firmaNo);
 }
 
@@ -3458,15 +3471,7 @@ async function saveFirmaInfo() {
     const body = {
         firmaNo: $('fi_firma').value,
         name: $('fi_name').value.trim(),
-        phone: $('fi_phone').value.trim(),
-        email: $('fi_email').value.trim(),
-        web: $('fi_web').value.trim(),
-        address: $('fi_address').value.trim(),
-        taxOffice: $('fi_taxOffice').value.trim(),
-        taxNo: $('fi_taxNo').value.trim(),
-        iban: $('fi_iban').value.trim(),
         legalTerms: $('fi_legal').value.trim(),
-        headerNameOnly: $('fi_headerNameOnly').checked,
     };
     const r = await api('/firma/info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     if (r.success) {

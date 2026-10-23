@@ -255,6 +255,20 @@
                         <label>Mesaj</label>
                         <textarea id="vd_template" style="min-height:90px"></textarea>
                     </div>
+                    <label class="check"><input type="checkbox" id="vd_cust" /> Alınan çek/senedi müşteriye de hatırlat</label>
+                    <div id="vd_custBox" style="display:none">
+                        <div class="row">
+                            <div class="field" style="flex:.6">
+                                <label>Müşteriye kaç gün kala?</label>
+                                <input id="vd_custDays" placeholder="3" />
+                                <div class="hint">Karttaki tüm numaralara (Tel 1/2/3)</div>
+                            </div>
+                        </div>
+                        <div class="field">
+                            <label>Müşteriye giden mesaj</label>
+                            <textarea id="vd_custTemplate" style="min-height:110px"></textarea>
+                        </div>
+                    </div>
 
                     <details class="adv">
                         <summary>Gelişmiş</summary>
@@ -269,6 +283,7 @@
                             </div>
                             <div class="field" style="flex:.6"><label>Alt tutar sınırı (TL)</label><input id="vd_min" type="number" min="0" value="0" /></div>
                         </div>
+                        <label class="check"><input type="checkbox" id="vd_portfoy" checked /> Çek/senette yalnız portföydekileri bildir (takas, ciro, tahsil, iade hariç)</label>
                         <label class="check"><input type="checkbox" id="vd_t_taksit" /> Taksit belgelerini de izle</label>
                         <label class="check"><input type="checkbox" id="vd_visaTaksit" checked /> Visa'da yalnız taksitli işlemleri al (peşin kart çekimini alma)</label>
                         <div class="field" style="margin-top:8px">
@@ -703,28 +718,14 @@
         <!-- ─── FİRMA BİLGİLERİ ─── -->
         <div class="wrap" id="viewFirma" style="display:none">
             <div class="card">
-                <p class="sub" style="margin-top:0">Hesap ekstresinin başlığında görünür. Vega'dan otomatik gelir, düzeltebilirsiniz.</p>
+                <p class="sub" style="margin-top:0">Hesap ekstresinin başlığında yalnız firma adı (ve logo) görünür. Vega'dan otomatik gelir, düzeltebilirsiniz.</p>
 
                 <div class="toolbar"><select id="fi_firma"></select></div>
 
                 <div class="field"><label>Firma adı</label><input id="fi_name" placeholder="Örn. Arc Teknik" /></div>
-                <div class="row">
-                    <div class="field"><label>Telefon</label><input id="fi_phone" placeholder="05xx..." /></div>
-                    <div class="field"><label>E-posta</label><input id="fi_email" placeholder="info@..." /></div>
-                </div>
-                <div class="row">
-                    <div class="field"><label>Web sitesi</label><input id="fi_web" placeholder="www..." /></div>
-                    <div class="field"><label>Adres</label><input id="fi_address" placeholder="Mah. Cad. No..." /></div>
-                </div>
-                <label class="check"><input type="checkbox" id="fi_headerNameOnly" /> Ekstre başlığında yalnız firma adı (adres, telefon, vergi ve IBAN yazılmaz)</label>
 
                 <details class="adv">
-                    <summary>Fatura bilgileri ve yasal metin</summary>
-                    <div class="row">
-                        <div class="field"><label>Vergi dairesi</label><input id="fi_taxOffice" placeholder="Örn: Merkez V.D." /></div>
-                        <div class="field"><label>Vergi / TC no</label><input id="fi_taxNo" placeholder="1234567890" /></div>
-                    </div>
-                    <div class="field"><label>IBAN</label><input id="fi_iban" placeholder="TR.. .... ...." /></div>
+                    <summary>Yasal metin</summary>
                     <div class="field"><label>Ekstre altı yasal metin</label><textarea id="fi_legal" rows="4" placeholder="Örn. Bu ekstre bilgilendirme amaçlıdır..."></textarea></div>
                 </details>
 
