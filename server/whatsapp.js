@@ -179,6 +179,11 @@ function createSession({ id, authDir, label = '' }) {
     let openHandler = null;
     // Oturumun SUNUCU tarafından iptal edildiğini üst katmana bildir (bkz. sessionRevoked).
     let revokedHandler = null;
+    // WhatsApp "yeni sohbet başlatma kısıtı" (reachout timelock) — yalnız Baileys 7 bildirir.
+    // Hesap bağlı kalır, eski sohbetlere yazabilir ama yeni kişiye mesaj atamaz; atmaya devam
+    // etmek kısıtı uzatır ve ban'a gider. accounts.js anti-ban soğumasına bağlar.
+    let restrictedHandler = null;
+    let reachoutLock = null;   // { until, type } | null
 
     const waEvent = (line) => waEventRaw(`[${id}] ${line}`);
 
@@ -317,6 +322,7 @@ function createSession({ id, authDir, label = '' }) {
         forbidden: (() => { const f = forbiddenActive(); return f ? { at: f.at, until: Number(f.at) + FORBIDDEN_HOLD_MS } : null; })(),
         daySent: getDailySent(),
         engine: sockEngine || engine,
+        restricted: reachoutLock && reachoutLock.until > Date.now() ? reachoutLock : null,
     });
 
     // Diskteki oturumda bağlı bir kimlik var mı? (creds.json → me.id) Baileys QR
@@ -371,11 +377,17 @@ function createSession({ id, authDir, label = '' }) {
                 lib = await loadBaileys(eng);
             }
             sockEngine = eng;
-            const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = lib;
+            const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = lib;
 
             ensureDir(AUTH_DIR);
             prepareAuthForEngine(AUTH_DIR, eng, waEvent);
             const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+            // Baileys 7: LID eşleme + LID oturumları her gönderimde anahtar deposuna çok sayıda
+            // okuma yapar; çok-dosyalı depo her okumada diske gider. Baileys'in önerdiği bellek
+            // önbelleği (yazma yine diske). 6.7 davranışı değişmesin diye yalnız v7'de.
+            const auth = eng === 'v7' && typeof makeCacheableSignalKeyStore === 'function'
+                ? { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, makeLogger()) }
+                : state;
 
             let version;
             try {
@@ -391,7 +403,7 @@ function createSession({ id, authDir, label = '' }) {
             sock = makeWASocket({
                 logger: makeLogger(),
                 printQRInTerminal: false,
-                auth: state,
+                auth,
                 version,
                 connectTimeoutMs: 60_000,
                 defaultQueryTimeoutMs: 60_000,
@@ -424,7 +436,11 @@ function createSession({ id, authDir, label = '' }) {
             sock.ev.on('messages.update', (updates) => {
                 for (const u of (updates || [])) {
                     if (u?.key?.fromMe && u?.update && u.update.status != null) {
-                        waEvent(`ack id=${u.key.id} to=${u.key.remoteJid} status=${u.update.status}`);
+                        // status=0 (ERROR): Baileys 7 sunucunun hata kodunu messageStubParameters'a koyar
+                        // (463 = hesap kısıtlı / gizlilik jetonu yok, 479 = adresleme reddi).
+                        const err = u.update.status === 0 && Array.isArray(u.update.messageStubParameters)
+                            ? ` err=${u.update.messageStubParameters.join('|')}` : '';
+                        waEvent(`ack id=${u.key.id} to=${u.key.remoteJid} status=${u.update.status}${err}`);
                         // Güven paneli: teslim (3) / okundu (4) sayımı.
                         try { stats.onAck(u.key.id, u.update.status); } catch { /* yok say */ }
                     }
@@ -476,6 +492,20 @@ function createSession({ id, authDir, label = '' }) {
 
             sock.ev.on('connection.update', (update) => {
                 const { connection, lastDisconnect, qr } = update;
+
+                // Baileys 7: yeni sohbet kısıtı başladı/kalktı. Bitiş zamanı yoksa WA Web gibi +60 sn.
+                if (update.reachoutTimeLock) {
+                    const r = update.reachoutTimeLock;
+                    if (r.isActive) {
+                        const t = r.timeEnforcementEnds ? new Date(r.timeEnforcementEnds).getTime() : NaN;
+                        reachoutLock = { until: Number.isFinite(t) ? t : Date.now() + 60_000, type: r.enforcementType || null };
+                        waEvent(`reachout-timelock active until=${new Date(reachoutLock.until).toISOString()} type=${reachoutLock.type || ''}`);
+                        try { restrictedHandler && restrictedHandler(meId || credsIdentity(), reachoutLock.until); } catch { /* yok say */ }
+                    } else {
+                        reachoutLock = null;
+                        waEvent('reachout-timelock lifted');
+                    }
+                }
 
                 if (qr) {
                     // Diskte BAĞLI bir kimlik dururken QR isteniyorsa oturumu biz
@@ -837,6 +867,7 @@ function createSession({ id, authDir, label = '' }) {
         setDisconnectHandler: (fn) => { disconnectHandler = fn; },
         setOpenHandler: (fn) => { openHandler = fn; },
         setRevokedHandler: (fn) => { revokedHandler = fn; },
+        setRestrictedHandler: (fn) => { restrictedHandler = fn; },
         get client() { return sock; },
     };
 }

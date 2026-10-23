@@ -82,3 +82,19 @@ test('bir numara 403 alınca aynı bilgisayardaki diğer numara 7 gün temkinli 
     t.mock.timers.tick(antiban.MACHINE_CAUTION_MS + 1000);
     assert.equal(antiban.snapshot(IKINCI).machineCaution, false);
 });
+
+test('Baileys 7 yeni sohbet kısıtı: kısıt bitene kadar (en az 2 saat) gönderim durur, açılış kaldırmaz', (t) => {
+    const antiban = taze(t);
+    olgunlastir(t, antiban, OLGUN);
+    antiban.noteRestricted(OLGUN, Date.now() + 5 * 60 * 60 * 1000);
+    assert.equal(antiban.gate(OLGUN, null, 'belge').capType, 'cooldown');
+    antiban.noteOpen(OLGUN);
+    t.mock.timers.tick(5 * 60 * 60 * 1000);
+    assert.equal(antiban.gate(OLGUN, null, 'belge').capType, 'cooldown', 'kısıt sonrası 30 dk pay');
+    t.mock.timers.tick(31 * 60 * 1000);
+    assert.equal(antiban.gate(OLGUN, null, 'belge').ok, true);
+    // Bitişi hemen olan kısıt da en az 2 saat durdurur.
+    antiban.noteRestricted(IKINCI, Date.now() + 60 * 1000);
+    t.mock.timers.tick(119 * 60 * 1000);
+    assert.equal(antiban.gate(IKINCI, null, 'belge').capType, 'cooldown');
+});

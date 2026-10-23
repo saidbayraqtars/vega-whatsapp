@@ -96,6 +96,12 @@ function buildSession(meta) {
             if (r) console.warn(`[Antiban] ${meta.id}: oturum iptali — gönderim durduruldu: ${r.reason}`);
         } catch { /* yok say */ }
     });
+    s.setRestrictedHandler((accountId, until) => {
+        try {
+            const r = antiban.noteRestricted(accountId || s.getStatus().me, until);
+            if (r) console.warn(`[Antiban] ${meta.id}: ${r.reason} — gönderim ${Math.ceil(r.cooldownMs / 60000)} dk durduruldu`);
+        } catch { /* yok say */ }
+    });
     s.setOpenHandler((accountId) => {
         try {
             const r = antiban.noteOpen(accountId);

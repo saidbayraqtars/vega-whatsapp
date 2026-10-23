@@ -410,6 +410,24 @@ function noteSessionRevoked(accountId, note) {
     return { cooldownMs: COOLDOWN_REVOKED_MS, reason: acc.cooldownReason };
 }
 
+// WhatsApp hesaba "yeni sohbet başlatma kısıtı" koydu (Baileys 7 reachout timelock).
+// Hesap bağlı kalır ama yeni kişiye mesaj atamaz; denemeye devam etmek kısıtı uzatır
+// ve 403'e gider. Kısıt bitene kadar (en az RESTRICT_MIN_MS, +30 dk pay) sticky soğuma,
+// warm-up sıfırlanır: kısıt kalkınca numara yavaş ısınmalı.
+const RESTRICT_MIN_MS = 2 * 60 * 60 * 1000;
+function noteRestricted(accountId, untilMs) {
+    if (!STATE_PATH) return null;
+    const { acc } = touch(resolveAccount(accountId));
+    const now = Date.now();
+    const end = Math.max(Number(untilMs) || 0, now) + 30 * 60 * 1000;
+    acc.cooldownUntil = Math.max(acc.cooldownUntil || 0, end, now + RESTRICT_MIN_MS);
+    acc.cooldownReason = 'WhatsApp yeni sohbet kısıtı koydu';
+    acc.cooldownSticky = true;
+    acc.firstActiveDate = dayKey();
+    save();
+    return { cooldownMs: acc.cooldownUntil - now, reason: acc.cooldownReason };
+}
+
 // Oturum BAŞARIYLA açıldı. DİKKAT: bu, numaranın sağlam olduğunun kanıtı DEĞİLDİR —
 // WhatsApp flaglediği numarayı bağlamaya ve mesaj iletmeye devam ederken arka planda
 // hesabı incelemeye alabiliyor (canlı vaka için yukarıdaki nota bak). O yüzden burada
@@ -551,4 +569,4 @@ function snapshot(accountId, userDailyCap) {
     };
 }
 
-module.exports = { configure, setBypass, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, noteSessionRevoked, clearCooldown, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP, CHANNEL_LIMITS, MACHINE_CAUTION_MS };
+module.exports = { configure, setBypass, gate, recordSent, acknowledgeWarn, noteDisconnect, noteOpen, noteSessionRevoked, noteRestricted, clearCooldown, snapshot, applySpintax, getLimits, setLimits, getSendWindow, setSendWindow, inQuietHours, quietReason, WARMUP_RAMP, HOURLY_CAP, CHANNEL_LIMITS, MACHINE_CAUTION_MS };
