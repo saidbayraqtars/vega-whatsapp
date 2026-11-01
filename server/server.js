@@ -32,10 +32,10 @@ const multer = require('multer');
 const accounts = require('./accounts');
 const waStatus = () => accounts.status();
 const waSend = (phone, text, media, opts) => accounts.send(phone, text, media, opts);
-const waDelete = (phone, id) => accounts.deleteMessage(phone, id);
-const checkOnWhatsApp = (phone) => accounts.checkOnWhatsApp(phone);
+const waDelete = (phone, id, opts) => accounts.deleteMessage(phone, id, opts);
+const checkOnWhatsApp = (phone, opts) => accounts.checkOnWhatsApp(phone, opts);
 const getDailySent = () => accounts.totalDailySent();
-const waWaitForReady = (ms) => accounts.waitForReady(ms);
+const waWaitForReady = (ms, id) => accounts.waitForReady(ms, id);
 const initializeWhatsApp = () => accounts.start();
 const refreshWhatsApp = () => accounts.refreshOne('main');
 const logoutWhatsApp = () => accounts.logoutAll();
@@ -47,6 +47,9 @@ const reminders = require('./reminders');
 const shopstar = require('./shopstar');
 const activeCari = require('./activeCari');
 const aiBot = require('./aiBot');
+const profiles = require('./profiles');   // çok firma: firma profilleri (bkz. profiles.js)
+const engines = require('./engines');     // profil başına motor kümeleri (bkz. engines.js)
+const { createLines, createBotRouter } = require('./lines'); // firma → WhatsApp hattı sıkı bağlama + gelen mesaj yönlendirme (bkz. lines.js)
 const credits = require('./credits');
 const license = require('./license');
 const antiban = require('./antiban');
@@ -94,6 +97,13 @@ app.use((req, res, next) => {
         error: 'LICENSE_REQUIRED',
         license: license.getStatus(),
     });
+});
+
+// Çok firma: her /api isteği bir firma profiline bağlanır (X-Profile başlığı; başlık yoksa
+// ya da tanınmazsa varsayılan firma). Tek firmalı kurulumda hep varsayılan profildir.
+app.use('/api', (req, res, next) => {
+    try { req.profile = requestProfile(req); } catch { req.profile = null; }
+    next();
 });
 
 const isPkg = typeof process.pkg !== 'undefined';
@@ -320,9 +330,10 @@ const waStatusX = () => {
     return waStatus();
 };
 
-const waCheckX = async (phone) => {
+// opts.accountId (firmaya bağlı hat) yalnız yerel havuzda anlamlıdır; cloud/relay tek numara.
+const waCheckX = async (phone, opts) => {
     if (isCloud()) return cloudapi.checkOnWhatsApp(phone);
-    if (!isRelay()) return checkOnWhatsApp(phone);
+    if (!isRelay()) return checkOnWhatsApp(phone, opts);
     try {
         const r = await httpJson(relayUrl('/api/relay-check'), { body: { phone }, headers: relayHeaders() });
         if (r.status === 200 && r.json) return r.json;
@@ -335,8 +346,11 @@ const waSendX = async (phone, text, media = null, opts = {}) => {
     if (!isRelay()) return waSend(phone, text, media, opts);
     let m = null;
     if (media && media.buffer) m = { kind: media.kind, mimetype: media.mimetype, fileName: media.fileName, b64: Buffer.from(media.buffer).toString('base64') };
+    // Hat kimlikleri bu PC'ye özgü; ana PC'nin havuzunda anlamı yok.
+    const ropts = { ...(opts || {}) };
+    delete ropts.accountId; delete ropts.stickyScope;
     try {
-        const r = await httpJson(relayUrl('/api/relay-send'), { body: { phone, text, media: m, opts }, headers: relayHeaders() });
+        const r = await httpJson(relayUrl('/api/relay-send'), { body: { phone, text, media: m, opts: ropts }, headers: relayHeaders() });
         if (r.json) return r.json;
         return { success: false, error: `Ana PC: ${r.status}` };
     } catch (e) { return { success: false, error: 'Ana PC erişilemiyor: ' + e.message }; }
@@ -344,9 +358,9 @@ const waSendX = async (phone, text, media = null, opts = {}) => {
 
 // Mesaj geri çekme: Baileys'te var, Cloud API'de YOK (Meta desteklemiyor).
 // Watcher "belge silindi → mesajı geri çek" akışı cloud modda anlaşılır hata alır.
-const waDeleteX = async (phone, id) => {
+const waDeleteX = async (phone, id, opts) => {
     if (isCloud()) return cloudapi.deleteMessage(phone, id);
-    return waDelete(phone, id);
+    return waDelete(phone, id, opts);
 };
 
 // Anti-ban kapısı. Relay modda PC2 yerel gate/record YAPMAZ; PC1'in /api/relay-send'i
@@ -354,19 +368,78 @@ const waDeleteX = async (phone, id) => {
 // sınırı Meta'nın kademesi (1K/10K/100K per 24h) belirler.
 // Yerel modda kapı HAVUZA sorulur: numaralardan HERHANGİ BİRİ gönderebiliyorsa ok
 // (hangisinin göndereceği waSendX içinde, gönderim anında seçilir).
-const gateX = (ch, cap) => (isRelay() || isCloud()) ? { ok: true } : accounts.gate(ch, cap);
+// accountId verilirse (firmaya bağlı hat) yalnız o hesabın kapısı sorulur.
+const gateX = (ch, cap, accountId) => (isRelay() || isCloud()) ? { ok: true } : accounts.gate(ch, cap, accountId || undefined);
 // NOT: gönderim sayacı artık TEK yerde işler — yerelde accounts.send (hangi hat
 // gönderdiyse onun sayacı), relayde PC1, cloudda hiç. Çağıranlar ayrıca saymaz.
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ÇOK FİRMA: profil → WhatsApp hattı (sıkı bağlama) — kurallar lines.js başlığında.
+// ═══════════════════════════════════════════════════════════════════════════
+//  Her firma profilinin motorları ve manuel gönderimleri waFor(profilId) sarmalayıcılarından
+//  geçer: tek firmada havuz eskisi gibi, çok firmada YALNIZ profilin kendi hattı.
+const lines = createLines({
+    profiles,
+    accounts,
+    isLocalMode: () => !isCloud() && !isRelay(),
+    x: {
+        send: (phone, text, media, opts) => waSendX(phone, text, media, opts),
+        check: (phone, opts) => waCheckX(phone, opts),
+        del: (phone, id, opts) => waDeleteX(phone, id, opts),
+        gate: (ch, cap, accountId) => gateX(ch, cap, accountId),
+        waitReady: (ms, accountId) => waWaitForReady(ms, accountId),
+        status: () => waStatusX(),
+    },
+});
+const { lineOf, waFor } = lines;
+
+// Bu istek/iş hangi profilin? İstemci X-Profile başlığıyla bildirir (yoksa varsayılan).
+// Geçerli profil kimliği yoksa varsayılana (etkinse) ya da ilk etkin profile düşülür.
+function requestProfile(req) {
+    const id = (req.get && req.get('x-profile')) || (req.query && req.query.profile) || null;
+    return profiles.pick(id);
+}
+// Profilin motor kümesi (ek profilde ilk istekte kurulur).
+function enginesOf(profile) {
+    const p = profile || profiles.pick(null);
+    return engines.ensure(p);
+}
+const E = (req) => enginesOf(req.profile);
+
+// Manuel gönderimde (toplu mesaj, ekstre, açık cari) hangi profil/hat? Çok firmada
+// firma numarası belirleyicidir: başlıktaki profil firmaya uyuyorsa o, değilse o
+// firmanın etkin profili. Eşleşen yoksa null → gönderme.
+function profileForFirma(req, firmaNo) {
+    if (!profiles.isMulti()) return req.profile || profiles.pick(null);
+    const f = firmaNo != null ? String(firmaNo) : null;
+    if (!f) return req.profile || null;
+    if (req.profile && req.profile.enabled && req.profile.firmaNo === f) return req.profile;
+    return profiles.forFirma(f);
+}
+
+// e-Fatura PDF entegrasyonu tek firmanın işi (ProgramData\Vega WhatsApp\efatura tek durum
+// klasörü, tek VKN/dizayn takımı). Çok firmada hangi profile ait olduğu profildeki `efatura`
+// işaretiyle belirlenir; yoksa ilk (eski) firma.
+function integrationOwnerId() {
+    const en = profiles.enabled();
+    const flagged = en.find((p) => p.efatura);
+    if (flagged) return flagged.id;
+    const def = en.find((p) => p.isDefault);
+    return def ? def.id : (en[0] ? en[0].id : profiles.DEFAULT_ID);
+}
 
 // Relay modda otomasyonu (watcher/hatırlatma/aktif-cari) BAŞLATMA — belge bildirimi
 // + hatırlatma ana PC'nin işi; ikinci PC'de de çalışırsa çift mesaj gider.
 function startAutomationUnlessRelay() {
     if (isRelay()) { console.log('[Relay] İkinci PC (ekstre) modu — watcher/hatırlatma/aktif-cari BAŞLATILMADI (ana PC yürütür).'); return; }
-    watcher.autoStart();
-    try { siparis.autoStart(); } catch { /* yok say */ }
-    try { vade.autoStart(); } catch { /* yok say */ }
-    try { reminders.autoStart(); } catch { /* Faz 6 */ }
-    try { shopstar.autoStart(); } catch (e) { console.error('[ShopStar] otomatik baslatma:', e.message); }
+    // Etkin her firmanın motorları (tek firmada yalnız 'default' = eski tekil modüller).
+    for (const p of profiles.enabled()) {
+        try {
+            engines.ensure(p);
+            if (profiles.isExplicit()) engines.applyContext(p);
+            engines.autoStart(p);
+        } catch (e) { console.error(`[Firma ${p.id}] motorlar başlatılamadı:`, e.message); }
+    }
     try { activeCari.autoStart(); } catch { /* yok say */ }
     try { integrations.autoStart(); } catch (e) { console.error('[Entegrasyon] otomatik baslatma:', e.message); }
 }
@@ -502,9 +575,7 @@ app.post('/api/login', async (req, res) => {
 
 app.post('/api/reset', async (req, res) => {
     try {
-        watcher.stop(); // DB ayarları silinirken izleme açık kalmasın
-        try { siparis.stop(); } catch { /* yok say */ }
-        try { vade.stop(); } catch { /* yok say */ }
+        engines.stopAll(); // DB ayarları silinirken hiçbir firmanın izlemesi açık kalmasın
         if (pool) { await pool.close(); pool = null; }
         if (fs.existsSync(CONFIG_PATH)) fs.unlinkSync(CONFIG_PATH);
         res.json({ success: true });
@@ -1311,15 +1382,29 @@ app.get('/api/donemler', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 //  OTOMATİK TAHSİLAT BİLDİRİMİ (watcher)
 // ═══════════════════════════════════════════════════════════════════════════
+// Çok firmada firma/dönem profilin kendisidir (Firmalar sekmesinden değişir): ekranlardaki
+// seçici gövdede ne gönderirse göndersin, ayar o profilin firmasına yazılır. Aksi halde
+// bir ekran yanlış firmanın tablosuna ayar yazıp başka firmayı izletebilirdi.
+function lockContext(req, patch) {
+    if (profiles.isExplicit() && req.profile && req.profile.firmaNo && ('firmaNo' in patch || 'donemNo' in patch)) {
+        patch.firmaNo = req.profile.firmaNo;
+        patch.donemNo = req.profile.donemNo;
+    }
+    return patch;
+}
+
 app.get('/api/watcher', (req, res) => {
+    const { watcher } = E(req);
     res.json({ success: true, status: watcher.getStatus() });
 });
 
 app.post('/api/watcher', (req, res) => {
+    const { watcher } = E(req);
     const allowed = ['firmaNo', 'donemNo', 'intervalSec', 'verifyOnWhatsApp', 'simulateTyping', 'sendAllPhones', 'onlySmsGonder', 'sendAlacakli', 'cariType', 'rules', 'watchEdits', 'watchDeletes', 'editScanSec', 'editTemplate',
         'slowMode', 'slowMinMin', 'slowMaxMin', 'slowStart', 'slowEnd'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    lockContext(req, patch);
     const prev = watcher.getConfig();
     watcher.setConfig(patch);
     // Firma/dönem değiştiyse yeni tablo geçmişine mesaj atılmasın diye watermark sıfırla.
@@ -1331,16 +1416,19 @@ app.post('/api/watcher', (req, res) => {
 
 app.post('/api/watcher/start', (req, res) => {
     if (!requireDb(req, res)) return;
+    const { watcher } = E(req);
     const ok = watcher.start();
     res.json({ success: ok, status: watcher.getStatus(), message: ok ? '' : (watcher.getStatus().lastError || 'Başlatılamadı.') });
 });
 
 app.post('/api/watcher/stop', (req, res) => {
+    const { watcher } = E(req);
     watcher.stop();
     res.json({ success: true, status: watcher.getStatus() });
 });
 
 app.get('/api/watcher/log', (req, res) => {
+    const { watcher } = E(req);
     res.json({ success: true, log: watcher.getLog(), status: watcher.getStatus() });
 });
 
@@ -1401,22 +1489,25 @@ app.post('/api/integrations/:id/run', async (req, res) => {
 
 // Üç otomatik gönderim kaynağındaki birikmiş mesajları tek işlemle temizle.
 // UI'da yalnız bir adet "Birikmiş mesajları temizle" düğmesi vardır.
+// Tüm firmaların kuyrukları toplanır (düğme WhatsApp penceresinde, firma seçiminden bağımsız).
 function pendingSummary() {
-    const bySource = {
-        watcher: watcher.getStatus().pendingCount || 0,
-        siparis: siparis.getStatus().pendingCount || 0,
-        vade: vade.getStatus().pendingCount || 0,
-    };
+    const bySource = { watcher: 0, siparis: 0, vade: 0 };
+    for (const { set } of engines.all()) {
+        bySource.watcher += set.watcher.getStatus().pendingCount || 0;
+        bySource.siparis += set.siparis.getStatus().pendingCount || 0;
+        bySource.vade += set.vade.getStatus().pendingCount || 0;
+    }
     return { total: Object.values(bySource).reduce((sum, n) => sum + n, 0), bySource };
 }
 
 app.post('/api/pending/clear', (req, res) => {
     try {
-        const bySource = {
-            watcher: watcher.clearPending(),
-            siparis: siparis.clearPending(),
-            vade: vade.clearPending(),
-        };
+        const bySource = { watcher: 0, siparis: 0, vade: 0 };
+        for (const { set } of engines.all()) {
+            bySource.watcher += set.watcher.clearPending();
+            bySource.siparis += set.siparis.clearPending();
+            bySource.vade += set.vade.clearPending();
+        }
         const cleared = Object.values(bySource).reduce((sum, n) => sum + n, 0);
         res.json({ success: true, cleared, bySource, pending: pendingSummary() });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
@@ -1426,14 +1517,17 @@ app.post('/api/pending/clear', (req, res) => {
 //  SİPARİŞ BİLDİRİMİ (tek sabit numaraya iç bildirim)
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/siparis', (req, res) => {
+    const { siparis } = E(req);
     res.json({ success: true, status: siparis.getStatus() });
 });
 
 app.post('/api/siparis', (req, res) => {
+    const { siparis } = E(req);
     const allowed = ['firmaNo', 'donemNo', 'phone', 'intervalSec', 'minAmount', 'includeContent',
         'watchCancel', 'cancelScanSec', 'respectSendWindow', 'simulateTyping', 'template', 'cancelTemplate'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    lockContext(req, patch);
     const prev = siparis.getConfig();
     siparis.setConfig(patch);
     // Firma/dönem değiştiyse yeni tablonun GEÇMİŞ siparişlerine mesaj atılmasın.
@@ -1445,22 +1539,25 @@ app.post('/api/siparis', (req, res) => {
 
 app.post('/api/siparis/start', (req, res) => {
     if (!requireDb(req, res)) return;
+    const { siparis } = E(req);
     const ok = siparis.start();
     res.json({ success: ok, status: siparis.getStatus(), message: ok ? '' : (siparis.getStatus().lastError || 'Başlatılamadı.') });
 });
 
 app.post('/api/siparis/stop', (req, res) => {
+    const { siparis } = E(req);
     siparis.stop();
     res.json({ success: true, status: siparis.getStatus() });
 });
 
 app.get('/api/siparis/log', (req, res) => {
+    const { siparis } = E(req);
     res.json({ success: true, log: siparis.getLog(), status: siparis.getStatus() });
 });
 
 // Şablonu gerçek (son) siparişle deneyip bildirim numarasına tek mesaj atar.
 app.post('/api/siparis/test', async (req, res) => {
-    try { res.json(await siparis.sendTest()); }
+    try { res.json(await E(req).siparis.sendTest()); }
     catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -1468,16 +1565,19 @@ app.post('/api/siparis/test', async (req, res) => {
 //  VADE TAKİBİ — çek / senet / vadeli visa (tek sabit numaraya iç bildirim)
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/vade', (req, res) => {
+    const { vade } = E(req);
     res.json({ success: true, status: vade.getStatus() });
 });
 
 app.post('/api/vade', (req, res) => {
+    const { vade } = E(req);
     const allowed = ['firmaNo', 'donemNo', 'phone', 'days', 'types', 'visaOnlyTaksit', 'visaRuleFirst', 'visaRuleEvery',
         'direction', 'minAmount', 'onlyPortfoy',
         'groupMessages', 'sendFromHour', 'sendToHour', 'intervalSec', 'respectSendWindow',
         'simulateTyping', 'template', 'headerTemplate', 'lineTemplate'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    lockContext(req, patch);
     // Müşteri kanalı: yalnız bilinen alanlar.
     const c = req.body && req.body.customer;
     if (c && typeof c === 'object') {
@@ -1495,11 +1595,13 @@ app.post('/api/vade', (req, res) => {
 
 app.post('/api/vade/start', (req, res) => {
     if (!requireDb(req, res)) return;
+    const { vade } = E(req);
     const ok = vade.start();
     res.json({ success: ok, status: vade.getStatus(), message: ok ? '' : (vade.getStatus().lastError || 'Başlatılamadı.') });
 });
 
 app.post('/api/vade/stop', (req, res) => {
+    const { vade } = E(req);
     vade.stop();
     res.json({ success: true, status: vade.getStatus() });
 });
@@ -1521,6 +1623,7 @@ app.get('/api/busy', (req, res) => {
 });
 
 app.get('/api/vade/log', (req, res) => {
+    const { vade } = E(req);
     res.json({ success: true, log: vade.getLog(), status: vade.getStatus() });
 });
 
@@ -1528,6 +1631,7 @@ app.get('/api/vade/log', (req, res) => {
 // visa = kart satışı dökümü (kaçının Vega'da vadesi yok vb.); okunamazsa liste yine döner.
 app.get('/api/vade/upcoming', async (req, res) => {
     if (!requireDb(req, res)) return;
+    const { vade } = E(req);
     try {
         const docs = await vade.listUpcoming(req.query.days);
         const visa = await vade.visaSummary().catch(e => { console.error('[Vade] visa özeti:', e.message); return null; });
@@ -1537,7 +1641,7 @@ app.get('/api/vade/upcoming', async (req, res) => {
 });
 
 app.post('/api/vade/test', async (req, res) => {
-    try { res.json(await vade.sendTest()); }
+    try { res.json(await E(req).vade.sendTest()); }
     catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -1545,42 +1649,46 @@ app.post('/api/vade/test', async (req, res) => {
 //  SHOPSTAR — taksitli satış (tahsilat bildirimi + geciken taksit hatırlatması)
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/shopstar', (req, res) => {
-    res.json({ success: true, status: shopstar.getStatus() });
+    res.json({ success: true, status: E(req).shopstar.getStatus() });
 });
 
 app.post('/api/shopstar', (req, res) => {
+    const { shopstar } = E(req);
     const allowed = ['firmaNo', 'donemNo', 'verifyOnWhatsApp', 'onlySmsGonder', 'sendAllPhones', 'payment', 'overdue'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    lockContext(req, patch);
     res.json({ success: true, status: shopstar.setConfig(patch) });
 });
 
 // ShopStar verisi olan en son firma/dönem (seçici ilk açılışta boş kalmasın).
 app.get('/api/shopstar/detect', async (req, res) => {
     if (!requireDb(req, res)) return;
-    try { res.json({ success: true, found: await shopstar.detectDefault() }); }
+    try { res.json({ success: true, found: await E(req).shopstar.detectDefault() }); }
     catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 app.get('/api/shopstar/log', (req, res) => {
+    const { shopstar } = E(req);
     res.json({ success: true, log: shopstar.getLog(), status: shopstar.getStatus() });
 });
 
 // Önizlemeler mesaj GÖNDERMEZ.
 app.get('/api/shopstar/overdue/preview', async (req, res) => {
     if (!requireDb(req, res)) return;
-    try { res.json({ success: true, ...(await shopstar.previewOverdue()) }); }
+    try { res.json({ success: true, ...(await E(req).shopstar.previewOverdue()) }); }
     catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 app.get('/api/shopstar/payments/preview', async (req, res) => {
     if (!requireDb(req, res)) return;
-    try { res.json({ success: true, ...(await shopstar.previewPayments(parseInt(req.query.limit, 10) || 20)) }); }
+    try { res.json({ success: true, ...(await E(req).shopstar.previewPayments(parseInt(req.query.limit, 10) || 20)) }); }
     catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 app.post('/api/shopstar/overdue/run', async (req, res) => {
     if (!requireDb(req, res)) return;
+    const { shopstar } = E(req);
     try {
         const r = await shopstar.runOverdueNow();
         res.json({ success: !r.aborted, message: r.aborted ? r.reason : r.note, result: r, status: shopstar.getStatus() });
@@ -1589,13 +1697,13 @@ app.post('/api/shopstar/overdue/run', async (req, res) => {
 
 app.post('/api/shopstar/overdue/send-one', async (req, res) => {
     if (!requireDb(req, res)) return;
-    try { res.json(await shopstar.sendOverdueOne(req.body && req.body.ind)); }
+    try { res.json(await E(req).shopstar.sendOverdueOne(req.body && req.body.ind)); }
     catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 app.post('/api/shopstar/test', async (req, res) => {
     if (!requireDb(req, res)) return;
-    try { res.json(await shopstar.sendTest(req.body && req.body.kind, req.body && req.body.phone)); }
+    try { res.json(await E(req).shopstar.sendTest(req.body && req.body.kind, req.body && req.body.phone)); }
     catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -1603,10 +1711,12 @@ app.post('/api/shopstar/test', async (req, res) => {
 //  AI OTO-YANIT BOTU
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/aibot', (req, res) => {
+    const { aiBot } = E(req);
     res.json({ success: true, config: aiBot.getConfig(), status: aiBot.getStatus() });
 });
 
 app.post('/api/aibot', (req, res) => {
+    const { aiBot } = E(req);
     const allowed = [
         'enabled', 'apiKey', 'clearApiKey', 'provider', 'baseUrl', 'model', 'firmaNo', 'donemNo',
         'businessName', 'paymentInfo', 'extraInstructions', 'startHour', 'endHour',
@@ -1618,16 +1728,19 @@ app.post('/api/aibot', (req, res) => {
     ];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    lockContext(req, patch);
     const config = aiBot.setConfig(patch);
     res.json({ success: true, config, status: aiBot.getStatus() });
 });
 
 app.get('/api/aibot/log', (req, res) => {
+    const { aiBot } = E(req);
     res.json({ success: true, log: aiBot.getLog(), status: aiBot.getStatus() });
 });
 
 // Anahtarı sına: gövdede apiKey verilirse onu, yoksa kayıtlıyı dener.
 app.post('/api/aibot/test', async (req, res) => {
+    const { aiBot } = E(req);
     try {
         const b = req.body || {};
         const out = await aiBot.testApiKey(b.apiKey, { provider: b.provider, baseUrl: b.baseUrl, model: b.model });
@@ -1753,12 +1866,12 @@ app.get('/api/firma/logo', (req, res) => {
 // Belge tipi kuralına eklenecek görsel/video yükle / kaldır (kural başına).
 app.post('/api/watcher/rules/:id/media', upload.single('media'), (req, res) => {
     if (!req.file) return res.status(400).json({ success: false, message: 'Dosya gerekli.' });
-    const status = watcher.setRuleMedia(req.params.id, req.file);
+    const status = E(req).watcher.setRuleMedia(req.params.id, req.file);
     res.json({ success: true, status });
 });
 
 app.post('/api/watcher/rules/:id/media/clear', (req, res) => {
-    res.json({ success: true, status: watcher.clearRuleMedia(req.params.id) });
+    res.json({ success: true, status: E(req).watcher.clearRuleMedia(req.params.id) });
 });
 
 // Cari hareket tablosundaki IZAHAT dağılımı — kullanıcı tahsilat kodunu canlı görsün.
@@ -1815,20 +1928,22 @@ app.get('/api/watcher/izahat-stats', async (req, res) => {
 //  PERİYODİK BAKİYE/BORÇ HATIRLATMA (reminders)
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/reminders', (req, res) => {
-    res.json({ success: true, status: reminders.getStatus() });
+    res.json({ success: true, status: E(req).reminders.getStatus() });
 });
 
 app.post('/api/reminders', (req, res) => {
     const allowed = ['firmaNo', 'donemNo', 'reminders'];
     const patch = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
-    const status = reminders.setConfig(patch);
+    lockContext(req, patch);
+    const status = E(req).reminders.setConfig(patch);
     res.json({ success: true, status });
 });
 
 // Elle test gönderimi (UI "Şimdi test gönder").
 app.post('/api/reminders/run', async (req, res) => {
     if (!requireDb(req, res)) return;
+    const { reminders } = E(req);
     try {
         const r = await reminders.runNow(req.body && req.body.id);
         res.json({ success: r.success, message: r.message, status: reminders.getStatus() });
@@ -1841,7 +1956,7 @@ app.post('/api/reminders/run', async (req, res) => {
 app.post('/api/reminders/preview', async (req, res) => {
     if (!requireDb(req, res)) return;
     try {
-        const out = await reminders.preview(req.body && req.body.id);
+        const out = await E(req).reminders.preview(req.body && req.body.id);
         res.json({ success: out.ok !== false, message: out.reason, ...out });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -1850,6 +1965,7 @@ app.post('/api/reminders/preview', async (req, res) => {
 
 // Elle telefon ekle/sil (UYGULAMA İÇİ — DB'ye yazılmaz). phone boşsa kaydı siler.
 app.post('/api/reminders/manual-phone', (req, res) => {
+    const { reminders } = E(req);
     const { ind, phone } = req.body || {};
     if (ind == null) return res.status(400).json({ success: false, message: 'Cari (ind) gerekli.' });
     if (phone == null || String(phone).trim() === '') {
@@ -1864,7 +1980,7 @@ app.post('/api/reminders/manual-phone', (req, res) => {
 app.post('/api/reminders/send-one', async (req, res) => {
     if (!requireDb(req, res)) return;
     try {
-        const r = await reminders.sendOne(req.body && req.body.id, req.body && req.body.ind);
+        const r = await E(req).reminders.sendOne(req.body && req.body.id, req.body && req.body.ind);
         res.json(r);
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -1872,16 +1988,17 @@ app.post('/api/reminders/send-one', async (req, res) => {
 });
 
 app.get('/api/reminders/log', (req, res) => {
+    const { reminders } = E(req);
     res.json({ success: true, log: reminders.getLog(), status: reminders.getStatus() });
 });
 
 app.post('/api/reminders/:id/media', upload.single('media'), (req, res) => {
     if (!req.file) return res.status(400).json({ success: false, message: 'Dosya gerekli.' });
-    res.json({ success: true, status: reminders.setReminderMedia(req.params.id, req.file) });
+    res.json({ success: true, status: E(req).reminders.setReminderMedia(req.params.id, req.file) });
 });
 
 app.post('/api/reminders/:id/media/clear', (req, res) => {
-    res.json({ success: true, status: reminders.clearReminderMedia(req.params.id) });
+    res.json({ success: true, status: E(req).reminders.clearReminderMedia(req.params.id) });
 });
 
 // ─── Gönderim saati penceresi (gece gönderme koruması — paylaşılan) ───────────
@@ -2051,8 +2168,12 @@ app.post('/api/active-cari/send', async (req, res) => {
     if (!firmaNo || !Number.isFinite(indNum)) {
         return res.status(400).json({ success: false, message: 'Açık cari tespit edilemedi.' });
     }
-    if (!waStatusX().ready) {
-        return res.status(400).json({ success: false, message: isCloud() ? ('Cloud API hazır değil: ' + (waStatusX().error || '')) : 'WhatsApp bağlı değil. Önce QR okutun.' });
+    // Çok firmada mesaj açık carinin firmasının hattından gider.
+    const prof = profileForFirma(req, firmaNo);
+    if (!prof) return res.status(400).json({ success: false, message: 'Bu firma için etkin bir firma profili yok (Firmalar sekmesi).' });
+    const wa = waFor(prof.id);
+    if (!wa.status().ready) {
+        return res.status(400).json({ success: false, message: isCloud() ? ('Cloud API hazır değil: ' + (waStatusX().error || '')) : (wa.status().error || 'WhatsApp bağlı değil. Önce QR okutun.') });
     }
     try {
         const map = await resolveCariContacts(firmaNo, [indNum]);
@@ -2076,11 +2197,11 @@ app.post('/api/active-cari/send', async (req, res) => {
             ? String(req.body.message)
             : renderBalanceMessage(ACTIVE_CARI_DEFAULT_TPL, c);
 
-        const chk = await waCheckX(c.phone);
+        const chk = await wa.check(c.phone);
         if (!chk.exists) {
             return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
         }
-        const result = await waSendX(c.phone, text, null, { simulateTyping: true, typingMs: 1500, channel: 'manual' });
+        const result = await wa.send(c.phone, text, null, { simulateTyping: true, typingMs: 1500, channel: 'manual' });
         if (result.success) return res.json({ success: true, message: 'Gönderildi.', phone: c.phone, name: c.name });
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
@@ -2541,8 +2662,11 @@ app.post('/api/extre/send', async (req, res) => {
     const indNum = parseInt(req.body && req.body.ind, 10);
     if (!firmaNo || !donemNo || !Number.isFinite(indNum))
         return res.status(400).json({ success: false, message: 'firma/dönem/cari gerekli.' });
-    if (!waStatusX().ready) return res.status(400).json({ success: false, message: isRelay() ? 'Ana PC WhatsApp bağlı değil (relay).' : 'WhatsApp bağlı değil. Önce QR okutun.' });
-    const g = gateX('manual', DEFAULT_PACING.dailyCap);
+    const prof = profileForFirma(req, firmaNo);
+    if (!prof) return res.status(400).json({ success: false, message: 'Bu firma için etkin bir firma profili yok (Firmalar sekmesi).' });
+    const wa = waFor(prof.id);
+    if (!wa.status().ready) return res.status(400).json({ success: false, message: isRelay() ? 'Ana PC WhatsApp bağlı değil (relay).' : (wa.status().error || 'WhatsApp bağlı değil. Önce QR okutun.') });
+    const g = wa.gate('manual', DEFAULT_PACING.dailyCap);
     if (!g.ok) return res.status(429).json({ success: false, message: g.reason || 'Anti-ban: gönderim sınırına ulaşıldı.' });
     try {
         const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum);
@@ -2558,14 +2682,14 @@ app.post('/api/extre/send', async (req, res) => {
             donem: donemNo, rows, net, generatedAt: new Date(),
         });
 
-        const chk = await waCheckX(c.phone);
+        const chk = await wa.check(c.phone);
         if (!chk.exists) return res.status(400).json({ success: false, message: chk.transient ? 'WhatsApp doğrulaması geçici hata — tekrar deneyin.' : 'Numara WhatsApp kullanıcısı değil.' });
 
         const caption = (req.body && req.body.message && String(req.body.message).trim())
             ? String(req.body.message)
             : `Sayın ${c.firma || c.name}, hesap ekstreniz ektedir.`;
         const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
-        const result = await waSendX(c.phone, caption, { kind: 'document', buffer: pdf, mimetype: 'application/pdf', fileName }, { simulateTyping: true, typingMs: 1200, channel: 'extre' });
+        const result = await wa.send(c.phone, caption, { kind: 'document', buffer: pdf, mimetype: 'application/pdf', fileName }, { simulateTyping: true, typingMs: 1200, channel: 'extre' });
         if (result.success) return res.json({ success: true, message: 'Ekstre gönderildi.', phone: c.phone, name: c.name });
         res.status(500).json({ success: false, message: result.error || 'Gönderilemedi.' });
     } catch (err) {
@@ -2634,7 +2758,7 @@ app.get('/api/extre/_havale', async (req, res) => {
     if (!requireDb(req, res)) return;
     let firmaNo = req.query.firmaNo, donemNo = req.query.donemNo;
     if (!firmaNo || !donemNo) {
-        try { const c = watcher.getConfig(); firmaNo = firmaNo || c.firmaNo; donemNo = donemNo || c.donemNo; } catch { /* yok say */ }
+        try { const c = E(req).watcher.getConfig(); firmaNo = firmaNo || c.firmaNo; donemNo = donemNo || c.donemNo; } catch { /* yok say */ }
     }
     if (!/^\d+$/.test(String(firmaNo || '')) || !/^\d+$/.test(String(donemNo || '')))
         return res.status(400).json({ success: false, message: 'firmaNo/donemNo bulunamadı (watcher config boş). ?firmaNo=..&donemNo=.. ekle.' });
@@ -2761,6 +2885,8 @@ app.get('/api/wa/status', async (req, res) => {
                 qrImage: a.qr ? await QRCode.toDataURL(a.qr, { margin: 2, width: 240 }) : null,
                 // Hesap-başı anti-ban: ısınma günü, tavan doluluğu, soğuma.
                 antiban: a.me ? antiban.snapshot(a.me, DEFAULT_PACING.dailyCap) : null,
+                // Hangi firma(lar) bu hattan gönderiyor (çok firmada; tek firmada boş).
+                profiles: accountProfiles(a.id),
             });
         }
         const primary = accs.find((a) => a.ready) || accs.find((a) => a.hasQr) || accs[0] || null;
@@ -2783,7 +2909,7 @@ app.get('/api/wa/status', async (req, res) => {
 // Ekle → yeni oturum hemen QR üretmeye başlar; diğer numaraların bağlantısı
 // BOZULMAZ (her hesabın auth klasörü ve soketi ayrıdır).
 app.get('/api/wa/accounts', (req, res) => {
-    res.json({ success: true, accounts: accounts.list(), max: accounts.MAX_ACCOUNTS });
+    res.json({ success: true, accounts: accounts.list().map((a) => ({ ...a, profiles: accountProfiles(a.id) })), max: accounts.MAX_ACCOUNTS });
 });
 
 app.post('/api/wa/accounts', (req, res) => {
@@ -2823,8 +2949,135 @@ app.delete('/api/wa/accounts/:id', async (req, res) => {
     try {
         const r = await accounts.remove(req.params.id);
         if (!r.success) return res.status(400).json(r);
-        res.json(r);
+        // Bu hatta bağlı firmaların hattı boşalır (hayalet bağ kalmasın); çok firmada o firmanın
+        // mesajları yeni hat atanana kadar GİTMEZ (başka firmanın hattına düşülmez).
+        const unbound = profiles.unbindAccount(req.params.id);
+        res.json({ ...r, unboundProfiles: unbound });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  FİRMA PROFİLLERİ (çok firma) — Firmalar sekmesi
+// ═══════════════════════════════════════════════════════════════════════════
+//  Her firma: { id, firmaNo, donemNo, label, enabled, waAccount }. Tek firmalı kurulumda
+//  yalnız örtük 'default' profil vardır ve hiçbir şey saklanmaz; ikinci firma eklenince
+//  data/profiles.json oluşur (bkz. profiles.js).
+const firmaNameCache = new Map();   // firmaNo → { name, at, loading }
+function cachedFirmaName(firmaNo) {
+    if (!firmaNo) return '';
+    const hit = firmaNameCache.get(firmaNo);
+    const stale = !hit || Date.now() - hit.at > 10 * 60 * 1000;
+    if (stale && !(hit && hit.loading)) {
+        const prev = hit ? hit.name : '';
+        firmaNameCache.set(firmaNo, { name: prev, at: hit ? hit.at : 0, loading: true });
+        fetchFirmaName(firmaNo)
+            .then((n) => firmaNameCache.set(firmaNo, { name: n || prev, at: Date.now() }))
+            .catch(() => firmaNameCache.set(firmaNo, { name: prev, at: Date.now() }));
+    }
+    return (firmaNameCache.get(firmaNo) || {}).name || '';
+}
+const profileLabel = (p) => p.label || cachedFirmaName(p.firmaNo) || (p.firmaNo ? `Firma ${p.firmaNo}` : 'Firma');
+
+// WhatsApp bağlantı ekranı için: bu hattı kullanan firmalar (yalnız açık profil dosyasında).
+function accountProfiles(accountId) {
+    if (!profiles.isExplicit()) return [];
+    return profiles.list()
+        .filter((p) => p.waAccount === accountId)
+        .map((p) => ({ id: p.id, label: profileLabel(p), firmaNo: p.firmaNo, enabled: p.enabled }));
+}
+
+function describeProfile(p) {
+    const ln = lineOf(p);
+    const acc = p.waAccount ? accounts.list().find((a) => a.id === p.waAccount) : null;
+    const set = engines.of(p.id);
+    let warning = null;
+    if (ln.mode === 'none') warning = ln.reason;
+    else if (p.enabled && ln.mode === 'strict' && acc && !acc.ready) warning = 'Hat şu an bağlı değil — mesajlar sırada bekler.';
+    return {
+        id: p.id, firmaNo: p.firmaNo, donemNo: p.donemNo, label: p.label || '', name: profileLabel(p),
+        enabled: p.enabled, isDefault: p.isDefault, efatura: !!p.efatura,
+        waAccount: p.waAccount || null,
+        line: {
+            mode: ln.mode,
+            label: acc ? acc.label : null,
+            me: acc ? (acc.me || null) : null,
+            ready: acc ? !!acc.ready : false,
+            shared: !!p.waAccount && profiles.list().filter((q) => q.enabled && q.waAccount === p.waAccount).length > 1,
+        },
+        warning,
+        running: !!(set && set.watcher.getStatus().running),
+    };
+}
+
+app.get('/api/profiles', (req, res) => {
+    const list = profiles.list();
+    const accs = accounts.list();
+    res.json({
+        success: true,
+        explicit: profiles.isExplicit(),          // true = çok firma kurulumu yapılmış (profiles.json var)
+        multi: profiles.isMulti(),
+        localMode: !isCloud() && !isRelay(),
+        max: profiles.MAX_PROFILES,
+        current: req.profile ? req.profile.id : null,
+        profiles: list.map(describeProfile),
+        accounts: accs.map((a) => ({ id: a.id, label: a.label, me: a.me || null, ready: !!a.ready })),
+        efaturaAvailable: integrations.status().some((x) => x.id === 'efatura'),
+    });
+});
+
+app.post('/api/profiles', async (req, res) => {
+    const b = req.body || {};
+    try {
+        if (b.copyFrom && !profiles.get(String(b.copyFrom))) return res.status(400).json({ success: false, message: 'Kopyalanacak firma bulunamadı.' });
+        const r = profiles.add({ firmaNo: b.firmaNo, donemNo: b.donemNo, label: b.label, waAccount: b.waAccount, enabled: b.enabled });
+        if (!r.success) return res.status(400).json(r);
+        const p = r.profile;
+        // Motorları kur (gerekirse ayarları kopyala), firma/dönemi işle, açıksa başlat.
+        engines.ensure(p, { copyFrom: b.copyFrom ? String(b.copyFrom) : null });
+        engines.applyContext(p);
+        // İlk ek firmayla tek firmalı kurulum "çok firma"ya terfi eder: ilk firmanın diğer motorları
+        // (hatırlatma, sipariş, vade, ShopStar, AI) da artık aynı firma/dönem bağlamına çekilir.
+        for (const q of profiles.list()) {
+            if (q.id !== p.id && engines.has(q.id)) { try { engines.applyContext(q); } catch { /* yok say */ } }
+        }
+        if (p.enabled && !isRelay()) engines.autoStart(p);
+        console.log(`[Firmalar] eklendi: ${p.id} (firma ${p.firmaNo}, dönem ${p.donemNo}, hat ${p.waAccount || '-'})`);
+        res.json({ success: true, profile: describeProfile(p) });
+    } catch (e) {
+        res.status(500).json({ success: false, message: e.message });
+    }
+});
+
+app.post('/api/profiles/:id', (req, res) => {
+    const id = req.params.id;
+    const before = profiles.get(id);
+    if (!before) return res.status(404).json({ success: false, message: 'Firma profili bulunamadı.' });
+    const b = req.body || {};
+    const patch = {};
+    for (const k of ['label', 'enabled', 'waAccount', 'donemNo', 'firmaNo', 'efatura']) if (k in b) patch[k] = b[k];
+    const r = profiles.update(id, patch);
+    if (!r.success) return res.status(400).json(r);
+    const p = r.profile;
+    try {
+        if (p.enabled && !before.enabled) {          // açıldı → motorlar dönsün
+            engines.ensure(p); engines.applyContext(p);
+            if (!isRelay()) engines.autoStart(p);
+        } else if (!p.enabled && before.enabled) {   // kapandı → zamanlayıcılar dursun (ayarlar korunur)
+            engines.pause(id);
+        } else if (engines.has(id)) {                // dönem/firma değişti → motorlara işle
+            if (engines.applyContext(p) && p.enabled && !isRelay()) engines.autoStart(p);
+        }
+    } catch (e) { console.error(`[Firmalar] ${id} güncellenirken motor hatası:`, e.message); }
+    res.json({ success: true, profile: describeProfile(p) });
+});
+
+app.delete('/api/profiles/:id', (req, res) => {
+    const r = profiles.remove(req.params.id);
+    if (!r.success) return res.status(400).json(r);
+    try { engines.drop(req.params.id); } catch { /* yok say */ }
+    lines.forget(req.params.id);
+    console.log(`[Firmalar] silindi: ${req.params.id} (disk verisi korunur: profiles/${req.params.id}/)`);
+    res.json({ success: true });
 });
 
 app.post('/api/wa/refresh', async (req, res) => {
@@ -2968,12 +3221,13 @@ function renderMessage(template, recipient) {
 // kuyrukta birikir; bağlantı gelince kaldığı yerden devam eder. İptal edilirse
 // false döner. 2 sn'lik dilimlerle beklenir ki iptal gecikmeden işlesin.
 async function waitForWhatsApp(job) {
-    if (waStatusX().ready) return true;
+    const wa = waFor(job.profileId);   // işin firmasının hattı (çok firmada başka hat sayılmaz)
+    if (wa.status().ready) return true;
     pushEvent(job, { type: 'waDisconnected', message: 'WhatsApp bağlantısı koptu, bağlanınca devam edilecek...' });
-    while (!job.cancelled && !waStatusX().ready) {
+    while (!job.cancelled && !wa.status().ready) {
         // Cloud modda Baileys olayı yok → Meta durumunu periyodik tazele.
         if (isCloud()) { await sleep(5000); await cloudapi.refreshStatus(true); }
-        else await waWaitForReady(2000);
+        else await wa.waitReady(2000);
     }
     if (job.cancelled) return false;
     pushEvent(job, { type: 'waReconnected', message: 'WhatsApp yeniden bağlandı, gönderim sürüyor.' });
@@ -2982,6 +3236,7 @@ async function waitForWhatsApp(job) {
 
 async function runJob(job) {
     job.status = 'running';
+    const wa = waFor(job.profileId);   // gönderim, kapı ve doğrulama firmanın kendi hattından
     const p = job.pacing;
     let order = [...job.recipients];
     if (p.shuffle) order = order.sort(() => Math.random() - 0.5);
@@ -2992,7 +3247,7 @@ async function runJob(job) {
         // Anti-ban kapısı: warm-up rampı + saatlik + günlük tavan (hesap-başı).
         // Günlük dolduysa job biter; saatlik dolduysa sonraki saat başına kadar
         // (iptal edilebilir) bekleyip aynı alıcıdan devam eder.
-        const g = gateX('bulk', p.dailyCap);
+        const g = wa.gate('bulk', p.dailyCap);
         if (!g.ok) {
             if (g.capType === 'hourly') {
                 const waitMs = msUntilNextHour();
@@ -3027,11 +3282,11 @@ async function runJob(job) {
         if (!(await waitForWhatsApp(job))) { pushEvent(job, { type: 'cancelled', index: i }); break; }
 
         if (p.verifyOnWhatsApp) {
-            const chk = await waCheckX(phone);
+            const chk = await wa.check(phone);
             if (!chk.exists) {
                 // Kontrol sırasında bağlantı koptuysa alıcıyı "kayıtlı değil" sayma;
                 // bağlantıyı bekleyip aynı alıcıyı yeniden dene.
-                if (!waStatusX().ready) { i--; continue; }
+                if (!wa.status().ready) { i--; continue; }
                 pushEvent(job, { ...base, status: 'notOnWhatsApp', error: chk.error || 'WhatsApp kullanıcısı değil' });
                 job.results.push({ ...rcp, status: 'notOnWhatsApp' });
                 continue;
@@ -3042,7 +3297,7 @@ async function runJob(job) {
         // Baileys hattında çıkış yolu metne eklenir. Cloud modda toplu mesaj pencere dışında
         // "genel_duyuru" şablonuna düşer, DUR cümlesi şablonda zaten var — iki kez yazılmasın.
         if (job.optOutNote && !isCloud()) text = (text.trim() ? text.replace(/\s+$/, '') + '\n\n' : '') + optout.FOOTER;
-        let result = await waSendX(phone, text, job.media, {
+        let result = await wa.send(phone, text, job.media, {
             simulateTyping: p.simulateTyping,
             typingMs: rand(1200, 2600),
             channel: 'bulk',
@@ -3052,9 +3307,9 @@ async function runJob(job) {
         // Gönderim sırasında kopma: bağlantı gelene kadar bekle, aynı alıcıya
         // yeniden dene. Bağlıyken alınan hatalar (geçersiz numara vb.) yeniden
         // denenmez, normal "failed" akışına düşer.
-        while (!result.success && !waStatusX().ready && !job.cancelled) {
+        while (!result.success && !wa.status().ready && !job.cancelled) {
             if (!(await waitForWhatsApp(job))) break;
-            result = await waSendX(phone, text, job.media, {
+            result = await wa.send(phone, text, job.media, {
                 simulateTyping: p.simulateTyping,
                 typingMs: rand(1200, 2600),
                 channel: 'bulk',
@@ -3123,8 +3378,11 @@ app.post('/api/optout/add', (req, res) => {
 });
 
 app.post('/api/send-bulk', upload.single('media'), async (req, res) => {
-    const st = waStatusX();
-    if (!st.ready) return res.status(400).json({ success: false, message: isCloud() ? ('Cloud API hazır değil: ' + (st.error || '')) : 'WhatsApp bağlı değil. Önce QR okutun.' });
+    // Çok firmada toplu mesaj, alıcıların firmasının hattından gider (firmaNo istemciden gelir).
+    const prof = profileForFirma(req, req.body && req.body.firmaNo);
+    if (!prof) return res.status(400).json({ success: false, message: 'Bu firma için etkin bir firma profili yok (Firmalar sekmesi).' });
+    const st = waFor(prof.id).status();
+    if (!st.ready) return res.status(400).json({ success: false, message: isCloud() ? ('Cloud API hazır değil: ' + (st.error || '')) : (st.error || 'WhatsApp bağlı değil. Önce QR okutun.') });
 
     let recipients, pacing;
     try {
@@ -3159,7 +3417,7 @@ app.post('/api/send-bulk', upload.single('media'), async (req, res) => {
 
     const jobId = crypto.randomBytes(8).toString('hex');
     const job = {
-        id: jobId, recipients, message, media, pacing,
+        id: jobId, recipients, message, media, pacing, profileId: prof.id,
         optOutNote: req.body.optOutNote === '1',   // metin sonuna "DUR yazabilirsiniz" (yalnız Baileys)
         status: 'pending', cancelled: false,
         results: [], events: [], clients: new Set(),
@@ -3307,11 +3565,7 @@ credits.configure({
 // keser; bu, ARKA PLAN otomasyonunu (watcher/hatırlatma/aktif cari) susturur —
 // aksi halde deneme dolduktan sonra da mesaj atmayı sürdürürdü.
 function stopAutomation(sebep) {
-    try { watcher.stop(); } catch { /* yok say */ }
-    try { siparis.stop(); } catch { /* yok say */ }
-    try { vade.stop(); } catch { /* yok say */ }
-    try { reminders.stop(); } catch { /* yok say */ }
-    try { shopstar.stop(); } catch { /* yok say */ }
+    try { engines.stopAll(); } catch { /* yok say */ }   // tüm firma profillerinin motorları
     try { activeCari.stop(); } catch { /* yok say */ }
     try { integrations.stopAll(); } catch { /* yok say */ }
     console.warn(`[Lisans] Otomasyon durduruldu — ${sebep}`);
@@ -3384,122 +3638,227 @@ setInterval(() => { pollRemoteLicense().catch(() => { }); }, LIC_POLL_UNLICENSED
 // (403 soğuması, oturum iptali, açılış) accounts.js içinde hesap-başı bağlanır.
 antiban.configure(baseDir);
 
-// Watcher'ı bağımlılıklarıyla yapılandır (config/state data/ altına yazılır).
-watcher.configure({
-    getPool: () => pool,
-    sql,
-    resolveCariContacts,
-    // Mod-duyarlı sarmalayıcılar: yerel=Baileys, cloud=Meta Cloud API.
-    waSend: waSendX,
-    waDelete: waDeleteX,
-    checkOnWhatsApp: waCheckX,
-    waStatus: waStatusX,
-    // Anti-ban kapısı mod/hesap duyarlı (çok numarada "herhangi bir hat gönderebilir mi").
-    gate: (ch) => gateX(ch, null),
-    recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
-    isDocumentClaimed: item => integrations.claimsWatcherDocument(item),
+// ═══════════════════════════════════════════════════════════════════════════
+//  MOTOR KÜMELERİ (firma profili başına)
+// ═══════════════════════════════════════════════════════════════════════════
+//  Tek firmalı kurulumda yalnız 'default' profil vardır ve onun motorları, bu dosyanın
+//  başında require edilen tekil modüllerdir (eskisiyle aynı kod yolu, aynı dosyalar:
+//  baseDir/data/watcher.json …). Ek firma eklenince her biri için bu modüllerin ayrı
+//  kopyaları kurulur (engines.js) ve aynı bağımlılıklarla — ama KENDİ hattına bağlı
+//  waSend/gate/waStatus ile — yapılandırılır.
+
+// Çok firma: firma profilleri deposu. Profil dosyası yoksa tek örtük profil, eski
+// motor ayarlarından türetilir (profiles.js başlığına bak).
+profiles.configure({
     baseDir,
-    // {firmaadi} imzası: Firma Bilgileri (TBLFIRMA + kullanıcı override) adı.
-    getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
-    // "Belge içeriğini de ekle" seçeneği için: kesilen belgenin kalemlerini metne çevir.
-    buildDocContentText,
-    // Anti-ban dönüş-budama: üst üste yanıt vermeyen numaraya gönderme + ilk temasta kaydet-ricası.
-    isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
-    shouldAskSave: (phone) => { try { return stats.shouldAskSave(phone); } catch { return false; } },
-    saveContactText: SAVE_CONTACT_LINE,
+    getLegacyContext: () => {
+        let w = null;
+        try { w = watcher.getConfig(); } catch { /* ayar henüz yok */ }
+        const ui = ((loadConfigFile() || {}).uiContext) || {};
+        return { firmaNo: (w && w.firmaNo) || ui.firmaNo || null, donemNo: (w && w.donemNo) || ui.donemNo || null };
+    },
+    hasAccount: (id) => !!accounts.get(id),
+    isLocalMode: () => !isCloud() && !isRelay(),
 });
 
-// Sipariş bildirimi: alınan sipariş fişi oluşunca TEK sabit numaraya haber ver.
-// (Sipariş cari harekete yazmaz → watcher göremez; ayrı tablo taranır.)
-siparis.configure({
-    getPool: () => pool,
-    sql,
-    resolveCariContacts,
-    waSend: waSendX,
-    waStatus: waStatusX,
-    gate: (ch) => gateX(ch, null),
-    recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
-    baseDir,
-    getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
-    buildSiparisContentText,
-});
+const firmaNameOf = async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } };
+const isSuspendedFn = (phone) => { try { return stats.isSuspended(phone); } catch { return false; } };
+const shouldAskSaveFn = (phone) => { try { return stats.shouldAskSave(phone); } catch { return false; } };
+const isOptedOutFn = (phone) => { try { return optout.has(phone); } catch { return false; } };
 
-// Vade takip: çek / senet / vadeli visa vadesine X gün kala sabit numaraya haber ver;
-// istenirse alınan çek/senedi müşteriye de hatırlat (cari kartındaki numaralar).
-// (Vade cari giriş/çıkış fişinin ödeme satırındadır — TBLCAR{GIR|CIK}HAREKET.VADE.)
-vade.configure({
-    getPool: () => pool,
-    sql,
-    resolveCariContacts,
-    waSend: waSendX,
-    checkOnWhatsApp: waCheckX,
-    waStatus: waStatusX,
-    isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
-    isOptedOut: (phone) => { try { return optout.has(phone); } catch { return false; } },
-    gate: (ch) => gateX(ch, null),
-    recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
-    baseDir,
-    getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
-});
+// Bir profilin motorlarını bağımlılıklarıyla yapılandır (config/state profilin data/ klasörüne
+// yazılır). waSend/waStatus/gate/checkOnWhatsApp/waDelete profilin hattına bağlı sarmalayıcılardır
+// (waFor): tek firmada havuz eski gibi çalışır, çok firmada YALNIZ profilin hattı kullanılır.
+function configureEngineSet(set, profile) {
+    const { watcher, siparis, vade, reminders, shopstar, aiBot } = set;
+    const pid = profile.id;
+    const wa = waFor(pid);
+    // 'default' profil: eski baseDir (dosyalar değişmez). Ek profil: baseDir/profiles/<id>.
+    const baseDir = profiles.baseDirFor(pid);
+    const getFirmaName = firmaNameOf;
 
-// Periyodik bakiye/borç hatırlatma zamanlayıcısı.
-reminders.configure({
-    getPool: () => pool,
-    sql,
-    resolveCariContacts,
-    reminderCandidateInds,
-    activeCariInds,
-    existingCariInds,
-    waSend: waSendX,
-    checkOnWhatsApp: waCheckX,
-    waStatus: waStatusX,
-    gate: (ch) => gateX(ch, null),
-    recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
-    baseDir,
-    isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
-    shouldAskSave: (phone) => { try { return stats.shouldAskSave(phone); } catch { return false; } },
-    saveContactText: SAVE_CONTACT_LINE,
-});
+    // Watcher'ı bağımlılıklarıyla yapılandır (config/state data/ altına yazılır).
+    watcher.configure({
+        getPool: () => pool,
+        sql,
+        resolveCariContacts,
+        // Mod-duyarlı sarmalayıcılar: yerel=Baileys, cloud=Meta Cloud API.
+        waSend: wa.send,
+        waDelete: wa.del,
+        checkOnWhatsApp: wa.check,
+        waStatus: wa.status,
+        // Anti-ban kapısı mod/hesap duyarlı (tek firmada "herhangi bir hat gönderebilir mi",
+        // çok firmada "bu firmanın hattı gönderebilir mi").
+        gate: (ch) => wa.gate(ch, null),
+        recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
+        // e-Fatura PDF'i yalnız entegrasyonun sahibi firmanın satış faturalarını üstlenir.
+        isDocumentClaimed: item => integrationOwnerId() === pid && integrations.claimsWatcherDocument(item),
+        baseDir,
+        // {firmaadi} imzası: Firma Bilgileri (TBLFIRMA + kullanıcı override) adı.
+        getFirmaName,
+        // "Belge içeriğini de ekle" seçeneği için: kesilen belgenin kalemlerini metne çevir.
+        buildDocContentText,
+        // Anti-ban dönüş-budama: üst üste yanıt vermeyen numaraya gönderme + ilk temasta kaydet-ricası.
+        isSuspended: isSuspendedFn,
+        shouldAskSave: shouldAskSaveFn,
+        saveContactText: SAVE_CONTACT_LINE,
+    });
 
-// ShopStar (taksitli satış): tahsilat sonrası kalan taksit bildirimi + geciken taksit hatırlatması.
-// Mesaj CARİYE gider; kaynak F{firma}D{donem}TBLWSTAKSITLISATIS.
-shopstar.configure({
-    getPool: () => pool,
-    sql,
-    resolveCariContacts,
-    waSend: waSendX,
-    checkOnWhatsApp: waCheckX,
-    waStatus: waStatusX,
-    gate: (ch) => gateX(ch, null),
-    baseDir,
-    getFirmaName: async (firmaNo) => { try { return (await fetchFirmaInfo(firmaNo)).name || ''; } catch { return ''; } },
-    isSuspended: (phone) => { try { return stats.isSuspended(phone); } catch { return false; } },
-    isOptedOut: (phone) => { try { return optout.has(phone); } catch { return false; } },
+    // Sipariş bildirimi: alınan sipariş fişi oluşunca TEK sabit numaraya haber ver.
+    // (Sipariş cari harekete yazmaz → watcher göremez; ayrı tablo taranır.)
+    siparis.configure({
+        getPool: () => pool,
+        sql,
+        resolveCariContacts,
+        waSend: wa.send,
+        waStatus: wa.status,
+        gate: (ch) => wa.gate(ch, null),
+        recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
+        baseDir,
+        getFirmaName,
+        buildSiparisContentText,
+    });
+
+    // Vade takip: çek / senet / vadeli visa vadesine X gün kala sabit numaraya haber ver;
+    // istenirse alınan çek/senedi müşteriye de hatırlat (cari kartındaki numaralar).
+    // (Vade cari giriş/çıkış fişinin ödeme satırındadır — TBLCAR{GIR|CIK}HAREKET.VADE.)
+    vade.configure({
+        getPool: () => pool,
+        sql,
+        resolveCariContacts,
+        waSend: wa.send,
+        checkOnWhatsApp: wa.check,
+        waStatus: wa.status,
+        isSuspended: isSuspendedFn,
+        isOptedOut: isOptedOutFn,
+        gate: (ch) => wa.gate(ch, null),
+        recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
+        baseDir,
+        getFirmaName,
+    });
+
+    // Periyodik bakiye/borç hatırlatma zamanlayıcısı.
+    reminders.configure({
+        getPool: () => pool,
+        sql,
+        resolveCariContacts,
+        reminderCandidateInds,
+        activeCariInds,
+        existingCariInds,
+        waSend: wa.send,
+        checkOnWhatsApp: wa.check,
+        waStatus: wa.status,
+        gate: (ch) => wa.gate(ch, null),
+        recordSent: () => { /* sayaç gönderim yolunda işlendi */ },
+        baseDir,
+        isSuspended: isSuspendedFn,
+        shouldAskSave: shouldAskSaveFn,
+        saveContactText: SAVE_CONTACT_LINE,
+    });
+
+    // ShopStar (taksitli satış): tahsilat sonrası kalan taksit bildirimi + geciken taksit hatırlatması.
+    // Mesaj CARİYE gider; kaynak F{firma}D{donem}TBLWSTAKSITLISATIS.
+    shopstar.configure({
+        getPool: () => pool,
+        sql,
+        resolveCariContacts,
+        waSend: wa.send,
+        checkOnWhatsApp: wa.check,
+        waStatus: wa.status,
+        gate: (ch) => wa.gate(ch, null),
+        baseDir,
+        getFirmaName,
+        isSuspended: isSuspendedFn,
+        isOptedOut: isOptedOutFn,
+    });
+
+    // AI oto-yanıt botu: gelen WA mesajlarına Claude Haiku ile SEÇMELİ cevap.
+    // Anahtar config.json'daki DB parolasıyla aynı makine anahtarıyla şifrelenir.
+    aiBot.configure({
+        credits,                       // kontörlü ('vega') sağlayıcı: çağrı + kontör düşme (lisans başına tek bakiye)
+        getPool: () => pool,
+        sql,
+        findCariByPhone,
+        fetchNetBalances,
+        fetchRecentMovements,
+        fetchLastSalesInvoice,
+        // Mod-duyarlı gönderim: yanıt, mesajın GELDİĞİ hattan gider (opts.accountId); çok
+        // firmada bu hat zaten botun firmasının hattıdır (routeToBot yalnız o hatta bağlı
+        // profilleri aday sayar) ve sarmalayıcı yine de profilin hattını zorlar.
+        waSend: wa.send,
+        waStatus: wa.status,
+        encryptSecret,
+        decryptSecret,
+        // Bot "borç sebebi / ekstre" sorusunda PDF hesap ekstresi üretir (manuel gönderimle aynı üretici).
+        buildCariExtre: async (firmaNo, donemNo, ind) => {
+            const indNum = parseInt(ind, 10);
+            const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum) || {};
+            const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum, { withKalemler: true });
+            const firma = await fetchFirmaInfo(firmaNo);
+            const pdf = await buildExtrePdf({
+                firmaName: (firma && firma.name) || '', firma, logo: loadFirmaLogo(firmaNo),
+                cariName: c.name || String(indNum), cariKod: c.kod || '',
+                donem: donemNo, rows, net, generatedAt: new Date(),
+            });
+            const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
+            return { buffer: pdf, fileName };
+        },
+        recordSent: () => { /* anti-ban sayacı gönderim yolunda (accounts.send) işlendi */ },
+        // firma/dönem config'te boşsa bağlama düş: çok firmada profilin kendisi, tek firmada
+        // uygulama bağlamı (eski davranış).
+        getContext: () => {
+            if (profiles.isExplicit()) {
+                const p = profiles.get(pid);
+                if (p && p.firmaNo) return { firmaNo: p.firmaNo, donemNo: p.donemNo };
+            }
+            const c = loadConfigFile();
+            if (c && c.uiContext) return c.uiContext;
+            try { const w = watcher.getConfig(); return { firmaNo: w.firmaNo, donemNo: w.donemNo }; } catch { return null; }
+        },
+        baseDir,
+    });
+}
+
+engines.configure({
+    defaultSet: { watcher, siparis, vade, reminders, shopstar, aiBot },
+    configureSet: configureEngineSet,
+    baseDirFor: (id) => profiles.baseDirFor(id),
+    log: (m) => console.log(m),
 });
+// 'default' profil = yukarıdaki tekil modüller; eski kurulumun tüm dosyaları onundur.
+engines.registerDefault({ watcher, siparis, vade, reminders, shopstar, aiBot }, profiles.getDefault());
 
 // Arctos'ta o an açık cariyi plan cache'ten tespit eden izleyici (yüzen buton için).
 activeCari.configure({ getPool: () => pool, sql });
 
 // Program Files\Vega WhatsApp\integrations altindaki eklentiler. Kod/dizayn
 // kurulum klasorunde, degisen durum ve loglar C:\ProgramData\Vega WhatsApp'ta.
+// e-Fatura tek durum klasörü ve tek VKN/dizayn takımıyla çalışır → tek firmaya (sahibine) bağlıdır;
+// WhatsApp gönderimi de o firmanın hattından gider (integrationOwnerId).
+const ownerWa = () => waFor(integrationOwnerId());
+const ownerSet = () => engines.of(integrationOwnerId()) || engines.of(profiles.DEFAULT_ID);
 integrations.configure({
     getPool: () => pool,
     sql,
     resolveCariContacts,
-    waSend: waSendX,
-    waDelete: waDeleteX,
-    waStatus: waStatusX,
-    checkOnWhatsApp: waCheckX,
-    gate: (ch) => gateX(ch, null),
+    waSend: (...a) => ownerWa().send(...a),
+    waDelete: (...a) => ownerWa().del(...a),
+    waStatus: () => ownerWa().status(),
+    checkOnWhatsApp: (...a) => ownerWa().check(...a),
+    gate: (ch) => ownerWa().gate(ch, null),
     getEnabled: () => { const c = loadConfigFile(); return (c && c.efatura) || null; },
     // "Carideki tüm telefonlara gönder" belge mesajı gibi e-Fatura PDF'ine de uygulanır.
     getWatcherOptions: () => {
-        try { const w = watcher.getConfig(); return { sendAllPhones: !!(w && w.sendAllPhones) }; }
+        try { const w = ownerSet().watcher.getConfig(); return { sendAllPhones: !!(w && w.sendAllPhones) }; }
         catch { return { sendAllPhones: false }; }
     },
     // Entegrasyon sonuclari "Son gönderilenler" listesinde görünsün.
-    log: (entry) => { try { watcher.logEntry(entry); } catch { /* log kritik değil */ } },
+    log: (entry) => { try { ownerSet().watcher.logEntry(entry); } catch { /* log kritik değil */ } },
     getContext: () => {
+        if (profiles.isExplicit()) {
+            const o = profiles.get(integrationOwnerId());
+            return { firmaNo: (o && o.firmaNo) || null, donemNo: (o && o.donemNo) || null };
+        }
         const c = loadConfigFile();
         let w = null;
         try { w = watcher.getConfig(); } catch { /* ayar henuz yok */ }
@@ -3513,44 +3872,6 @@ integrations.configure({
     electron: (() => { try { return require('electron'); } catch { return null; } })(),
 });
 
-// AI oto-yanıt botu: gelen WA mesajlarına Claude Haiku ile SEÇMELİ cevap.
-// Anahtar config.json'daki DB parolasıyla aynı makine anahtarıyla şifrelenir.
-aiBot.configure({
-    credits,                       // kontörlü ('vega') sağlayıcı: çağrı + kontör düşme
-    getPool: () => pool,
-    sql,
-    findCariByPhone,
-    fetchNetBalances,
-    fetchRecentMovements,
-    fetchLastSalesInvoice,
-    // Mod-duyarlı gönderim: yanıt, mesajın GELDİĞİ hattan gider (opts.accountId).
-    waSend: waSendX,
-    waStatus: waStatusX,
-    encryptSecret,
-    decryptSecret,
-    // Bot "borç sebebi / ekstre" sorusunda PDF hesap ekstresi üretir (manuel gönderimle aynı üretici).
-    buildCariExtre: async (firmaNo, donemNo, ind) => {
-        const indNum = parseInt(ind, 10);
-        const c = (await resolveCariContacts(firmaNo, [indNum])).get(indNum) || {};
-        const { rows, net } = await fetchHareketRows(firmaNo, donemNo, indNum, { withKalemler: true });
-        const firma = await fetchFirmaInfo(firmaNo);
-        const pdf = await buildExtrePdf({
-            firmaName: (firma && firma.name) || '', firma, logo: loadFirmaLogo(firmaNo),
-            cariName: c.name || String(indNum), cariKod: c.kod || '',
-            donem: donemNo, rows, net, generatedAt: new Date(),
-        });
-        const fileName = `Hesap-Ekstresi-${String(c.kod || indNum)}.pdf`.replace(/[^\w.\-]+/g, '_');
-        return { buffer: pdf, fileName };
-    },
-    recordSent: () => { /* anti-ban sayacı gönderim yolunda (accounts.send) işlendi */ },
-    // firma/dönem config'te boşsa uygulama bağlamına düş.
-    getContext: () => {
-        const c = loadConfigFile();
-        if (c && c.uiContext) return c.uiContext;
-        try { const w = watcher.getConfig(); return { firmaNo: w.firmaNo, donemNo: w.donemNo }; } catch { return null; }
-    },
-    baseDir,
-});
 // Hesap havuzu: gelen mesajlar bota gider (hangi hattan geldiği accountId ile),
 // günlük tavan kullanıcı ayarından okunur. Yerel modda oturumlar burada açılır.
 // DUR listesi: toplu mesajdan çıkmak isteyenler (data/optout.json).
@@ -3561,16 +3882,24 @@ optout.configure({ dataDir: path.join(baseDir, 'data'), normalizePhone });
 // Onay aynı hattan gider (accountId) — müşteri iki numaradan cevap görmesin.
 async function routeIncoming(m) {
     const r = optout.handleIncoming(m.phone, m.text);
-    if (!r) return aiBot.handleIncoming(m);
+    if (!r) return routeToBot(m);
     console.log(`[DUR] ${m.phone} → ${r.action === 'stop' ? 'toplu listeden çıktı' : 'toplu listeye döndü'}${r.changed ? '' : ' (değişiklik yok)'}`);
     if (!r.changed) return;
     try { await waSendX(m.phone, optout.REPLY[r.action], null, { channel: 'aibot', accountId: m.accountId }); }
     catch (e) { console.error('[DUR] onay gönderilemedi:', e.message); }
 }
 
+// Gelen mesajı hangi firmanın botu karşılasın? (kurallar lines.js → createBotRouter)
+const routeToBot = createBotRouter({ profiles, enginesOf, findCariByPhone, log: (m) => console.log(m) });
+
 accounts.configure({
     onIncoming: routeIncoming,
     dailyCap: DEFAULT_PACING.dailyCap,
+    // Çok firmada yapışkan eşleme anahtarı (firma, telefon): gelen hat hangi firmalara bağlıysa
+    // onların kapsamına yazılır. Tek firmada boş → eski (yalnız telefon) anahtar.
+    stickyScopes: (accountId) => (profiles.isMulti()
+        ? profiles.forAccount(accountId).map((p) => profiles.stickyScope(p)).filter(Boolean)
+        : []),
 });
 // Cloud API ('vega' yolu) gelen kutusu: Vega sunucusundaki olayları çekip Baileys
 // gelen mesajıyla aynı yola sokar. 10 dk'dan eski mesaja AI cevap yazmaz (cloudinbox.js).

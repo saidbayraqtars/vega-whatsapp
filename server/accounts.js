@@ -35,6 +35,7 @@ const MSG_MAP_MAX = 3_000;       // mesaj kimliği → hesap (geri çekme için)
 let deps = {
     onIncoming: null,            // ({phone,text,jid,id,accountId}) => …
     dailyCap: null,              // kullanıcı günlük tavanı (DEFAULT_PACING.dailyCap)
+    stickyScopes: null,          // (accountId) => ['F0101', …] çok firmada eşleme kapsamları; boş = kapsamsız
 };
 const configure = (d = {}) => { deps = { ...deps, ...d }; };
 
@@ -82,8 +83,14 @@ function buildSession(meta) {
     // Gelen mesaj → AI bot (hangi hattan geldiği accountId ile gider).
     s.setIncomingHandler(async (msg) => {
         // Müşteri bize bu hattan yazdıysa yapışkan eşlemeyi ona sabitle: yanıt ve
-        // sonraki bildirimler aynı numaradan gitsin.
-        try { setSticky(msg.phone, meta.id); } catch { /* yok say */ }
+        // sonraki bildirimler aynı numaradan gitsin. Çok firmada anahtar (firma, telefon):
+        // hat hangi firmalara bağlıysa onların kapsamına yazılır (aynı telefon iki
+        // firmanın carisi olabilir).
+        try {
+            const scopes = (deps.stickyScopes && deps.stickyScopes(meta.id)) || [];
+            if (scopes.length) for (const sc of scopes) setSticky(msg.phone, meta.id, sc);
+            else setSticky(msg.phone, meta.id);
+        } catch { /* yok say */ }
         if (deps.onIncoming) await deps.onIncoming(msg);
     });
     // Anti-ban: ban-şüpheli kapanış → o HESABI soğut (diğerleri çalışmaya devam eder).
@@ -181,9 +188,15 @@ function rename(id, label) {
 }
 
 // ─── Yapışkan (müşteri → numara) eşleme ──────────────────────────────────────
-const stickyKey = (phone) => normalizePhone(phone) || String(phone || '');
-function setSticky(phone, accountId) {
-    const k = stickyKey(phone);
+// Tek firmada anahtar yalnız telefondur (eski kayıtlar aynen geçerli). Çok firmada
+// anahtar `<kapsam>|<telefon>` olur (kapsam = 'F0101'): aynı telefon iki firmanın
+// carisi olabilir ve her firmanın kendi hattı vardır.
+const stickyKey = (phone, scope) => {
+    const base = normalizePhone(phone) || String(phone || '');
+    return scope && base ? `${scope}|${base}` : base;
+};
+function setSticky(phone, accountId, scope) {
+    const k = stickyKey(phone, scope);
     if (!k || !accountId) return;
     if (reg.sticky[k] === accountId) return;
     reg.sticky[k] = accountId;
@@ -192,16 +205,19 @@ function setSticky(phone, accountId) {
     if (keys.length > STICKY_MAX) for (const old of keys.slice(0, keys.length - STICKY_MAX)) delete reg.sticky[old];
     save();
 }
-const getSticky = (phone) => reg.sticky[stickyKey(phone)] || null;
+const getSticky = (phone, scope) => reg.sticky[stickyKey(phone, scope)] || null;
 
 // ─── Seçim ───────────────────────────────────────────────────────────────────
 // Hazır + anti-ban kapısından geçen hesaplar. gate() sayaç ARTIRMAZ (yalnız
 // gün/saat kovalarını tazeler) → yoklama güvenli.
-function candidates(channel, dailyCap) {
+// onlyId verilirse YALNIZ o hesap değerlendirilir (firmaya sıkı hat bağlama): başka
+// hesap hazır ve boş olsa bile aday sayılmaz.
+function candidates(channel, dailyCap, onlyId) {
     const out = [];
     const fails = [];
     let anyReady = false;
     for (const s of sessions.values()) {
+        if (onlyId && s.id !== onlyId) continue;
         const st = s.getStatus();
         if (!st.ready || !st.me) continue;
         anyReady = true;
@@ -222,33 +238,43 @@ function worstFail(fails) {
 
 // Bu kanal için şu an gönderim yapılabilir mi? (döngülerin "dur/bekle" kararı)
 // Dönüş antiban.gate ile aynı biçimde: { ok, reason, capType… } + accounts alanı.
-function gate(channel, dailyCap) {
-    const { out, anyReady, fails } = candidates(channel, dailyCap);
+// onlyId (opsiyonel): yalnız o hesabın kapısı sorulur — firmaya bağlı hat. O hat
+// kapalı/tavandaysa başka hesaba BAKILMAZ (başka firmanın numarasından gitmesin).
+function gate(channel, dailyCap, onlyId) {
+    if (onlyId && !sessions.has(onlyId)) {
+        return { ok: false, reason: 'Firmaya atanan WhatsApp hattı bulunamadı.', capType: 'offline', accounts: 0 };
+    }
+    const { out, anyReady, fails } = candidates(channel, dailyCap, onlyId);
     if (out.length) {
         const best = out[0];
         return { ...best.g, ok: true, accountId: best.st.me, accounts: out.length };
     }
-    if (!anyReady) return { ok: false, reason: 'WhatsApp bağlı değil.', capType: 'offline', accounts: 0 };
+    if (!anyReady) return { ok: false, reason: onlyId ? 'Firmanın WhatsApp hattı bağlı değil.' : 'WhatsApp bağlı değil.', capType: 'offline', accounts: 0 };
     const f = worstFail(fails) || {};
-    const many = sessions.size > 1 ? ` (${sessions.size} numaranın hepsi kapalı)` : '';
-    return { ...f, ok: false, reason: (f.reason || 'Tüm numaralar günlük/saatlik tavanda.') + many, capType: f.capType || 'daily', accounts: 0 };
+    const many = !onlyId && sessions.size > 1 ? ` (${sessions.size} numaranın hepsi kapalı)` : '';
+    return { ...f, ok: false, reason: (f.reason || (onlyId ? 'Firmanın hattı günlük/saatlik tavanda.' : 'Tüm numaralar günlük/saatlik tavanda.')) + many, capType: f.capType || 'daily', accounts: 0 };
 }
 
-// Gönderimi hangi hesap yapsın? Yapışkan eşleme → yoksa bugün en az gönderen.
-function pick(phone, channel, dailyCap, forcedId) {
-    const { out, anyReady, fails } = candidates(channel, dailyCap);
+// Gönderimi hangi hesap yapsın? Zorlanan hesap (firma hattı / AI yanıtı) → yoksa
+// yapışkan eşleme (kapsamlı) → yoksa bugün en az gönderen.
+function pick(phone, channel, dailyCap, forcedId, scope) {
+    if (forcedId && !sessions.has(forcedId)) {
+        return { error: 'İlgili numara bulunamadı.', capped: true };
+    }
+    const { out, anyReady, fails } = candidates(channel, dailyCap, forcedId || null);
+    if (forcedId) {
+        const forced = out.find((c) => c.s.id === forcedId);
+        // Zorlanan hesap (firma hattı, AI yanıtı) müsait değilse gönderme: mesaj başka
+        // numaradan giderse müşteri yanlış hattan (başka firmadan) mesaj almış olur.
+        if (forced) return { session: forced.s, me: forced.st.me };
+        const f = worstFail(fails) || {};
+        return { error: anyReady ? (f.reason || 'İlgili numara tavanda.') : 'İlgili numara şu an bağlı değil.', capped: true };
+    }
     if (!out.length) {
         const f = worstFail(fails) || {};
         return { error: anyReady ? (f.reason || 'Tüm numaralar tavanda.') : 'WhatsApp bağlı değil.', capped: anyReady };
     }
-    if (forcedId) {
-        const forced = out.find((c) => c.s.id === forcedId);
-        // Zorlanan hesap (AI yanıtı gibi) müsait değilse gönderme: yanıt başka
-        // numaradan giderse müşteri iki ayrı hattan konuşulmuş olur.
-        if (forced) return { session: forced.s, me: forced.st.me };
-        return { error: 'İlgili numara şu an gönderemiyor (bağlı değil ya da tavanda).', capped: true };
-    }
-    const stickyId = getSticky(phone);
+    const stickyId = getSticky(phone, scope);
     if (stickyId) {
         const hit = out.find((c) => c.s.id === stickyId);
         if (hit) return { session: hit.s, me: hit.st.me };
@@ -257,16 +283,18 @@ function pick(phone, channel, dailyCap, forcedId) {
     }
     out.sort((a, b) => a.st.daySent - b.st.daySent);
     const chosen = out[0];
-    if (!stickyId) setSticky(phone, chosen.s.id);
+    if (!stickyId) setSticky(phone, chosen.s.id, scope);
     return { session: chosen.s, me: chosen.st.me };
 }
 
 // ─── Dış API (server.js sarmalayıcılarının çağırdıkları) ─────────────────────
 // Baileys sendMessage ile aynı imza + { accountId } eklenir. Anti-ban kapısı ve
 // sayacı BURADA işler (tek yer) — çağıranlar ayrıca recordSent ETMEZ.
+// opts.accountId = zorunlu hat (firmaya bağlı hat / AI yanıtı); opts.stickyScope =
+// çok firmada yapışkan eşleme kapsamı.
 async function send(phone, text, media = null, opts = {}) {
     const channel = opts.channel || 'manual';
-    const p = pick(phone, channel, opts.dailyCap, opts.accountId || null);
+    const p = pick(phone, channel, opts.dailyCap, opts.accountId || null, opts.stickyScope || null);
     if (p.error) return { success: false, error: p.error, capped: !!p.capped };
     const res = await p.session.sendMessage(phone, text, media, opts);
     if (res.success) {
@@ -280,8 +308,15 @@ async function send(phone, text, media = null, opts = {}) {
 }
 
 // Numara WhatsApp kullanıcısı mı? Yapışkan hesabı yoksa hazır olan ilk hesap sorar.
-async function checkOnWhatsApp(phone) {
-    const stickyId = getSticky(phone);
+// opts.accountId verilirse (firmaya bağlı hat) YALNIZ o hesap sorar; hazır değilse
+// geçici hata döner — başka hesaba düşülmez, çağıran mesajı sıraya alır.
+async function checkOnWhatsApp(phone, opts = {}) {
+    if (opts.accountId) {
+        const s = sessions.get(opts.accountId);
+        if (!s || !s.getStatus().ready) return { exists: false, transient: true, error: 'Firmanın WhatsApp hattı bağlı değil.' };
+        return s.checkOnWhatsApp(phone);
+    }
+    const stickyId = getSticky(phone, opts.stickyScope || null);
     const ordered = [];
     if (stickyId && sessions.has(stickyId)) ordered.push(sessions.get(stickyId));
     for (const s of sessions.values()) if (s.id !== stickyId) ordered.push(s);
@@ -292,12 +327,20 @@ async function checkOnWhatsApp(phone) {
     return { exists: false, transient: true, error: 'WhatsApp bağlı değil.' };
 }
 
-// Geri çekme MESAJI GÖNDEREN hattan yapılmalı; defterde yoksa yapışkan hesaba düş.
-async function deleteMessage(phone, msgId) {
-    const accId = (msgId && msgAccount.get(msgId)) || getSticky(phone) || 'main';
-    const s = sessions.get(accId) || sessions.get('main');
+// Geri çekme MESAJI GÖNDEREN hattan yapılmalı; defterde yoksa firmanın hattına
+// (opts.accountId), o da yoksa yapışkan hesaba düş.
+async function deleteMessage(phone, msgId, opts = {}) {
+    const accId = (msgId && msgAccount.get(msgId)) || opts.accountId || getSticky(phone, opts.stickyScope || null) || 'main';
+    const s = sessions.get(accId) || (opts.accountId ? null : sessions.get('main'));
     if (!s) return { success: false, error: 'WhatsApp hesabı yok.' };
     return s.deleteMessage(phone, msgId);
+}
+
+// Tek hesabın durumu (firmaya bağlı hattın hazır olup olmadığı). Hesap yoksa hazır değil.
+function statusOf(id) {
+    const s = sessions.get(id);
+    if (!s) return { ready: false, initializing: false, hasQr: false, qr: null, me: null, error: 'Hat bulunamadı.' };
+    return s.getStatus();
 }
 
 // Toplam durum. ready = EN AZ BİR hesap bağlı. me/qr alanları eski tek-hesap
@@ -322,7 +365,13 @@ function status() {
 }
 
 // En az bir hesap hazır olana kadar bekle (toplu gönderim kuyruğu bunu kullanır).
-function waitForReady(timeoutMs = 0) {
+// id verilirse (firmaya bağlı hat) yalnız o hesabı bekler: başka hesap hazır diye hemen
+// dönmez, yoksa bekleme döngüleri boşa dönerdi.
+function waitForReady(timeoutMs = 0, id = null) {
+    if (id) {
+        const s = sessions.get(id);
+        return s ? s.waitForReady(timeoutMs) : new Promise((resolve) => setTimeout(() => resolve(false), Math.max(1, timeoutMs || 2000)));
+    }
     if (status().ready) return Promise.resolve(true);
     const waiters = [...sessions.values()].map((s) => s.waitForReady(timeoutMs));
     if (!waiters.length) return Promise.resolve(false);
@@ -347,7 +396,7 @@ const restartAll = () => Promise.all([...sessions.values()].map((s) => s.restart
 module.exports = {
     configure, start, list, get, count, add, remove, rename,
     send, checkOnWhatsApp, deleteMessage, gate, pick,
-    status, waitForReady, totalDailySent,
+    status, statusOf, waitForReady, totalDailySent,
     initializeOne, refreshOne, resumeOne, logoutOne, refreshAll, logoutAll, restartAll,
     setSticky, getSticky,
     MAX_ACCOUNTS,
