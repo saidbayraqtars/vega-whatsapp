@@ -58,7 +58,11 @@ const ENGAGE_TTL_MS = 45 * 24 * 60 * 60 * 1000;
 // askSaveContact da VARSAYILAN AÇIK: ilk otomatik temasta "numaramızı kaydedin" ricası
 // eklenir. Rehbere kayıtlı olmayan numaradan gelen toplu mesaj spam sinyalidir; kayıt
 // olması hem teslimi hem güveni artırır (aynı vakada ban'e giden etkenlerden biri).
-const DEFAULT_GUARD = { enabled: true, noReplyLimit: 6, askSaveContact: true };
+// reinstateDays: susturulan numara son otomatik mesajından bu kadar gün sonra kendiliğinden geri alınır
+// (streak sıfırlanır, "Durdurulanları sıfırla" ile aynı). Varsayılan 15: Hakan Bey (Vega Yazılım) isteği,
+// 31 Eki 2026 — susturma yalnız şikayet önlemiydi, kalıcı olması istenmiyor. 0 = otomatik geri alma yok.
+const DEFAULT_GUARD = { enabled: true, noReplyLimit: 6, askSaveContact: true, reinstateDays: 15 };
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const dayKey = (d = new Date()) => d.toISOString().slice(0, 10);
 const normPhone = (p) => String(p || '').split('@')[0].split(':')[0].replace(/\D/g, '');
@@ -68,7 +72,14 @@ function configure(baseDir) {
     try { if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true }); } catch { /* yok say */ }
     STATE_PATH = path.join(dataDir, 'stats.json');
     load();
+    // Uygulama kapalıyken süresi dolan susturmalar açılışta geri alınır; açık kalan kurulumda saatte bir.
+    reinstateExpired();
+    if (!reinstateTimer) {
+        reinstateTimer = setInterval(() => reinstateExpired(), 60 * 60 * 1000);
+        if (reinstateTimer.unref) reinstateTimer.unref();
+    }
 }
+let reinstateTimer = null;
 
 function load() {
     try {
@@ -81,6 +92,13 @@ function load() {
 function save() {
     try { if (STATE_PATH) fs.writeFileSync(STATE_PATH, JSON.stringify(state)); }
     catch { /* sayaç yazılamazsa gönderim etkilenmesin */ }
+}
+// Gönderim döngüsünde (her aday numara için isSuspended) tek tek dosya yazmamak için gecikmeli kayıt.
+let saveTimer = null;
+function saveSoon() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => { saveTimer = null; save(); }, 1500);
+    if (saveTimer.unref) saveTimer.unref();
 }
 
 // Gün kaydını al/oluştur + eski günleri buda.
@@ -283,6 +301,8 @@ function guardConfig() {
         enabled: g.enabled === undefined ? DEFAULT_GUARD.enabled : g.enabled === true,
         noReplyLimit: Math.max(1, Number(g.noReplyLimit) || DEFAULT_GUARD.noReplyLimit),
         askSaveContact: g.askSaveContact === undefined ? DEFAULT_GUARD.askSaveContact : g.askSaveContact === true,
+        // Hiç yazılmamışsa varsayılan (15 gün); 0 yazılmışsa otomatik geri alma kapalı.
+        reinstateDays: g.reinstateDays === undefined || g.reinstateDays === null ? DEFAULT_GUARD.reinstateDays : Math.max(0, Math.floor(Number(g.reinstateDays)) || 0),
     };
 }
 function setGuard(patch = {}) {
@@ -291,17 +311,42 @@ function setGuard(patch = {}) {
         enabled: patch.enabled !== undefined ? patch.enabled === true : cur.enabled,
         noReplyLimit: patch.noReplyLimit !== undefined ? Math.max(1, Number(patch.noReplyLimit) || cur.noReplyLimit) : cur.noReplyLimit,
         askSaveContact: patch.askSaveContact !== undefined ? patch.askSaveContact === true : cur.askSaveContact,
+        reinstateDays: patch.reinstateDays !== undefined ? Math.max(0, Math.floor(Number(patch.reinstateDays)) || 0) : cur.reinstateDays,
     };
     save();
     return guardConfig();
 }
 
-// Bu numaraya otomatik gönderim şu an susturulmuş mu? (guard açık + streak >= limit)
+// Susturulmuş numaranın geri alma zamanı geldi mi? Süre son OTOMATİK mesajdan sayılır: susturma, limitteki
+// son cevapsız mesajla başlar ve sonrasında numaraya otomatik mesaj gitmediği için lastOutAt susturma anıdır.
+function reinstateDue(e, g, now = Date.now()) {
+    return g.reinstateDays > 0 && (e.lastOutAt || 0) > 0 && now - e.lastOutAt >= g.reinstateDays * DAY_MS;
+}
+function reinstate(e, now = Date.now()) {
+    e.streak = 0;
+    e.reinstatedAt = now;
+}
+// Süresi dolan susturmaları toplu geri alır (tek kayıt). Açılışta, saatte bir ve özet istenince çalışır; kaç numara döndüğünü verir.
+function reinstateExpired(now = Date.now()) {
+    const g = guardConfig();
+    if (!g.enabled || !g.reinstateDays) return 0;
+    let n = 0;
+    for (const e of Object.values(state.engage || {})) {
+        if (e.streak >= g.noReplyLimit && reinstateDue(e, g, now)) { reinstate(e, now); n++; }
+    }
+    if (n) save();
+    return n;
+}
+
+// Bu numaraya otomatik gönderim şu an susturulmuş mu? (guard açık + streak >= limit + geri alma süresi dolmamış)
 function isSuspended(phone) {
     const g = guardConfig();
     if (!g.enabled) return false;
     const e = state.engage && state.engage[normPhone(phone)];
-    return !!(e && e.streak >= g.noReplyLimit);
+    if (!e || e.streak < g.noReplyLimit) return false;
+    // Süre dolduysa numara yeniden devreye girer: streak sıfırdan sayılır ("Durdurulanları sıfırla" ile aynı sonuç).
+    if (reinstateDue(e, g)) { reinstate(e); saveSoon(); return false; }
+    return true;
 }
 // İlk (otomatik) temas mı? → "numaramızı kaydedin" ricası yalnız ilk mesajda eklensin.
 function shouldAskSave(phone) {
@@ -320,19 +365,24 @@ function resetEngage(phone) {
 }
 // UI özeti: izlenen numara sayısı + susturulanlar (streak azalan).
 function engageSummary() {
+    reinstateExpired();
     const g = guardConfig();
     const arr = Object.entries(state.engage || {});
     const suspended = arr
         .filter(([, e]) => e.streak >= g.noReplyLimit)
-        .map(([phone, e]) => ({ phone, streak: e.streak, out: e.out || 0, lastOutAt: e.lastOutAt || 0 }))
+        .map(([phone, e]) => ({
+            phone, streak: e.streak, out: e.out || 0, lastOutAt: e.lastOutAt || 0,
+            // Otomatik geri alınacağı zaman (kapalıysa 0).
+            reinstateAt: g.reinstateDays > 0 && e.lastOutAt ? e.lastOutAt + g.reinstateDays * DAY_MS : 0,
+        }))
         .sort((a, b) => b.streak - a.streak);
     return {
-        enabled: g.enabled, noReplyLimit: g.noReplyLimit, askSaveContact: g.askSaveContact,
+        enabled: g.enabled, noReplyLimit: g.noReplyLimit, askSaveContact: g.askSaveContact, reinstateDays: g.reinstateDays,
         tracked: arr.length, suspendedCount: suspended.length, suspended: suspended.slice(0, 100),
     };
 }
 
 module.exports = {
     configure, recordSent, recordFail, onAck, onIncoming, today, history, summaryText,
-    guardConfig, setGuard, isSuspended, shouldAskSave, resetEngage, engageSummary,
+    guardConfig, setGuard, isSuspended, shouldAskSave, resetEngage, engageSummary, reinstateExpired,
 };

@@ -787,9 +787,10 @@ async function openSettings() {
             $('ab_warnAt').value = (ab.limits.warnAt != null) ? ab.limits.warnAt : 120;
             $('ab_guardEnabled').checked = !!(ab.guard && ab.guard.enabled);
             $('ab_noReplyLimit').value = (ab.guard && ab.guard.noReplyLimit) || 6;
+            $('ab_reinstateDays').value = (ab.guard && ab.guard.reinstateDays != null) ? ab.guard.reinstateDays : 15;
             $('ab_askSave').checked = !!(ab.guard && ab.guard.askSaveContact);
             const eng = ab.engage || {};
-            $('ab_engInfo').textContent = `İzlenen ${eng.tracked || 0} numara · susturulan ${eng.suspendedCount || 0}`;
+            $('ab_engInfo').textContent = `İzlenen ${eng.tracked || 0} numara · susturulan ${eng.suspendedCount || 0}` + (eng.reinstateDays ? ` · ${eng.reinstateDays} gün sonra kendiliğinden açılır` : '');
         }
     } catch { /* yok say */ }
     try {
@@ -1124,7 +1125,7 @@ $('abg_save').onclick = async () => {
         });
         const gr = await api('/antiban/guard', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled: $('ab_guardEnabled').checked, noReplyLimit: Number($('ab_noReplyLimit').value) || 6, askSaveContact: $('ab_askSave').checked }),
+            body: JSON.stringify({ enabled: $('ab_guardEnabled').checked, noReplyLimit: Number($('ab_noReplyLimit').value) || 6, reinstateDays: $('ab_reinstateDays').value === '' ? 15 : Math.max(0, Number($('ab_reinstateDays').value) || 0), askSaveContact: $('ab_askSave').checked }),
         });
         if (lr.success && gr.success) {
             box.className = 'hint ok';
