@@ -257,6 +257,13 @@ h2 { font-size: 16px; margin: 0 0 12px; display: flex; align-items: center; gap:
     padding: 18px 28px 0; max-width: 1180px; width: 100%; margin: 0 auto;
 }
 .appbar .title { font-size: 22px; font-weight: 700; color: var(--text-strong); }
+/* Çok firma: açık firmanın seçici (yalnız 2+ firma varken görünür) */
+#profileSel { width: auto; min-width: 180px; max-width: 280px; font-size: 14.5px; font-weight: 600; padding: 7px 12px; }
+/* WhatsApp kartında bağlı firmalar / Firmalar sekmesi uyarıları */
+.waCard .waFirms { font-size: 12px; color: var(--muted); }
+.waCard .waFirms b { color: var(--text-strong); }
+.pf-warn { color: var(--danger); font-size: 13px; margin-top: 8px; }
+.pf-line { font-size: 13px; color: var(--muted); }
 
 /* İki sütunlu ekranlar (toplu mesaj / ekstre / AI / firma) */
 .wrap {

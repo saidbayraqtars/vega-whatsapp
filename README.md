@@ -93,6 +93,30 @@ ile Anthropic / OpenAI / Gemini.
 Firma adı, iletişim, vergi bilgileri, logo ve yasal metin — ekstre PDF'inin başlık ve
 altbilgisinde kullanılır. Vega'dan otomatik dolar, düzeltilebilir.
 
+### Firmalar (çok firma, tek bilgisayar)
+
+Bir veritabanında birden çok firma varsa hepsinin otomasyonu tek bilgisayardan, **her firma kendi
+WhatsApp numarasıyla** yürür. Tek firmalı kurulumda sekme yalnız bilgi verir; ikinci firma eklenmedikçe
+hiçbir şey değişmez (ayarlar, watermark'lar, defterler, WhatsApp oturumu aynen kalır).
+
+- **Firma ekle:** veritabanındaki firmalardan seç; dönem (en son dönem hazır gelir), ad (isteğe bağlı),
+  WhatsApp hattı ve "ayarları şu firmadan kopyala". Kopyada otomatik gönderim ve iç bildirim numaraları
+  kapalı gelir, cari kimliğine bağlı kayıtlar (hatırlatma geçmişi vb.) kopyalanmaz.
+- Her firmanın belge mesajı, bakiye hatırlatma, sipariş, vade, ShopStar ve AI ayarı; watermark'ı ve
+  gönderim defteri ayrıdır. Başlıktaki firma seçici hangi firmanın ekranının açık olduğunu belirler;
+  firma/dönem seçicileri kilitlidir, değişiklik bu sekmeden yapılır.
+- **Hat bağlama:** mesaj yalnız firmanın kendi hattından gider. Hat kapalıysa ya da günlük/saatlik
+  tavandaysa mesaj sıraya girer; başka firmanın numarasından **gitmez**. Hattı atanmamış firma hiçbir
+  yerden gönderemez (sekmede uyarı çıkar). Aynı hat iki firmaya atanabilir (ortak numara).
+- **AI oto-yanıt:** gelen mesaj, geldiği hatta bağlı firmanın botuna gider; hat birden çok firmayla
+  ortaksa numara bu firmaların carilerinde sırayla aranır. Her firmanın kendi işletme adı, ödeme bilgisi
+  ve cevap sayacı vardır. Yapışkan numara eşlemesi çok firmada (firma, telefon) anahtarıyla tutulur.
+- Yalnız **Yerel (Baileys)** modda çalışır; Cloud API ve ikinci bilgisayar (relay) tek numaradır, çok
+  firmada gönderim kapalıdır.
+- e-Fatura PDF entegrasyonu tek firmanındır (firma satırında işaretlenir, işaret yoksa ilk firma).
+- Kod: `server/profiles.js` (depo), `engines.js` (firma başına motor kopyaları), `lines.js` (hat bağlama
+  ve AI yönlendirme).
+
 ### Ayarlar
 
 Açılır-kapanır bölümler: firma ve dönem · gönderim saatleri ve günleri · ban koruması ·
@@ -237,6 +261,7 @@ server/
   extre.js           PDF hesap ekstresi
   aiBot.js           AI oto-yanıt
   whatsapp.js        Baileys oturumu · accounts.js çok numara havuzu
+  profiles.js        firma profilleri (çok firma) · engines.js firma başına motor kümesi · lines.js firma→hat bağlama
   cloudapi.js        Meta Cloud API · cloudinbox.js gelen kutusu
   antiban.js         ban koruması · stats.js gönderim sayaçları · optout.js DUR listesi
   license.js         lisans · credits.js kontör
@@ -272,4 +297,6 @@ Kurulu uygulamada `%APPDATA%\vega-whatsapp-desktop\`, geliştirmede `server/` al
 | `data/vade.json`, `vade-sent.json`, `vade-pending.json` | vade ayarı, gönderilenler defteri, bekleyen kuyruk |
 | `data/antiban.json`, `data/stats.json` | ban koruması sayaçları, gönderim istatistikleri |
 | `data/optout.json` | DUR listesi |
+| `data/profiles.json` | firma profilleri — yalnız çok firmalı kurulumda; yoksa tek firma |
+| `profiles/<id>/data/` | ek firmaların motor dosyaları (`watcher.json`, `watcher-state.json`, `reminders.json` …); ilk firma eski `data/` klasöründe kalır |
 | `data/reminders-log.json`, `data/aibot-state.json` | hatırlatma kaydı, AI sohbet durumu |

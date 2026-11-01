@@ -2,7 +2,12 @@
 const $ = (id) => document.getElementById(id);
 // Lisans/deneme geçersizse sunucu TÜM /api/* uçlarına 403 LICENSE_REQUIRED döner.
 // Nerede olursak olalım lisans kapısına düş (deneme uygulama açıkken de dolabilir).
-const api = (path, opts) => fetch('/api' + path, opts).then(async (r) => {
+// Çok firma: hangi firma profilinin ekranı açık? Her istekle X-Profile başlığı gider
+// (tek firmada boş → sunucu varsayılan profili kullanır, davranış eskisiyle aynı).
+let profileId = null;
+try { profileId = localStorage.getItem('vega.profile') || null; } catch { /* yok say */ }
+const profileHeaders = (h) => (profileId ? { ...(h || {}), 'X-Profile': profileId } : (h || {}));
+const api = (path, opts) => fetch('/api' + path, profileId ? { ...(opts || {}), headers: profileHeaders(opts && opts.headers) } : opts).then(async (r) => {
     const j = await r.json();
     if (r.status === 403 && j && j.error === 'LICENSE_REQUIRED') showLicenseGate(j.license);
     return j;
@@ -24,6 +29,8 @@ const state = {
     waPollTimer: null,
     currentJob: null,
     sse: null,
+    profiles: [],             // firma profilleri (Firmalar sekmesi); tek firmada tek örtük profil
+    explicit: false,          // true = çok firma kurulumu var → firma/dönem seçicileri kilitli
 };
 
 // Uygulama bağlamı (firma/dönem) kalıcı: hem sunucu config'i hem localStorage.
@@ -137,6 +144,7 @@ $('su_btn').onclick = async () => {
 async function enterApp() {
     show('app');
     $('dbDot').className = 'dot on';
+    await loadProfiles();   // çok firma: açık profil + (varsa) kilitli firma/dönem bağlamı
     await loadFirmalar();
     startWaPolling();
     loadLicense();
@@ -164,6 +172,239 @@ async function loadFirmalar() {
     sel.value = state.firmaNo;
     await loadCari();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Çok firma: profil seçici, kilitli firma/dönem, Firmalar sekmesi
+// ═══════════════════════════════════════════════════════════════════════════
+// Tek firmalı kurulumda (data/profiles.json yok) bu bölüm hiçbir şeyi değiştirmez:
+// seçici görünmez, başlık gitmez, firma/dönem seçicileri eskisi gibi serbesttir.
+const CTX_SELECTS = ['wc_firma', 'wc_donem', 'rm_firma', 'rm_donem', 'ss_firma', 'ss_donem', 'ex_firma', 'ex_donem', 'ab_firma', 'ab_donem', 'firmaSel'];
+const currentProfile = () => state.profiles.find((p) => p.id === profileId) || state.profiles[0] || null;
+
+async function loadProfiles() {
+    let r;
+    try { r = await api('/profiles'); } catch { return; }
+    if (!r || !r.success) return;
+    state.profiles = r.profiles || [];
+    state.explicit = !!r.explicit;
+    if (!state.explicit) {
+        profileId = null;                       // tek firma: başlık yok, sunucu varsayılanı kullanır
+        $('profileSel').classList.add('hidden');
+        return;
+    }
+    // Geçerli profil: kayıtlı seçim hâlâ listedeyse o, değilse sunucunun seçtiği.
+    if (!state.profiles.some((p) => p.id === profileId)) {
+        profileId = r.current || (state.profiles[0] && state.profiles[0].id) || null;
+        try { localStorage.setItem('vega.profile', profileId || ''); } catch { /* yok say */ }
+    }
+    const sel = $('profileSel');
+    if (state.profiles.length > 1) {
+        sel.innerHTML = state.profiles.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}${p.enabled ? '' : ' (kapalı)'}</option>`).join('');
+        sel.value = profileId;
+        sel.classList.remove('hidden');
+        sel.onchange = () => {
+            profileId = sel.value;
+            try { localStorage.setItem('vega.profile', profileId); } catch { /* yok say */ }
+            location.reload();                  // ekranların hepsi yeni firmayla temiz açılsın
+        };
+    } else {
+        sel.classList.add('hidden');
+    }
+    // Firma/dönem bağlamı artık profilin kendisi: ekranlar buradan başlar.
+    const p = currentProfile();
+    if (p && p.firmaNo) {
+        state.firmaNo = p.firmaNo; state.donemNo = p.donemNo || null;
+        try { localStorage.setItem('vega.ctx', JSON.stringify({ firmaNo: p.firmaNo, donemNo: p.donemNo || null })); } catch { /* yok say */ }
+    }
+}
+
+// Çok firmada firma/dönem seçicileri kilitlenir (tek doğruluk kaynağı Firmalar sekmesi).
+function applyCtxLock() {
+    if (!state.explicit) return;
+    for (const id of CTX_SELECTS) {
+        const el = $(id);
+        if (el) { el.disabled = true; el.title = 'Firma ve dönem "Firmalar" sekmesinden değiştirilir.'; }
+    }
+}
+// Her ekranın açılış fonksiyonu bittikten sonra kilidi uygula (seçiciler o sırada doldurulur).
+['initWatcherView', 'initRemindersView', 'initShopstarView', 'initExtreView', 'initAiBotView', 'loadFirmalar'].forEach((name) => {
+    const f = window[name];
+    if (typeof f !== 'function') return;
+    window[name] = async function (...a) { const out = await f.apply(this, a); applyCtxLock(); return out; };
+});
+
+// ─── Firmalar sekmesi ───────────────────────────────────────────────────────
+let pfData = null;
+async function initProfilesView() {
+    let r;
+    try { r = await api('/profiles'); } catch (e) { $('pf_note').textContent = 'Firmalar alınamadı: ' + e.message; return; }
+    if (!r || !r.success) { $('pf_note').textContent = (r && r.message) || 'Firmalar alınamadı.'; return; }
+    pfData = r;
+    state.profiles = r.profiles; state.explicit = r.explicit;
+    renderProfiles();
+}
+
+function pfLineText(p) {
+    if (!p.waAccount) return '⚠ Hat atanmadı';
+    const me = p.line.me ? ' · ' + String(p.line.me).split(':')[0].split('@')[0] : '';
+    return `Hat: ${p.line.label || p.waAccount}${me}${p.line.ready ? '' : ' (bağlı değil)'}${p.line.shared ? ' · ortak hat' : ''}`;
+}
+
+function renderProfiles() {
+    const r = pfData;
+    const box = $('pf_list');
+    box.innerHTML = '';
+    r.profiles.forEach((p) => box.appendChild(profileCard(p, r)));
+    // Mesaj gitmeme riski olan her durum açıkça yazılır (sessiz hata yok).
+    const notes = [];
+    if (!r.explicit) {
+        notes.push('Şu an tek firma var. İkinci firmayı eklediğinizde her firma kendi WhatsApp numarasından gönderir; mevcut firma da şimdiki hattına (1. Numara) sabitlenir.');
+    } else if (!r.localMode) {
+        notes.push('⚠ Birden çok firma yalnız Yerel (Baileys) WhatsApp modunda çalışır. Ayarlar → WhatsApp Gönderim Modu.');
+    } else if (r.multi) {
+        notes.push('Her firma yalnız kendi hattından gönderir; hat kapalıysa mesaj bekler, başka firmanın numarasından GİTMEZ.');
+    }
+    $('pf_note').innerHTML = notes.map((n) => esc(n)).join('<br>');
+    $('pf_add').disabled = r.profiles.length >= r.max;
+}
+
+function profileCard(p, r) {
+    const card = document.createElement('div');
+    card.className = 'rule-card acc-item' + (p.enabled ? '' : ' off');
+    card.dataset.id = p.id;
+    const accOpts = ['<option value="">Atanmadı</option>'].concat(r.accounts.map((a) => {
+        const me = a.me ? ' · ' + String(a.me).split(':')[0].split('@')[0] : '';
+        return `<option value="${esc(a.id)}">${esc(a.label || a.id)}${esc(me)}${a.ready ? '' : ' (bağlı değil)'}</option>`;
+    })).join('');
+    const editable = r.explicit;
+    card.innerHTML = `
+        <div class="acc-head">
+            ${editable ? `<input type="checkbox" class="pf_enabled" title="Açık / kapalı" ${p.enabled ? 'checked' : ''} />` : ''}
+            <div class="acc-head-txt">
+                <span class="acc-t">${esc(p.name)}</span>
+                <span class="acc-s">Firma ${esc(p.firmaNo || '—')} · Dönem ${esc(p.donemNo || '—')}${editable ? ' · ' + esc(pfLineText(p)) : ''}</span>
+            </div>
+        </div>
+        <div class="acc-body">
+            ${editable ? `
+            <div class="row">
+                <div class="field"><label>Ad</label><input class="pf_label" value="${esc(p.label)}" placeholder="Boşsa firma adı yazılır" /></div>
+                <div class="field" style="flex:.6"><label>Dönem</label><select class="pf_donem"><option value="${esc(p.donemNo || '')}">${esc(p.donemNo || '—')}</option></select></div>
+            </div>
+            <div class="field"><label>WhatsApp hattı</label><select class="pf_wa">${accOpts}</select></div>
+            ${r.efaturaAvailable ? `<label class="check"><input type="checkbox" class="pf_efatura" ${p.efatura ? 'checked' : ''} /> e-Fatura PDF bu firmada çalışsın</label>` : ''}
+            ${p.warning ? `<div class="pf-warn">${esc(p.warning)}</div>` : ''}
+            <div class="err pf_err"></div>
+            <div class="acc-foot">
+                <button class="btn green sm pf_save" type="button" style="width:auto">Kaydet</button>
+                ${p.isDefault ? '<span class="hint" style="margin:0">İlk firma silinemez, kapatılabilir.</span>' : '<button class="link-danger pf_del" type="button">Firmayı sil</button>'}
+            </div>` : '<div class="hint">İkinci firma eklenince burada ad, dönem ve WhatsApp hattı ayarlanır.</div>'}
+        </div>`;
+    const head = card.querySelector('.acc-head');
+    const enabledBox = card.querySelector('.pf_enabled');
+    head.addEventListener('click', (e) => { if (e.target !== enabledBox) card.classList.toggle('open'); });
+    if (!editable) return card;
+    card.querySelector('.pf_wa').value = p.waAccount || '';
+    const errBox = card.querySelector('.pf_err');
+    const send = async (patch) => {
+        errBox.textContent = '';
+        const res = await api(`/profiles/${encodeURIComponent(p.id)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+        if (!res.success) { errBox.textContent = res.message || 'Kaydedilemedi.'; return false; }
+        await initProfilesView();
+        await loadProfiles();
+        return true;
+    };
+    enabledBox.addEventListener('change', async () => {
+        if (!enabledBox.checked && !confirm(`"${p.name}" kapatılsın mı? Otomatik mesajları durur (ayarları korunur).`)) { enabledBox.checked = true; return; }
+        if (!(await send({ enabled: enabledBox.checked }))) enabledBox.checked = !enabledBox.checked;
+    });
+    // Dönem listesi kart açılınca yüklenir (en son dönem varsayılan, mevcut dönem seçili).
+    let donemLoaded = false;
+    head.addEventListener('click', async () => {
+        if (donemLoaded || !card.classList.contains('open')) return;
+        donemLoaded = true;
+        const dr = await api(`/donemler?firmaNo=${encodeURIComponent(p.firmaNo || '')}`);
+        const sel = card.querySelector('.pf_donem');
+        if (dr.success && dr.data.length) {
+            sel.innerHTML = dr.data.map((d) => `<option value="${esc(d.donemNo)}">${esc(d.donem ? `${d.donemNo} — ${d.donem}` : d.donemNo)}</option>`).join('');
+            sel.value = p.donemNo || dr.data[dr.data.length - 1].donemNo;
+        }
+    });
+    card.querySelector('.pf_save').onclick = async () => {
+        const patch = {
+            label: card.querySelector('.pf_label').value.trim(),
+            waAccount: card.querySelector('.pf_wa').value || null,
+            donemNo: card.querySelector('.pf_donem').value,
+        };
+        const ef = card.querySelector('.pf_efatura');
+        if (ef) patch.efatura = ef.checked;
+        if (patch.donemNo && patch.donemNo !== p.donemNo && !confirm('Dönem değişince yeni dönemin mevcut belgelerine mesaj gitmez; izleme bugünden başlar. Devam?')) return;
+        await send(patch);
+    };
+    const del = card.querySelector('.pf_del');
+    if (del) del.onclick = async () => {
+        if (!confirm(`"${p.name}" silinsin mi?\n\nBu firmanın otomatik mesajları durur. Ayar ve kayıt dosyaları bilgisayarda kalır.`)) return;
+        const res = await api(`/profiles/${encodeURIComponent(p.id)}`, { method: 'DELETE' });
+        if (!res.success) { errBox.textContent = res.message || 'Silinemedi.'; return; }
+        if (profileId === p.id) { profileId = null; try { localStorage.removeItem('vega.profile'); } catch { /* yok say */ } }
+        await initProfilesView();
+        await loadProfiles();
+    };
+    return card;
+}
+
+// Firma ekle formu: DB'deki firmalardan seç, dönem (en son) otomatik gelir, hat ve kopya seçilir.
+$('pf_add').onclick = async () => {
+    const form = $('pf_form');
+    if (!form.classList.contains('hidden')) { form.classList.add('hidden'); return; }
+    $('pf_err').textContent = '';
+    const used = new Set((pfData ? pfData.profiles : []).map((p) => p.firmaNo));
+    const fr = await api('/firmalar');
+    const fsel = $('pf_firma');
+    const free = fr.success ? fr.data.filter((f) => !used.has(f.FIRMANO)) : [];
+    fsel.innerHTML = free.map((f) => `<option value="${esc(f.FIRMANO)}">${esc(f.FIRMANO)} — ${esc(f.FIRMAADI)}</option>`).join('') || '<option value="">Eklenecek firma kalmadı</option>';
+    fsel.onchange = loadPfDonemler;
+    await loadPfDonemler();
+    $('pf_wa').innerHTML = '<option value="">Sonra seçeceğim (hat atanana dek mesaj gitmez)</option>' +
+        ((pfData && pfData.accounts) || []).map((a) => {
+            const me = a.me ? ' · ' + String(a.me).split(':')[0].split('@')[0] : '';
+            return `<option value="${esc(a.id)}">${esc(a.label || a.id)}${esc(me)}${a.ready ? '' : ' (bağlı değil)'}</option>`;
+        }).join('');
+    $('pf_copy').innerHTML = '<option value="">Boş başla</option>' +
+        ((pfData && pfData.profiles) || []).map((p) => `<option value="${esc(p.id)}">${esc(p.name)} firmasının ayarlarını kopyala</option>`).join('');
+    $('pf_label').value = '';
+    form.classList.remove('hidden');
+};
+async function loadPfDonemler() {
+    const sel = $('pf_donem');
+    const firmaNo = $('pf_firma').value;
+    if (!firmaNo) { sel.innerHTML = ''; return; }
+    sel.innerHTML = '<option>...</option>';
+    const dr = await api(`/donemler?firmaNo=${encodeURIComponent(firmaNo)}`);
+    if (dr.success && dr.data.length) {
+        sel.innerHTML = dr.data.map((d) => `<option value="${esc(d.donemNo)}">${esc(d.donem ? `${d.donemNo} — ${d.donem}` : d.donemNo)}</option>`).join('');
+        sel.value = dr.data[dr.data.length - 1].donemNo;     // en son dönem (otomatik)
+    } else sel.innerHTML = '<option value="">dönem yok</option>';
+}
+$('pf_cancel').onclick = () => $('pf_form').classList.add('hidden');
+$('pf_save').onclick = async () => {
+    const err = $('pf_err');
+    err.textContent = '';
+    const body = {
+        firmaNo: $('pf_firma').value, donemNo: $('pf_donem').value, label: $('pf_label').value.trim(),
+        waAccount: $('pf_wa').value || null, copyFrom: $('pf_copy').value || null,
+    };
+    if (!body.firmaNo || !body.donemNo) { err.textContent = 'Firma ve dönem seçin.'; return; }
+    $('pf_save').disabled = true;
+    try {
+        const res = await api('/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        if (!res.success) { err.textContent = res.message || 'Eklenemedi.'; return; }
+        $('pf_form').classList.add('hidden');
+        await initProfilesView();
+        await loadProfiles();
+    } catch (e) { err.textContent = 'Hata: ' + e.message; }
+    finally { $('pf_save').disabled = false; }
+};
 
 $('firmaSel').onchange = async () => { await saveContext($('firmaSel').value, state.donemNo); await loadCari(); };
 $('searchBtn').onclick = loadCari;
@@ -559,7 +800,7 @@ function renderWaModal(r) {
         else c.innerHTML = `<p class="muted">Bağlanıyor / QR hazırlanıyor...</p>`;
         return;
     }
-    c.innerHTML = `<div class="waCards">${accs.map(renderWaCard).join('')}</div>`;
+    c.innerHTML = `<div class="waCards">${accs.map((a) => renderWaCard({ ...a, _firmsKnown: !!state.explicit })).join('')}</div>`;
 }
 
 // Cloud API gelen kutusu (Vega sunucusundan çekilen son mesajlar). Liste yalnız
@@ -644,8 +885,14 @@ function renderWaCard(a) {
         ? `<p class="waState bad">⏸ Soğuma: ${esc(ab.cooldownReason || 'ban şüphesi')}</p>
            <button class="btn ghost sm" data-wa="clearCooldown" data-id="${esc(a.id)}" style="margin-top:4px">Ban uyarısını kaldır (riski kabul et)</button>`
         : '';
+    // Çok firma: bu hattan hangi firma(lar) gönderiyor? (Firmalar sekmesinde atanır.)
+    const firms = Array.isArray(a.profiles) ? a.profiles : [];
+    const firmsLine = firms.length
+        ? `<div class="waFirms">Firma: <b>${firms.map((f) => esc(f.label) + (f.enabled ? '' : ' (kapalı)')).join(', ')}</b>${firms.length > 1 ? ' · ortak hat' : ''}</div>`
+        : (a._firmsKnown ? '<div class="waFirms">Hiçbir firmaya bağlı değil</div>' : '');
     return `<div class="waCard ${a.ready ? 'on' : ''}">
         <div class="waName"><span class="dot ${a.ready ? 'on' : 'wait'}"></span>${esc(a.label || a.id)}</div>
+        ${firmsLine}
         <div class="waState ${stateCls}">${esc(state)}</div>
         ${body}
         ${cooldown}
@@ -1265,12 +1512,13 @@ $('sendBtn').onclick = async () => {
     fd.append('message', message);
     fd.append('pacing', JSON.stringify(pacing));
     fd.append('optOutNote', $('p_optout').checked ? '1' : '0');
+    fd.append('firmaNo', state.firmaNo || '');   // çok firma: toplu mesaj o firmanın hattından gider
     if (media) fd.append('media', media);
 
     $('sendBtn').disabled = true;
     let r;
     try {
-        r = await fetch('/api/send-bulk', { method: 'POST', body: fd }).then(x => x.json());
+        r = await fetch('/api/send-bulk', { method: 'POST', body: fd, headers: profileHeaders() }).then(x => x.json());
     } catch (e) { $('sendErr').textContent = 'Hata: ' + e.message; $('sendBtn').disabled = false; return; }
     $('sendBtn').disabled = false;
     if (!r.success) { $('sendErr').textContent = r.message; return; }
@@ -1420,7 +1668,7 @@ document.querySelectorAll('.tab').forEach(t => {
         document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
         t.classList.add('active');
         const v = t.dataset.view;
-        ['viewBulk', 'viewWatcher', 'viewReminders', 'viewShopstar', 'viewExtre', 'viewAiBot', 'viewFirma'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
+        ['viewBulk', 'viewWatcher', 'viewReminders', 'viewShopstar', 'viewExtre', 'viewAiBot', 'viewFirma', 'viewProfiles'].forEach(id => { const el = $(id); if (el) el.style.display = (id === v) ? '' : 'none'; });
         const at = $('appbarTitle'); if (at) at.textContent = t.dataset.title || t.textContent.trim();
         if (v === 'viewWatcher') initWatcherView();
         if (v === 'viewReminders' && typeof initRemindersView === 'function') initRemindersView();
@@ -1428,6 +1676,7 @@ document.querySelectorAll('.tab').forEach(t => {
         if (v === 'viewExtre' && typeof initExtreView === 'function') initExtreView();
         if (v === 'viewAiBot' && typeof initAiBotView === 'function') initAiBotView();
         if (v === 'viewFirma' && typeof initFirmaView === 'function') initFirmaView();
+        if (v === 'viewProfiles') initProfilesView();
     };
 });
 
@@ -1811,7 +2060,7 @@ $('wc_save').onclick = async () => {
             const f = card.querySelector('.rc_media').files[0];
             if (f) {
                 const fd = new FormData(); fd.append('media', f);
-                await fetch(`/api/watcher/rules/${card.dataset.id}/media`, { method: 'POST', body: fd });
+                await fetch(`/api/watcher/rules/${card.dataset.id}/media`, { method: 'POST', body: fd, headers: profileHeaders() });
                 card.querySelector('.rc_media').value = '';
             }
         }
@@ -2493,7 +2742,7 @@ async function saveRemindersConfig() {
         const f = card.querySelector('.rm_media').files[0];
         if (f) {
             const fd = new FormData(); fd.append('media', f);
-            await fetch(`/api/reminders/${card.dataset.id}/media`, { method: 'POST', body: fd });
+            await fetch(`/api/reminders/${card.dataset.id}/media`, { method: 'POST', body: fd, headers: profileHeaders() });
             card.querySelector('.rm_media').value = '';
         }
     }
