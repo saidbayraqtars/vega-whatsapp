@@ -53,6 +53,10 @@ const { normalizePhone, isLikelyValid } = require('./phone');
 let deps = null;
 const CHANNEL = 'shopstar';
 const gateSend = () => (deps.gate ? deps.gate(CHANNEL) : antiban.gate(deps.waStatus().me, null, CHANNEL));
+// Yoğun trafik modu (Belge Mesajları > Diğer ayarlar): ShopStar bildirimleri de watcher'daki ORTAK
+// gönderim hakkıyla gider (belge mesajı + e-Fatura PDF + ShopStar tek saat). deps.slow verilmezse
+// ya da mod kapalıysa eski davranış. Elle gönderimler (manual) kullanıcı kararıdır, hakka takılmaz.
+const slowActive = () => { try { return !!(deps && deps.slow && deps.slow.active()); } catch { return false; } };
 
 let CONFIG_PATH = null;
 let STATE_PATH = null;
@@ -456,9 +460,27 @@ async function processPayQueue(pool, T, { manual = false } = {}) {
         return true;
     });
 
+    // Yoğun trafik: pencere kapanınca o güne düşen ve gönderilemeyen bildirimler silinir
+    // (belge mesajıyla aynı kural; sıkıştırıp peş peşe göndermek ban sebebi).
+    const slow = slowActive();
+    if (slow) {
+        state.payQueue = state.payQueue.filter(q => {
+            let dl = null;
+            try { dl = deps.slow.deadline(q.foundAt); } catch { dl = null; }
+            if (dl == null || now < dl) return true;
+            pushLog({ kind: 'payment', ind: q.musteri, status: 'cleared', odenen: fmtAmount(q.odenen), evrak: q.evrak, error: 'Gün sonu: gönderim saati bitti, sırada kalan bildirim silindi (yoğun trafik modu)' });
+            return false;
+        });
+    }
+
     const ready = state.payQueue.filter(q => manual || now - new Date(q.foundAt).getTime() >= SETTLE_MS);
     waiting = state.payQueue.length - ready.length;
     if (!ready.length) { saveState(); return { sent, skipped, waiting }; }
+    // Hak yoksa ağır sorgulara (cari, taksit planı) hiç girme.
+    if (slow && !manual) {
+        const peek = deps.slow.peek();
+        if (!peek.ok) { saveState(); return { sent, skipped, waiting, stopReason: peek.reason }; }
+    }
 
     // Müşteri başına grupla: aynı turdaki çoklu tahsilat tek mesaj.
     const groups = new Map();
@@ -509,7 +531,15 @@ async function processPayQueue(pool, T, { manual = false } = {}) {
         const paidOff = kalanNum <= 0.009;
         const tpl = paidOff ? (config.payment.paidOffTemplate || DEFAULT_PAIDOFF_TEMPLATE) : (config.payment.template || DEFAULT_PAY_TEMPLATE);
         const text = renderTemplate(tpl, vars);
-        const res = await sendText(contact, text);
+        // Yoğun trafik: ortak hakkı al (yoksa bildirim kuyrukta kalır, hak açılınca gider).
+        let slot = null;
+        if (slow && !manual) {
+            slot = deps.slow.take();
+            if (!slot.ok) { stopReason = slot.reason; break; }
+        }
+        let res = null;
+        try { res = await sendText(contact, text); }
+        finally { if (slot) slot.release(!!(res && (res.ok || res.transient))); }
         if (res.ok) {
             sent++;
             done('sent');
@@ -530,9 +560,21 @@ async function processPayQueue(pool, T, { manual = false } = {}) {
             done('skipped');
             pushLog({ ...logBase, status: res.status, error: res.error });
         }
+        // Yoğun trafik: bu turda tek bildirim; sonraki hak slot.release'te kuruldu.
+        if (slot) break;
         await sleep(rand(8000, 20000));
     }
     return { sent, skipped, waiting, stopReason };
+}
+
+// Kuyruğu elle boşalt ("Birikmiş mesajları temizle"). Filigran bu satırları çoktan geçti, yani
+// silinenler yeniden bulunup kuyruğa girmez. Geri alınamaz.
+function clearPending() {
+    const n = state.payQueue.length;
+    if (n) pushLog({ kind: 'payment', status: 'cleared', error: `Kuyruk elle temizlendi (${n} bekleyen tahsilat bildirimi silindi)` });
+    state.payQueue = [];
+    saveState();
+    return n;
 }
 
 async function paymentTick() {
@@ -624,10 +666,19 @@ async function runOverdue({ manual = false } = {}) {
         const skip = overdueSkip(c, contact, { manual });
         if (skip) { skipped++; continue; }
 
+        // Yoğun trafik: ortak hakkı al. Hak yoksa tur durur; müşteri başı defter sayesinde
+        // hak açılınca kaldığı yerden sürer, gün sonunda kalanlar ertesi gün için bekler.
+        let slot = null;
+        if (!manual && slowActive()) {
+            slot = deps.slow.take();
+            if (!slot.ok) { interrupted = true; stopReason = slot.reason; break; }
+        }
         const text = overdueText(c, contact, bizFirma);
         const pv = planVars(c.plan);
         const logBase = { kind: 'overdue', ind: c.ind, name: contact.name, firma: contact.firma, kod: contact.kod, phone: contact.phone || '', geciken: pv.gecikenTutar, gecikmeGun: pv.gecikmeGun, kalan: pv.kalan };
-        const res = await sendText(contact, text);
+        let res = null;
+        try { res = await sendText(contact, text); }
+        finally { if (slot) slot.release(!!(res && (res.ok || res.transient))); }
         const nowIso = new Date().toISOString();
         if (res.ok) {
             sent++;
@@ -643,6 +694,8 @@ async function runOverdue({ manual = false } = {}) {
         }
         saveState();
         // Tahsilat mesajı yüksek risk: insansı tempo, her 20 mesajda uzun mola.
+        // Yoğun trafikte aralığı ortak hak belirler (bir sonraki turda take() bekletir).
+        if (slot) continue;
         if (res.ok && sent % 20 === 0) await sleep(rand(60000, 150000));
         else await sleep(rand(12000, 30000));
     }
@@ -671,6 +724,8 @@ async function overdueTick() {
         if (config.overdue.enabled && !lastOverdueResult) lastOverdueResult = { note: why, at: new Date().toISOString() };
         return;
     }
+    // Yoğun trafik: hak yokken adayları (ağır sorgu) her dakika yeniden hesaplama.
+    if (slowActive() && !deps.slow.peek().ok) return;
     const r = await runOverdue();
     if (r && !r.aborted && !r.interrupted) { state.overdueRunDate = localYmd(); saveState(); }
 }
@@ -731,6 +786,7 @@ function getStatus() {
         payment: { ...config.payment },
         overdue: { ...config.overdue },
         payQueue: state.payQueue.length,
+        slow: slowActive(),
         watermark: prefix() ? (state.wm[prefix()] ?? null) : null,
         overdueDue: overdueDueReason(),
         overdueRunDate: state.overdueRunDate,
@@ -883,7 +939,7 @@ async function sendTest(kind, phoneRaw) {
 
 module.exports = {
     configure, autoStart, start, stop, tick,
-    getConfig, setConfig, getStatus, getLog,
+    getConfig, setConfig, getStatus, getLog, clearPending,
     previewOverdue, previewPayments, sendOverdueOne, sendTest, detectDefault,
     runOverdueNow: () => runOverdue({ manual: true }),
 };

@@ -91,7 +91,8 @@ class State {
     }
     scanAfter(key, value) { this.data.contexts[key].scanAfter = value; this.save(); }
     doc(key) { return this.data.documents[key] || null; }
-    setDoc(key, value) { this.data.documents[key] = { ...(this.data.documents[key] || {}), ...value, updatedAt: new Date().toISOString() }; this.save(); }
+    // save=false: toplu yazimda (sira doldurma, sira temizleme) dosya tek seferde yazilsin.
+    setDoc(key, value, save = true) { this.data.documents[key] = { ...(this.data.documents[key] || {}), ...value, updatedAt: new Date().toISOString() }; if (save) this.save(); }
     docsForContext(contextKey) {
         return Object.entries(this.data.documents)
             .filter(([key, value]) => value.contextKey === contextKey || key.startsWith(`${contextKey}:`))
@@ -236,10 +237,147 @@ class Integration {
         if (ms > 0) await new Promise(r => setTimeout(r, ms));
     }
 
+    // ── Yoğun trafik modu ─────────────────────────────────────────────────────
+    // Watcher'daki "Yoğun trafik modu" açıkken PDF anında gitmez: fatura sıraya girer,
+    // belge mesajı ve ShopStar ile AYNI gönderim hakkını (host.slow) paylaşarak 5–15 dk
+    // aralıkla, tek tek gider; pencere kapanınca o güne düşen kalanlar silinir. Canlıda
+    // (Expert Bilişim) PDF'lerin bu moddan muaf olması banın sebebi sayıldı.
+    // host.slow = { active(), take(), deadline(from) } — server.js sahibi firmanın watcher'ına bağlar.
+    slowActive() {
+        const s = this.host.slow;
+        try { return !!(s && s.active()); } catch { return false; }
+    }
+
+    // Sıradaki faturalar: ayrı kuyruk dosyası yok, belge kaydının durumu 'queued' ise sıradadır.
+    // Tam tarama ve yeniden başlatma sırayı bozmaz; temizleme/süre aşımı da tek durum değişikliği.
+    queuedDocs(contextKey) {
+        const list = Object.entries(this.state.data.documents)
+            .filter(([, v]) => v && v.status === 'queued')
+            .map(([key, v]) => ({ key, ...v }))
+            .filter(d => !contextKey || d.contextKey === contextKey);
+        return list.sort((a, b) => (Date.parse(a.queuedAt) || 0) - (Date.parse(b.queuedAt) || 0) || Number(a.ind) - Number(b.ind));
+    }
+
+    queuedCount() { return this.queuedDocs().length; }
+
+    // "Birikmiş mesajları temizle": sıradaki faturalar silinir. Durum 'skipped' kalır;
+    // 'queued' bırakılsa ya da kayıt silinse tam tarama aynı faturayı yeniden sıraya alırdı.
+    clearPending() {
+        const items = this.queuedDocs();
+        if (!items.length) return 0;
+        const at = new Date().toISOString();
+        for (const d of items) this.state.setDoc(d.key, { status: 'skipped', reason: 'bekleyen mesajlar elle temizlendi', clearedAt: at }, false);
+        this.state.save();
+        this.log('INFO', `sirada bekleyen ${items.length} fatura elle temizlendi`);
+        this.uiLog({ status: 'cleared', name: 'e-Fatura PDF', error: `Kuyruk elle temizlendi (${items.length} bekleyen fatura PDF'i silindi)` });
+        return items.length;
+    }
+
+    // Gün sonu: pencere kapanınca o güne düşen ve gönderilemeyen PDF'ler silinir (belge
+    // mesajıyla aynı kural — sıkıştırıp peş peşe göndermek tam da ban sebebi).
+    expireQueued(now = Date.now()) {
+        const slow = this.host.slow;
+        if (!slow) return 0;
+        let deadline = null;
+        const expired = this.queuedDocs().filter(d => {
+            try { deadline = slow.deadline(d.queuedAt); } catch { deadline = null; }
+            return deadline != null && now >= deadline;
+        });
+        if (!expired.length) return 0;
+        const at = new Date(now).toISOString();
+        for (const d of expired) this.state.setDoc(d.key, { status: 'skipped', reason: 'gun sonu: gonderim saati bitti (yogun trafik modu)', clearedAt: at }, false);
+        this.state.save();
+        this.log('INFO', `yogun trafik modu: gun sonu, ${expired.length} fatura siradan silindi`);
+        this.uiLog({ status: 'cleared', name: 'e-Fatura PDF', error: `Gün sonu: gönderim saati bitti, sırada kalan ${expired.length} fatura PDF'i silindi (yoğun trafik modu)` });
+        return expired.length;
+    }
+
+    // Yeni hazır faturaları gönderim yapmadan sıraya al; imleç ilerler.
+    async enqueueNew(pool, ctx, ctxKey, stateCtx) {
+        let rows = await db.readyDocuments(pool, ctx, { afterInd: stateCtx.scanAfter, limit: 50 });
+        if (!rows.length && stateCtx.scanAfter !== stateCtx.baselineMax) {
+            this.state.scanAfter(ctxKey, stateCtx.baselineMax); // gec tamamlanan hareketleri yeniden tara
+            stateCtx = this.state.context(ctxKey);
+            rows = await db.readyDocuments(pool, ctx, { afterInd: stateCtx.scanAfter, limit: 50 });
+        }
+        if (!rows.length) return 0;
+        let added = 0, cursor = Number(stateCtx.scanAfter) || 0;
+        const queuedAt = new Date().toISOString();
+        for (const row of rows) {
+            cursor = Number(row.IND);
+            const key = this.documentKey(ctx, row);
+            const old = this.state.doc(key);
+            if (old && (old.status === 'sent' || old.status === 'skipped' || old.status === 'queued')) continue;
+            this.state.setDoc(key, {
+                status: 'queued', queuedAt, contextKey: ctxKey, ind: Number(row.IND), belgeNo: row.BELGENO,
+                cariInd: row.CARIIND, type: row.DOCUMENT_TYPE, amount: row.TUTAR,
+                attempts: Number((old && old.attempts) || 0),
+            }, false);
+            added++;
+        }
+        if (added) this.state.save();
+        if (cursor > Number(stateCtx.scanAfter)) this.state.scanAfter(ctxKey, cursor);
+        return added;
+    }
+
+    // Sıradaki faturaları gönder. Yoğun trafik modunda ortak hak alınır ve EN ÇOK BİR PDF gider;
+    // mod kapalıysa (sıra doluyken kapatıldı) batchLimit kadar boşaltılır. Bekleyen fatura
+    // gönderim anında Vega'dan yeniden okunur: silinmiş/iptal edilmişse hak harcamadan düşer,
+    // değişmişse PDF zaten o anki halinden üretilir.
+    async drainQueued(pool, ctx, { slow }) {
+        const ctxKey = this.key(ctx);
+        const items = this.queuedDocs(ctxKey);
+        if (!items.length) return { processed: 0 };
+        let slot = null;
+        if (slow) {
+            slot = this.host.slow.take();
+            if (!slot.ok) return { paused: slot.reason, waiting: items.length };
+        }
+        const limit = slow ? 1 : Math.max(1, Number(this.settings.batchLimit) || 5);
+        const results = [];
+        let used = false;
+        try {
+            const head = items.slice(0, 50);
+            const rows = await db.documentStates(pool, ctx, head.map(d => d.ind));
+            const byInd = new Map(rows.map(r => [Number(r.IND), r]));
+            for (const it of head) {
+                if (results.filter(x => x.sent).length >= limit) break;
+                const row = byInd.get(Number(it.ind));
+                const why = !row ? "fatura Vega'dan silinmis"
+                    : (row.IPTAL || row.IADE) ? 'fatura iptal/iade edilmis'
+                        : String(row.BELGENO || '').trim().length !== 16 ? 'fatura numarasi gecersiz' : null;
+                if (why) {
+                    this.state.setDoc(it.key, { status: 'skipped', reason: `sirada beklerken: ${why}` });
+                    this.uiLog({ status: 'dropped', name: 'e-Fatura PDF', evrak: it.belgeNo || String(it.ind), error: `Sıradaki PDF gönderilmedi: ${why}` });
+                    results.push({ dropped: why, belgeNo: it.belgeNo });
+                    continue;
+                }
+                try {
+                    const r = await this.processOne(ctx, row, 'queued');
+                    results.push(r);
+                    if (r.paused) break;
+                    if (r.sent) used = true;
+                } catch (e) {
+                    const previous = this.state.doc(it.key) || {};
+                    this.state.setDoc(it.key, { status: 'error', attempts: Number(previous.attempts || 0) + 1, lastError: e.message });
+                    this.lastError = e.message;
+                    if (previous.lastError !== e.message) {
+                        this.log('ERROR', `${row.BELGENO} islenemedi: ${e.message}`);
+                        this.uiLog({ status: 'failed', name: 'e-Fatura PDF', evrak: row.BELGENO, error: e.message });
+                    }
+                    results.push({ belgeNo: row.BELGENO, error: e.message });
+                    break;
+                }
+            }
+        } finally { if (slot) slot.release(used); }
+        return { processed: results.length, results };
+    }
+
     async processOne(ctx, row, mode = 'initial') {
         const itemKey = this.documentKey(ctx, row);
         const old = this.state.doc(itemKey);
-        if (mode === 'initial' && old && (old.status === 'sent' || old.status === 'skipped')) return { skipped: old.status, belgeNo: row.BELGENO };
+        // 'queued' modu sıradan çıkan faturadır: kayıt zaten 'queued' durumunda, korumaya takılmaz.
+        if (mode === 'initial' && old && (old.status === 'sent' || old.status === 'skipped' || old.status === 'queued')) return { skipped: old.status, belgeNo: row.BELGENO };
 
         const contacts = await this.host.resolveCariContacts(ctx.firmaNo, [Number(row.CARIIND)]);
         const contact = contacts.get(Number(row.CARIIND));
@@ -434,16 +572,34 @@ class Integration {
         const rows = await db.documentStates(pool, ctx, watched.map(d => d.ind));
         const current = new Map(rows.map(r => [Number(r.IND), r]));
         const results = [];
+        // Yoğun trafik modu: iptal bildirimi ve güncel PDF de ortak gönderim hakkıyla gider
+        // (hak yoksa { paused } döner, bir sonraki turda aynı karar yeniden verilir).
+        const slow = this.slowActive();
+        const withSlot = async (doc, send) => {
+            if (!slow) return send();
+            const slot = this.host.slow.take();
+            if (!slot.ok) return { paused: slot.reason, belgeNo: doc.belgeNo, slotWait: true };
+            let used = false;
+            try {
+                const r = await send();
+                used = !!(r && (r.cancelled || r.updated || r.sent));
+                return r;
+            } finally { slot.release(used); }
+        };
         for (const doc of watched) {
             if (results.length >= Number(this.settings.batchLimit || 5)) break;
             const row = current.get(Number(doc.ind));
             try {
                 if (!row) {
-                    results.push(await this.cancelOne(ctx, doc, null, 'silindi'));
+                    const r = await withSlot(doc, () => this.cancelOne(ctx, doc, null, 'silindi'));
+                    results.push(r);
+                    if (r && r.slotWait) break;
                     continue;
                 }
                 if (row.IPTAL || row.IADE) {
-                    results.push(await this.cancelOne(ctx, doc, row, 'iptal'));
+                    const r = await withSlot(doc, () => this.cancelOne(ctx, doc, row, 'iptal'));
+                    results.push(r);
+                    if (r && r.slotWait) break;
                     continue;
                 }
                 if (String(row.BELGENO || '').trim().length !== 16) continue;
@@ -458,7 +614,11 @@ class Integration {
                     if (doc.pendingFingerprint) this.state.setDoc(doc.key, { pendingFingerprint: null, pendingSince: null });
                     continue;
                 }
-                if (this.updateDecision(doc, currentFingerprint) === 'send') results.push(await this.processOne(ctx, row, 'update'));
+                if (this.updateDecision(doc, currentFingerprint) === 'send') {
+                    const r = await withSlot(doc, () => this.processOne(ctx, row, 'update'));
+                    results.push(r);
+                    if (r && r.slotWait) break;
+                }
             } catch (e) {
                 this.state.setDoc(doc.key, { lastChangeError: e.message, changeAttempts: Number(doc.changeAttempts || 0) + 1 });
                 this.lastError = e.message;
@@ -478,6 +638,8 @@ class Integration {
         this.running = true;
         this.lastRun = new Date().toISOString();
         try {
+            // Yoğun trafik: gün sonu temizliği veritabanı/WhatsApp hazır olmasa da yapılır.
+            if (this.slowActive()) this.expireQueued();
             const pool = this.host.getPool && this.host.getPool();
             if (!pool || !pool.connected) return { skipped: 'veritabani bagli degil' };
             const ctx = await this.currentContext(pool);
@@ -498,9 +660,27 @@ class Integration {
             const wa = this.host.waStatus && this.host.waStatus();
             if (!wa || !wa.ready) return { skipped: 'WhatsApp hazir degil', context: ctxKey };
 
+            // Yoğun trafik modu: yeni faturalar yalnız sıraya girer; bu turda en çok BİR PDF
+            // (önce iptal/güncelleme, yoksa sıradaki fatura) ortak gönderim hakkıyla gider.
+            const slow = this.slowActive();
+            let queuedNow = 0;
+            if (slow) queuedNow = await this.enqueueNew(pool, ctx, ctxKey, stateCtx);
+
             const changed = await this.reconcileSent(pool, ctx);
             if (changed.some(x => x && (x.cancelled || x.updated || x.error || x.paused))) {
                 this.lastResult = { context: ctxKey, processed: changed.length, changes: changed };
+                return this.lastResult;
+            }
+
+            if (slow) {
+                const drained = await this.drainQueued(pool, ctx, { slow: true });
+                this.lastResult = { context: ctxKey, slow: true, queuedNow, queue: this.queuedCount(), ...drained };
+                return this.lastResult;
+            }
+            // Mod sıra doluyken kapatıldıysa kalan faturalar normal hızla boşaltılır.
+            const flushed = await this.drainQueued(pool, ctx, { slow: false });
+            if (flushed.processed) {
+                this.lastResult = { context: ctxKey, processed: flushed.processed, results: flushed.results };
                 return this.lastResult;
             }
 
@@ -592,6 +772,8 @@ class Integration {
             lastRun: this.lastRun,
             lastError: this.lastError,
             lastResult: this.lastResult,
+            slow: this.slowActive(),
+            queued: this.queuedCount(),
             task,
             ...this.testModeStatus(),
             dataDir: this.host.dataDir,

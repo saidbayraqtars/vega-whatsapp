@@ -1487,27 +1487,38 @@ app.post('/api/integrations/:id/run', async (req, res) => {
     }
 });
 
-// Üç otomatik gönderim kaynağındaki birikmiş mesajları tek işlemle temizle.
+// Otomatik gönderim kaynaklarındaki birikmiş mesajları tek işlemle temizle: belge (watcher),
+// sipariş, vade, e-Fatura PDF sırası ve ShopStar tahsilat sırası.
 // UI'da yalnız bir adet "Birikmiş mesajları temizle" düğmesi vardır.
 // Tüm firmaların kuyrukları toplanır (düğme WhatsApp penceresinde, firma seçiminden bağımsız).
+// e-Fatura entegrasyonu firma başına değil makine başınadır (tek durum klasörü) → bir kez sayılır.
+const emptyPending = () => ({ watcher: 0, siparis: 0, vade: 0, efatura: 0, shopstar: 0 });
+const efaturaInstance = () => { try { return integrations.instance('efatura'); } catch { return null; } };
+
 function pendingSummary() {
-    const bySource = { watcher: 0, siparis: 0, vade: 0 };
+    const bySource = emptyPending();
     for (const { set } of engines.all()) {
         bySource.watcher += set.watcher.getStatus().pendingCount || 0;
         bySource.siparis += set.siparis.getStatus().pendingCount || 0;
         bySource.vade += set.vade.getStatus().pendingCount || 0;
+        try { bySource.shopstar += set.shopstar.getStatus().payQueue || 0; } catch { /* yok say */ }
     }
+    const ef = efaturaInstance();
+    if (ef && typeof ef.queuedCount === 'function') { try { bySource.efatura = ef.queuedCount(); } catch { /* yok say */ } }
     return { total: Object.values(bySource).reduce((sum, n) => sum + n, 0), bySource };
 }
 
 app.post('/api/pending/clear', (req, res) => {
     try {
-        const bySource = { watcher: 0, siparis: 0, vade: 0 };
+        const bySource = emptyPending();
         for (const { set } of engines.all()) {
             bySource.watcher += set.watcher.clearPending();
             bySource.siparis += set.siparis.clearPending();
             bySource.vade += set.vade.clearPending();
+            try { bySource.shopstar += set.shopstar.clearPending(); } catch { /* yok say */ }
         }
+        const ef = efaturaInstance();
+        if (ef && typeof ef.clearPending === 'function') bySource.efatura = ef.clearPending();
         const cleared = Object.values(bySource).reduce((sum, n) => sum + n, 0);
         res.json({ success: true, cleared, bySource, pending: pendingSummary() });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
@@ -3702,6 +3713,19 @@ function configureEngineSet(set, profile) {
         isSuspended: isSuspendedFn,
         shouldAskSave: shouldAskSaveFn,
         saveContactText: SAVE_CONTACT_LINE,
+        // Yoğun trafik modunda aralık hesabı bu firmanın TÜM sıralarını görsün: belge kuyruğu +
+        // e-Fatura PDF sırası (yalnız entegrasyonun sahibi firmada) + ShopStar tahsilat sırası.
+        slowExtraQueued: () => {
+            let n = 0;
+            try { n += Number(shopstar.getStatus().payQueue) || 0; } catch { /* yok say */ }
+            try {
+                if (integrationOwnerId() === pid) {
+                    const ef = integrations.instance('efatura');
+                    if (ef && typeof ef.queuedCount === 'function') n += ef.queuedCount();
+                }
+            } catch { /* yok say */ }
+            return n;
+        },
     });
 
     // Sipariş bildirimi: alınan sipariş fişi oluşunca TEK sabit numaraya haber ver.
@@ -3770,6 +3794,13 @@ function configureEngineSet(set, profile) {
         getFirmaName,
         isSuspended: isSuspendedFn,
         isOptedOut: isOptedOutFn,
+        // Yoğun trafik modu bu firmanın watcher'ındaki ortak gönderim hakkıyla ShopStar'a da uygulanır.
+        slow: {
+            active: () => { try { return watcher.slowActive() === true; } catch { return false; } },
+            peek: () => watcher.slowPeek(),
+            take: () => watcher.slowTake(),
+            deadline: (from) => { try { return watcher.slowDeadline(from); } catch { return null; } },
+        },
     });
 
     // AI oto-yanıt botu: gelen WA mesajlarına Claude Haiku ile SEÇMELİ cevap.
@@ -3846,6 +3877,13 @@ integrations.configure({
     waStatus: () => ownerWa().status(),
     checkOnWhatsApp: (...a) => ownerWa().check(...a),
     gate: (ch) => ownerWa().gate(ch, null),
+    // Yoğun trafik modu (Belge Mesajları > Diğer ayarlar) e-Fatura PDF'i için de geçerli: sahibi
+    // firmanın watcher'ındaki ortak gönderim hakkı kullanılır (belge mesajı + PDF + ShopStar tek saat).
+    slow: {
+        active: () => { try { return ownerSet().watcher.slowActive() === true; } catch { return false; } },
+        take: () => ownerSet().watcher.slowTake(),
+        deadline: (from) => { try { return ownerSet().watcher.slowDeadline(from); } catch { return null; } },
+    },
     getEnabled: () => { const c = loadConfigFile(); return (c && c.efatura) || null; },
     // "Carideki tüm telefonlara gönder" belge mesajı gibi e-Fatura PDF'ine de uygulanır.
     getWatcherOptions: () => {

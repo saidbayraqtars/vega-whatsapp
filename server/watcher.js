@@ -586,11 +586,21 @@ function slowGapMs(now = Date.now()) {
     const { min, max } = slowCfg();
     let hi = max;
     const w = slowWindowNow(new Date(now));
-    if (w.open && pending.length) {
-        const fit = (w.endAt - now) / pending.length / 60000;
+    const queued = slowQueueLen();
+    if (w.open && queued) {
+        const fit = (w.endAt - now) / queued / 60000;
         hi = Math.min(max, Math.max(min + (max - min) / 2, 2 * fit - min));
     }
     return Math.round((min + Math.random() * (hi - min)) * 60000);
+}
+
+// Sıradaki toplam mesaj: belge kuyruğu + aynı firmanın e-Fatura PDF ve ShopStar kuyrukları.
+// Aralık hesabı hepsini birlikte görür; yoksa her kaynak kendi sırasına göre hızlı sanırdı.
+function slowQueueLen() {
+    let extra = 0;
+    try { if (deps && typeof deps.slowExtraQueued === 'function') extra = Math.max(0, Number(deps.slowExtraQueued()) || 0); }
+    catch { /* yardımcı kuyruk sayısı okunamadı: yalnız belge kuyruğu */ }
+    return pending.length + extra;
 }
 
 function slowStatus() {
@@ -600,9 +610,55 @@ function slowStatus() {
     const next = Math.max(Date.now(), state.slowNextAt || 0);
     return {
         minMin: min, maxMin: max, start: minToHhmm(start), end: minToHhmm(end), open: w.open,
-        nextAt: w.open && pending.length ? new Date(next).toISOString() : null,
+        nextAt: w.open && slowQueueLen() ? new Date(next).toISOString() : null,
     };
 }
+
+// ── Ortak gönderim hakkı ──────────────────────────────────────────────────────
+// Yoğun trafik modunda hattın saati TEK: belge mesajı, e-Fatura PDF ve ShopStar bildirimi
+// aynı `state.slowNextAt` hakkını paylaşır. Her kaynak kendi saatini tutsaydı hat başına
+// hız kaynak sayısıyla çarpılırdı (belge + PDF + ShopStar = 3 kat) ve ban yine gelirdi.
+//   slowPeek()  — hakkı almadan bakar (ağır sorgudan önce erken çıkış için).
+//   slowTake()  — hakkı ATOMİK alır; gönderim sürerken başka kaynak giremesin diye bekleme
+//                 anı geçici olarak ileri alınır (SLOW_INFLIGHT_MS). release(used): used=true →
+//                 gerçekten WhatsApp'a gönderim denendi, sonraki hak rastgele aralıkla ileri
+//                 alınır; used=false → hiçbir şey gönderilmedi, önceki bekleme anı geri konur.
+// Mod kapalıysa her zaman { ok:true } döner ve release bir şey yapmaz.
+const SLOW_INFLIGHT_MS = 3 * 60 * 1000;
+
+function slowPeek(now = Date.now()) {
+    if (!slowOn()) return { ok: true, active: false };
+    if (!slowWindowNow(new Date(now)).open) {
+        const { start, end } = slowCfg();
+        return { ok: false, active: true, reason: `Yoğun trafik modu: gönderim saati dışında (${minToHhmm(start)}–${minToHhmm(end)})` };
+    }
+    const next = state.slowNextAt || 0;
+    if (now < next) {
+        return { ok: false, active: true, nextAt: next, reason: `Yoğun trafik modu: sıradaki gönderim ${new Date(next).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}` };
+    }
+    return { ok: true, active: true };
+}
+
+function slowTake(now = Date.now()) {
+    const peek = slowPeek(now);
+    if (!peek.ok || !peek.active) return { ...peek, release: () => {} };
+    const prev = state.slowNextAt || 0;
+    state.slowNextAt = now + SLOW_INFLIGHT_MS;
+    saveState();
+    let done = false;
+    return {
+        ok: true, active: true,
+        release(used) {
+            if (done) return;
+            done = true;
+            state.slowNextAt = used ? Date.now() + slowGapMs() : prev;
+            saveState();
+        },
+    };
+}
+
+// Diğer kaynaklar (e-Fatura PDF, ShopStar) gün sonu silmesi için aynı kapanış saatini kullanır.
+const slowDeadlineFor = (from) => (slowOn() ? slowDeadline(from) : null);
 
 const pendingBase = (p) => ({
     ind: p.ind, cariInd: p.cariInd, name: p.name, firma: p.firma, kod: p.kod, phone: p.phone,
@@ -696,10 +752,18 @@ async function refreshQueued(pool, item) {
 
 async function processPending() {
     // Yoğun trafik: gün sonu temizliği WhatsApp bağlı olmasa da yapılır; gönderim yalnız
-    // pencere açıkken ve bekleme dolmuşsa (DB'ye de ancak o zaman gidilir).
+    // pencere açıkken ve bekleme dolmuşsa (DB'ye de ancak o zaman gidilir). Hak, e-Fatura
+    // PDF ve ShopStar ile ortaktır (slowTake): biri gönderirken diğerleri sıra bekler.
     if (slowOn()) dropExpiredSlow();
     if (!pending.length || !deps.waStatus().ready) return 0;
-    if (slowOn() && (Date.now() < (state.slowNextAt || 0) || !slowWindowNow().open)) return 0;
+    const slot = slowTake();
+    if (!slot.ok) return 0;
+    let attempted = false;
+    try { return await sendPendingItems(() => { attempted = true; }); }
+    finally { slot.release(attempted); }
+}
+
+async function sendPendingItems(markAttempt) {
     let sentCount = 0;
 
     // Kuyruktaki carileri DB'de YENİDEN doğrula: kuyruk phone+text snapshot tutar ve
@@ -768,6 +832,7 @@ async function processPending() {
                 continue;
             }
         }
+        markAttempt();
         const res = await deps.waSend(item.phone, item.text, media, { simulateTyping: config.simulateTyping, typingMs: rand(1200, 2400), channel: 'belge' });
         if (res.success) {
             noteSent('belge');
@@ -794,12 +859,8 @@ async function processPending() {
             }
             savePending();
         }
-        // Yoğun trafik: bu turda tek mesaj; sonraki için uzun, rastgele bekleme.
-        if (slowOn()) {
-            state.slowNextAt = Date.now() + slowGapMs();
-            saveState();
-            break;
-        }
+        // Yoğun trafik: bu turda tek mesaj; sonraki hak (uzun, rastgele bekleme) slot.release'te kurulur.
+        if (slowOn()) break;
         await sleep(rand(8000, 20000));
     }
     return sentCount;
@@ -1512,4 +1573,6 @@ module.exports = {
     configure, autoStart, start, stop, logEntry,
     getConfig, setConfig, getStatus, getLog, resetWatermark, pollOnce,
     setRuleMedia, clearRuleMedia, clearPending,
+    // Yoğun trafik modunun ortak gönderim hakkı (e-Fatura PDF, ShopStar de kullanır).
+    slowPeek, slowTake, slowDeadline: slowDeadlineFor, slowActive: slowOn,
 };
