@@ -1064,8 +1064,10 @@ app.get('/api/cari', async (req, res) => {
 
         r.input('offset', sql.Int, offset);
         r.input('limit', sql.Int, pageSize);
-        // SMS Gönder izinliler önce (1. öncelik), sonra ada göre.
-        const orderExpr = (info.hasSmsGonder ? 'ISNULL(SMSGONDER,0) DESC, ' : '') + nameExpr;
+        // SMS Gönder izinliler önce (1. öncelik), sonra ada göre. Son anahtar IND: aynı adlı
+        // cariler her sorguda aynı sırada gelsin — yoksa sayfa geçişinde bir cari iki kez
+        // görünüp bir başkası atlanıyordu (80 bin carili veride görüldü).
+        const orderExpr = (info.hasSmsGonder ? 'ISNULL(SMSGONDER,0) DESC, ' : '') + nameExpr + ', IND';
         // Sayfalama SQL 2008 UYUMLU: OFFSET/FETCH (SQL 2012+) yerine ROW_NUMBER
         // (SQL 2005+). Dış SELECT iç sorgunun TAKMA ADLARINI kullanır — ifadeler
         // tekrarlanmaz (selectCols ile birebir aynı sırada).
@@ -2401,9 +2403,11 @@ async function fetchBelgeKalemleri(firmaNo, donemNo, izahat, evrakno) {
         const rb = pool.request(); rb.input('e', sql.NVarChar, ev);
         const b = (await rb.query(`SELECT TOP 1 IND FROM [${bTbl}] WHERE BELGENO=@e ORDER BY IND DESC`)).recordset[0];
         if (!b) continue;
+        // SATIRNO boş/aynı olabiliyor → IND ile sabitle; yoksa kalem sırası (ve uzun ekstrede
+        // sayfa kırılımı) her sorguda değişiyordu (80 bin carili veride görüldü).
         const lines = (await pool.request().query(`
             SELECT MALINCINSI, STOKKODU, MIKTAR, BIRIM, FIYATI, GERCEKTOPLAM, KDV
-            FROM [${hTbl}] WHERE EVRAKNO=${Number(b.IND)} ORDER BY SATIRNO
+            FROM [${hTbl}] WHERE EVRAKNO=${Number(b.IND)} ORDER BY SATIRNO, IND
         `)).recordset;
         if (lines.length) return mapKalemRows(lines);
     }
