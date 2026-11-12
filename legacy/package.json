@@ -1,6 +1,6 @@
 {
   "name": "vega-whatsapp-desktop-legacy",
-  "version": "1.11.1",
+  "version": "1.11.2",
   "description": "Vega WhatsApp Legacy — Windows 7 SP1 / Server 2008 R2 / Server 2012 için masaüstü (Electron 22). Toplu mesaj + otomatik tahsilat takibi.",
   "main": "electron/main.js",
   "author": "Vega",
