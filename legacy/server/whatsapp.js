@@ -1,0 +1,877 @@
+// ─── WhatsApp servisi (Baileys / WebSocket — chromium gerekmez) ──────────────
+// proje teknik'teki çalışan servis temel alınarak toplu gönderim için uyarlandı:
+//   • QR ile bağlanma + otomatik yeniden bağlanma + durum
+//   • Metin + medya (görsel/video/belge) gönderimi
+//   • Gönderim öncesi "yazıyor..." (presence) simülasyonu — insansı görünüm
+//   • onWhatsApp ile numara WhatsApp'ta kayıtlı mı kontrolü (bot sinyalini azaltır)
+// Gönderim hızlandırma/molalar server.js tarafında yönetilir; burası tek tek
+// güvenilir gönderim sağlar.
+//
+// ÇOK HESAP (v1.5): bu dosya artık TEK bir oturum değil, oturum FABRİKASIDIR.
+// createSession({ id, authDir, label }) bağımsız bir Baileys oturumu üretir —
+// kendi auth klasörü, kendi QR'ı, kendi durumu, kendi sayacı. Böylece 2/3/4
+// telefon AYNI ANDA QR okutabilir. Hangi hesabın hangi mesajı göndereceğine
+// accounts.js karar verir (sticky eşleme + sırayla dağıtım).
+// Eski tekil API (initializeWhatsApp, sendMessage…) accounts.js üzerinden
+// sağlandığı için burada MODÜL SEVİYESİ durum kalmadı.
+
+const fs = require('fs');
+const path = require('path');
+const { normalizePhone } = require('./phone');
+const stats = require('./stats'); // gönderim/teslim/okundu/yanıt sayacı (güven paneli)
+
+// pkg altında exe dizinini, geliştirmede klasörü kullan.
+const isPkg = typeof process.pkg !== 'undefined';
+const baseDir = process.env.VEGA_BASE_DIR || (isPkg ? path.dirname(process.execPath) : __dirname);
+const DATA_DIR = path.join(baseDir, 'data');
+const VERSION_PATH = path.join(DATA_DIR, 'wa-version.json');
+const EVENTS_PATH = path.join(DATA_DIR, 'wa-events.log');
+const QR_TIMEOUT_MS = 60_000;
+
+// Güven paneli sayacını baseDir'e bağla (data/stats.json). Ledger + son gönderim
+// seti bellekte; makbuz (ack) ve gelen mesaj olayları buradan beslenir.
+stats.configure(baseDir);
+
+const ensureDir = (d) => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); };
+
+// ─── Bağlantı olay günlüğü (kalıcı, TÜM hesaplar ortak dosya) ────────────────
+// Müşteride "bağlantı sürekli düşüyor" şikâyeti teşhis edilemiyordu çünkü kopma
+// sebebi hiçbir yere yazılmıyordu. Her open/close olayı kod+mesajıyla buraya
+// eklenir; dosya 200KB'ı aşınca son yarısı tutulur. Çok hesapta satır başına
+// hesap kimliği yazılır (hangi numara koptu, ayırt edilebilsin).
+const waEventRaw = (line) => {
+    try {
+        ensureDir(DATA_DIR);
+        fs.appendFileSync(EVENTS_PATH, `${new Date().toISOString()} ${line}\n`);
+        const st = fs.statSync(EVENTS_PATH);
+        if (st.size > 200_000) {
+            const buf = fs.readFileSync(EVENTS_PATH, 'utf8');
+            fs.writeFileSync(EVENTS_PATH, buf.slice(buf.length / 2));
+        }
+    } catch { /* günlük yazılamazsa gönderim etkilenmesin */ }
+};
+
+// ─── WA protokol sürümü önbelleği (ortak) ────────────────────────────────────
+// fetchLatestBaileysVersion her bağlanışta internete çıkar; ağ sorunluyken
+// (tam da yeniden bağlanmaya çalıştığımız anda) hata verip varsayılan eski
+// sürüme düşer, bu da 405 ile bağlantının tekrar kopmasına yol açabilir.
+// Başarılı sorgu diske yazılır; sorgu başarısızsa son bilinen sürüm kullanılır.
+const loadCachedVersion = () => {
+    try {
+        const v = JSON.parse(fs.readFileSync(VERSION_PATH, 'utf8'));
+        return Array.isArray(v.version) ? v.version : null;
+    } catch { return null; }
+};
+const saveCachedVersion = (version) => {
+    try { ensureDir(DATA_DIR); fs.writeFileSync(VERSION_PATH, JSON.stringify({ version, at: Date.now() })); }
+    catch { /* yok say */ }
+};
+
+// ─── WhatsApp motoru (Baileys sürümü) ────────────────────────────────────────
+// 'v6' = @whiskeysockets/baileys 6.7 (varsayılan). 'v7' = Baileys 7 (npm takma adı
+// baileys7). Gizli numara (LID) düzenine geçmiş hesaplarda 6.7 mesajı eski tip
+// (telefon numaralı) oturumla şifreliyor; karşı telefon çözemiyor ve mesaj
+// "Mesaj bekleniyor" diye takılıyor (canlı: Ekmel Çeyiz 2026-10, 276 mesajın hiçbiri
+// teslim alındısı almadı). Baileys 7 LID eşleme deposu ve LID oturumları getiriyor.
+// Henüz sürüm adayı (rc) olduğu için müşteri başına Ayarlar'dan açılır; motor
+// değişince oturumlar SİLİNMEDEN yeniden bağlanır (restart).
+// LEGACY: Baileys paketleri Node 16 (Electron 22) için server/vendor/ altına derlenir
+// (scripts/build-vendor.js). Ham ESM paketler Node 16'da yüklenemez.
+const ENGINES = { v6: './vendor/baileys-v6.cjs', v7: './vendor/baileys-v7.cjs' };
+let engine = 'v6';
+const setEngine = (e) => { engine = ENGINES[e] ? e : 'v6'; return engine; };
+const getEngine = () => engine;
+
+// Baileys ESM modülü tüm oturumlarda ORTAK yüklenir (motor başına tek import).
+const _baileys = {};
+const loadBaileys = async (eng) => {
+    if (!_baileys[eng]) _baileys[eng] = require(ENGINES[eng]);
+    return _baileys[eng];
+};
+
+// v7'ye ilk geçişte oturum klasörünü yedekle. Baileys 7 klasöre yeni anahtarlar
+// (lid-mapping) ve LID oturumları yazar; 6.7'ye dönüşte sorun çıkarsa yedekten elle
+// geri yüklenebilsin. İşaret dosyası (.engine) klasörü en son hangi motorun
+// kullandığını tutar; v6→v7 her geçişte yedek tazelenir.
+const ENGINE_MARK = '.engine';
+const prepareAuthForEngine = (authDir, eng, log) => {
+    try {
+        const mark = path.join(authDir, ENGINE_MARK);
+        const prev = fs.existsSync(mark) ? fs.readFileSync(mark, 'utf8').trim() : 'v6';
+        if (eng === 'v7' && prev !== 'v7' && fs.existsSync(path.join(authDir, 'creds.json'))) {
+            const bak = `${authDir}-v6-yedek`;
+            fs.rmSync(bak, { recursive: true, force: true });
+            fs.cpSync(authDir, bak, { recursive: true });
+            log(`engine-backup ${path.basename(bak)}`);
+        }
+        if (prev !== eng || !fs.existsSync(mark)) { ensureDir(authDir); fs.writeFileSync(mark, eng); }
+    } catch (err) { log(`engine-backup-fail ${err.message}`); }
+};
+
+const makeLogger = () => {
+    const log = {
+        trace: () => { }, debug: () => { }, info: () => { },
+        warn: (...a) => console.warn('[Baileys]', ...a),
+        error: (...a) => console.error('[Baileys]', ...a),
+        fatal: (...a) => console.error('[Baileys][FATAL]', ...a),
+        level: 'warn',
+    };
+    log.child = () => makeLogger();
+    return log;
+};
+
+// Baileys mesaj gövdesinden düz metni çıkar (farklı sarmalayıcı tipleri).
+const extractText = (msg) => {
+    if (!msg) return '';
+    // viewOnce / ephemeral sarmalayıcılarını aç
+    const inner = msg.ephemeralMessage?.message
+        || msg.viewOnceMessage?.message
+        || msg.viewOnceMessageV2?.message
+        || msg;
+    return (
+        inner.conversation
+        || inner.extendedTextMessage?.text
+        || inner.imageMessage?.caption
+        || inner.videoMessage?.caption
+        || inner.documentMessage?.caption
+        || ''
+    ).trim();
+};
+
+// TR normalizasyonu: +90.../90.../0... hepsi tek biçime (905...) iner — aksi halde
+// 05350786101@s.whatsapp.net gibi geçersiz JID "gönderildi" görünüp teslim olmaz.
+const toJid = (phone) => `${normalizePhone(phone)}@s.whatsapp.net`;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  OTURUM FABRİKASI — her çağrı bağımsız bir WhatsApp hesabı yönetir
+// ═══════════════════════════════════════════════════════════════════════════
+//  opts: { id, authDir, label }
+//    id      → hesap kimliği ('main', 'a2'…). Günlük/sayaç dosyası adında geçer.
+//    authDir → Baileys çok-dosyalı oturum klasörü (hesap başına AYRI olmalı).
+//    label   → kullanıcıya gösterilen ad ("Satış hattı" gibi).
+function createSession({ id, authDir, label = '' }) {
+    const AUTH_DIR = authDir;
+    const STATS_PATH = path.join(DATA_DIR, id === 'main' ? 'wa-stats.json' : `wa-stats-${id}.json`);
+
+    let sock = null;
+    let isReady = false;
+    let isInitializing = false;
+    let lastError = null;
+    let currentQR = null;
+    let qrTimer = null;
+    let meId = null;
+    // Açık soketin hangi motorla kurulduğu (durum + günlük için).
+    let sockEngine = null;
+    // Hesap kaldırıldı mı? Kaldırma sırasında sock.logout() bir 'close' olayı
+    // üretiyor, o da 401'i "gerçek logout" sayıp scheduleInit ile YENİDEN bağlanma
+    // kuruyordu → silinen numara hayalet oturum olarak QR döngüsüne giriyordu.
+    // Bu bayrak açıkken hiçbir yeniden başlatma yolu çalışmaz.
+    let disposed = false;
+
+    // Gelen mesaj işleyici (AI oto-yanıt botu için). accounts.js kaydeder; sock her
+    // yeniden bağlanışta baştan kurulduğu için dinleyici initialize içinde bağlanır
+    // ve bu callback'i çağırır (removeAllListeners sonrası kaybolmasın diye).
+    let incomingHandler = null;
+    // Bağlantı kapanışını üst katmana (anti-ban) bildir. statusCode ile çağrılır;
+    // anti-ban ban-şüpheli kapanışta gönderimi soğutur. whatsapp.js düşük seviyede
+    // kalsın diye doğrudan antiban require etmez — accounts.js bağlar.
+    let disconnectHandler = null;
+    // Başarılı (kimlik doğrulanmış) açılışı üst katmana bildir: kısıtlı numara 'open'
+    // olamaz, dolayısıyla açılış önceki ban şüphesini çürütür.
+    let openHandler = null;
+    // Oturumun SUNUCU tarafından iptal edildiğini üst katmana bildir (bkz. sessionRevoked).
+    let revokedHandler = null;
+    // WhatsApp "yeni sohbet başlatma kısıtı" (reachout timelock) — yalnız Baileys 7 bildirir.
+    // Hesap bağlı kalır, eski sohbetlere yazabilir ama yeni kişiye mesaj atamaz; atmaya devam
+    // etmek kısıtı uzatır ve ban'a gider. accounts.js anti-ban soğumasına bağlar.
+    let restrictedHandler = null;
+    let reachoutLock = null;   // { until, type } | null
+
+    const waEvent = (line) => waEventRaw(`[${id}] ${line}`);
+
+    // ─── Oturum iptali / QR döngüsü koruması ─────────────────────────────────
+    // Çakışma (conflict) İKİ kapanış olayı üretir: önce "401 Stream Errored (conflict)",
+    // saniyeler sonra düz "401 Connection Failure". İkincisinin mesajında 'conflict'
+    // geçmediği için tek tek bakan koruma onu GERÇEK logout sanıp auth'u siliyordu
+    // (canlı vaka 4 Ağu 2026: 07:08:57 → 07:09:02) → her çakışma yeni QR + YENİ CİHAZ
+    // SLOTU. Aynı numara :60. slota kadar gitti; cihaz fırtınası flag sebebidir.
+    // Çözüm: ilk çakışmadan sonraki kısa pencerede gelen 401'i aynı olay say.
+    const CONFLICT_GRACE_MS = 60_000;
+    let lastConflictAt = 0;
+    // Oturumu WhatsApp iptal etti mi? (diskte bağlı kimlik varken QR isteniyor)
+    let sessionRevoked = false;
+    // Okutulmayan QR kaç tur döndü? Baileys QR süresi dolunca 408 "QR refs attempts
+    // ended" ile kapanıyor; eski kod bunu sonsuza dek yeniden deniyordu (tek günlükte
+    // 2074 tur). Her tur WhatsApp'a yeni el sıkışma = şüpheli trafik. Tavanla kes.
+    let qrCycles = 0;
+    const MAX_QR_CYCLES = 5;
+
+    // ─── 403 (hesap kısıtlı) sonrası bağlanma durdurma ────────────────────────
+    // Eski davranış: 403'te de backoff ile (en çok 60 sn) sonsuza dek yeniden
+    // bağlanıyordu. Canlı vaka (Expert Bilişim, 9-10 Eki 2026): 403'ten sonra 30
+    // saatte 820 bağlantı denemesi. Kısıtlı numarayı dövmek incelemeyi kalıcı bana
+    // çevirir. Artık 403'te otomatik bağlanma durur; kayıt oturum klasöründe
+    // tutulur, böylece uygulama yeniden başlasa da (güncelleme, Windows açılışı,
+    // durum yoklamasındaki initialize) FORBIDDEN_HOLD_MS dolmadan bağlanmaz. Süre
+    // dolunca TEK deneme yapılır; yine 403 gelirse bekleme yenilenir. Kullanıcı
+    // telefonda numaranın açıldığını görünce "Yeniden bağlan" (resume) ile kaldırır.
+    const FORBIDDEN_HOLD_MS = 24 * 60 * 60 * 1000;
+    const FORBIDDEN_PATH = path.join(AUTH_DIR, 'forbidden.json');
+    const FORBIDDEN_TEXT = 'WhatsApp bu numarayı kısıtladı (403). Otomatik bağlanma durduruldu — numarayı telefonda kontrol edin, açıldıysa "Yeniden bağlan"a basın.';
+    const readForbidden = () => {
+        try {
+            const f = JSON.parse(fs.readFileSync(FORBIDDEN_PATH, 'utf8'));
+            return f && Number(f.at) > 0 ? f : null;
+        } catch { return null; }
+    };
+    const forbiddenActive = () => {
+        const f = readForbidden();
+        return f && Date.now() - Number(f.at) < FORBIDDEN_HOLD_MS ? f : null;
+    };
+    const markForbidden = () => {
+        try { ensureDir(AUTH_DIR); fs.writeFileSync(FORBIDDEN_PATH, JSON.stringify({ at: Date.now() })); }
+        catch { /* yazılamazsa bu çalışmada yine durur (retry kurulmuyor) */ }
+    };
+    const clearForbidden = () => { try { fs.rmSync(FORBIDDEN_PATH, { force: true }); } catch { /* yok say */ } };
+
+    // ─── Gönderilen mesaj önbelleği (retry/yeniden şifreleme için) ───────────
+    // WhatsApp karşı taraf mesajı çözemeyince retry ister; Baileys getMessage(key)
+    // ile orijinali isteyip YENİDEN şifreler. undefined dönersek mesaj karşıda
+    // "Mesaj bekleniyor..." takılır. id → message proto (son ~400 gönderim tutulur).
+    const sentMsgCache = new Map();
+    const cacheSentMessage = (mid, message) => {
+        if (!mid || !message) return;
+        sentMsgCache.set(mid, message);
+        if (sentMsgCache.size > 400) sentMsgCache.delete(sentMsgCache.keys().next().value);
+    };
+
+    // ─── Günlük gönderim sayacı (kalıcı, HESAP BAŞINA) ───────────────────────
+    // Günlük tavan iş (job) bazlı değil hesap bazlı anlamlı: aynı gün başlatılan
+    // ikinci toplu gönderim de aynı tavandan düşmeli (ban riski hesaba göre işler).
+    const todayKey = () => new Date().toISOString().slice(0, 10);
+    let dailyStats = { date: todayKey(), sent: 0 };
+    try {
+        const s = JSON.parse(fs.readFileSync(STATS_PATH, 'utf8'));
+        if (s && s.date === todayKey()) dailyStats = s;
+    } catch { /* ilk çalıştırma */ }
+    const bumpDailySent = () => {
+        if (dailyStats.date !== todayKey()) dailyStats = { date: todayKey(), sent: 0 };
+        dailyStats.sent++;
+        try { ensureDir(DATA_DIR); fs.writeFileSync(STATS_PATH, JSON.stringify(dailyStats)); } catch { /* yok say */ }
+    };
+    const getDailySent = () => (dailyStats.date === todayKey() ? dailyStats.sent : 0);
+
+    // ─── Bağlantı bekleyicileri ──────────────────────────────────────────────
+    // Bağlantı koptuğunda gönderim döngüleri burada bekler; "open" gelince hepsi
+    // uyandırılır. Böylece mesajlar kaybolmaz, sırada birikir ve bağlanınca akar.
+    let readyWaiters = [];
+    const notifyReady = () => {
+        const waiters = readyWaiters;
+        readyWaiters = [];
+        for (const resolve of waiters) resolve(true);
+    };
+    // isReady olana kadar bekle. timeoutMs > 0 verilirse süre dolunca false döner
+    // (çağıran taraf iptal kontrolü yapıp tekrar bekleyebilsin diye).
+    const waitForReady = (timeoutMs = 0) => {
+        if (isReady) return Promise.resolve(true);
+        return new Promise((resolve) => {
+            let timer = null;
+            const entry = (ok) => { if (timer) clearTimeout(timer); resolve(ok); };
+            if (timeoutMs > 0) {
+                timer = setTimeout(() => {
+                    readyWaiters = readyWaiters.filter((w) => w !== entry);
+                    resolve(false);
+                }, timeoutMs);
+            }
+            readyWaiters.push(entry);
+        });
+    };
+
+    // Yeniden başlatmayı tek timer'la debounce et (hata döngüsünde spam olmasın).
+    let retryTimer = null;
+    const scheduleInit = (ms) => {
+        if (disposed || retryTimer) return;
+        retryTimer = setTimeout(() => {
+            retryTimer = null;
+            if (!isReady && !isInitializing) initialize();
+        }, ms);
+    };
+    // Bekleyen otomatik yeniden-bağlanmayı iptal et. Kullanıcı elle "QR oluştur"a
+    // bastığında çağrılır: zamanlanmış reconnect ile elle başlatma yarışmasın.
+    const clearRetry = () => { if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; } };
+
+    // Üst üste kopmalarda bekleme süresini artır (3s → 6s → 12s ... 60s tavan).
+    // Sabit 3sn ile sorunlu ağda saniyede bir el sıkışma denenip WhatsApp tarafında
+    // şüpheli trafik oluşuyordu; başarılı bağlantı sayacı sıfırlar.
+    let reconnectFails = 0;
+    const backoffMs = () => Math.min(3000 * Math.pow(2, Math.min(reconnectFails, 5)), 60_000);
+
+    // badSession (500) üst üste kaç kez geldi? İlk gelişte oturum silinmez (geçici
+    // senkron hatası olabilir), 2. üst üste gelişte gerçekten bozuk sayılıp silinir.
+    // Başarılı "open" sayacı sıfırlar.
+    let badSessionFails = 0;
+
+    const getStatus = () => ({
+        id,
+        label,
+        ready: isReady,
+        initializing: isInitializing,
+        hasQr: !!currentQR,
+        qr: currentQR,
+        error: lastError,
+        me: meId,
+        revoked: sessionRevoked,
+        forbidden: (() => { const f = forbiddenActive(); return f ? { at: f.at, until: Number(f.at) + FORBIDDEN_HOLD_MS } : null; })(),
+        daySent: getDailySent(),
+        engine: sockEngine || engine,
+        restricted: reachoutLock && reachoutLock.until > Date.now() ? reachoutLock : null,
+    });
+
+    // Diskteki oturumda bağlı bir kimlik var mı? (creds.json → me.id) Baileys QR
+    // istiyorsa ama diskte kimlik VARSA, oturumu biz düşürmedik: WhatsApp iptal etti
+    // (kullanıcı "bağlı cihazlar"dan çıkardı ya da hesap kısıtlandı).
+    const credsIdentity = () => {
+        try {
+            const c = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, 'creds.json'), 'utf8'));
+            return c?.me?.id || null;
+        } catch { return null; }
+    };
+
+    const clearQrTimer = () => { if (qrTimer) { clearTimeout(qrTimer); qrTimer = null; } };
+
+    const cleanupSocket = () => {
+        if (sock) {
+            try { sock.ev.removeAllListeners(); } catch { /* yok say */ }
+            try { sock.end(); } catch { /* yok say */ }
+            sock = null;
+        }
+    };
+
+    const wipeAuth = () => {
+        if (fs.existsSync(AUTH_DIR)) {
+            try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); }
+            catch (err) { console.error(`[WhatsApp:${id}] Auth temizlenemedi:`, err.message); }
+        }
+    };
+
+    const initialize = async () => {
+        if (disposed || isReady || isInitializing) return getStatus();
+        // 403 bekleme süresi dolmadıysa hiç el sıkışma yapma (bkz. FORBIDDEN_HOLD_MS).
+        if (forbiddenActive()) { lastError = FORBIDDEN_TEXT; currentQR = null; return getStatus(); }
+
+        isInitializing = true;
+        lastError = null;
+        currentQR = null;
+        clearQrTimer();
+        console.log(`[WhatsApp:${id}] Başlatılıyor...`);
+
+        try {
+            let eng = engine;
+            let lib;
+            try {
+                lib = await loadBaileys(eng);
+            } catch (err) {
+                if (eng === 'v6') throw err;
+                // v7 yüklenemedi (eksik/bozuk paket): hesabı WhatsApp'sız bırakma, 6.7 ile aç.
+                console.error(`[WhatsApp:${id}] Yeni motor yüklenemedi, 6.7 ile devam:`, err.message);
+                waEvent(`engine-load-fail v7 ${err.message}`);
+                eng = 'v6';
+                lib = await loadBaileys(eng);
+            }
+            sockEngine = eng;
+            const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = lib;
+
+            ensureDir(AUTH_DIR);
+            prepareAuthForEngine(AUTH_DIR, eng, waEvent);
+            const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+            // Baileys 7: LID eşleme + LID oturumları her gönderimde anahtar deposuna çok sayıda
+            // okuma yapar; çok-dosyalı depo her okumada diske gider. Baileys'in önerdiği bellek
+            // önbelleği (yazma yine diske). 6.7 davranışı değişmesin diye yalnız v7'de.
+            const auth = eng === 'v7' && typeof makeCacheableSignalKeyStore === 'function'
+                ? { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, makeLogger()) }
+                : state;
+
+            let version;
+            try {
+                const fetched = await fetchLatestBaileysVersion();
+                version = fetched.version;
+                saveCachedVersion(version);
+                console.log(`[WhatsApp:${id}] WA protokol sürümü:`, version.join('.'));
+            } catch (err) {
+                version = loadCachedVersion() || undefined;
+                console.warn(`[WhatsApp:${id}] Sürüm sorgulanamadı,`, version ? `önbellek: ${version.join('.')}` : 'varsayılan kullanılacak.', '—', err.message);
+            }
+
+            sock = makeWASocket({
+                logger: makeLogger(),
+                printQRInTerminal: false,
+                auth,
+                version,
+                connectTimeoutMs: 60_000,
+                defaultQueryTimeoutMs: 60_000,
+                keepAliveIntervalMs: 25_000,
+                // Bağlanınca hesabı "online" İŞARETLEME. Varsayılan true; online olunca WA
+                // bildirimleri aktif cihaza (bu programa) yönlendirir → telefon/diğer bağlı
+                // cihazlar push ALMAZ. false → telefon birincil kalır, bildirimler oraya düşer;
+                // program yine sessizce mesaj gönderir/alır.
+                markOnlineOnConnect: false,
+                browser: ['Vega Toplu Mesaj', 'Chrome', '120.0'],
+                // Geçmiş sohbetleri telefondan çekme. 6.7'de varsayılan false, Baileys 7'de
+                // true: eşleşmede telefon tüm geçmişi göndermeye çalışır (büyük hesapta
+                // dakikalarca indirme/işleme). Programın geçmişe ihtiyacı yok.
+                syncFullHistory: false,
+                // Karşı taraf mesajı çözemeyince (yeni oturum/anahtar uyuşmazlığı) WA bir
+                // "retry receipt" gönderir; Baileys mesajı YENİDEN şifreleyip göndermek için
+                // getMessage(key) ile orijinal içeriği ister. Burada undefined dönersek
+                // yeniden gönderim OLMAZ → mesaj karşıda "Mesaj bekleniyor..." takılır.
+                // Bu yüzden gönderdiğimiz mesajları kısa süre cache'te tutup buradan döndürüyoruz.
+                getMessage: async (key) => sentMsgCache.get(key?.id) || undefined,
+            });
+
+            sock.ev.on('creds.update', saveCreds);
+
+            // Gönderim TANILAMA: gönderdiğimiz mesajların gerçek teslim durumunu (ack) günlüğe
+            // yaz. status: 1=PENDING 2=SERVER_ACK(WhatsApp aldı) 3=DELIVERY_ACK(karşıya ulaştı)
+            // 4=READ. "gönderildi deyip ulaşmıyor" şikayetinde: SERVER_ACK var ama DELIVERY_ACK
+            // hiç gelmiyorsa WhatsApp kabul edip düşürüyor (shadow/anti-bot); hiç ack yoksa relay
+            // olmuyor (protokol/sürüm). Teşhis için kritik.
+            sock.ev.on('messages.update', (updates) => {
+                for (const u of (updates || [])) {
+                    if (u?.key?.fromMe && u?.update && u.update.status != null) {
+                        // status=0 (ERROR): Baileys 7 sunucunun hata kodunu messageStubParameters'a koyar
+                        // (463 = hesap kısıtlı / gizlilik jetonu yok, 479 = adresleme reddi).
+                        const err = u.update.status === 0 && Array.isArray(u.update.messageStubParameters)
+                            ? ` err=${u.update.messageStubParameters.join('|')}` : '';
+                        waEvent(`ack id=${u.key.id} to=${u.key.remoteJid} status=${u.update.status}${err}`);
+                        // Güven paneli: teslim (3) / okundu (4) sayımı.
+                        try { stats.onAck(u.key.id, u.update.status); } catch { /* yok say */ }
+                    }
+                }
+            });
+
+            // Gelen mesajlar → AI oto-yanıt botu. Yalnız: bize gelen (fromMe değil),
+            // birebir sohbet (@s.whatsapp.net — grup/broadcast/status hariç), metin
+            // içeren. Filtre/karar/gönderim incomingHandler'da (ai-bot.js). type
+            // 'notify' = canlı yeni mesaj (append = geçmiş senkronu, atlanır).
+            sock.ev.on('messages.upsert', async ({ messages, type }) => {
+                if (type !== 'notify' || !incomingHandler) return;
+                for (const m of (messages || [])) {
+                    try {
+                        if (!m.message || m.key?.fromMe) continue;
+                        const jid = m.key?.remoteJid || '';
+                        // Birebir sohbet: @s.whatsapp.net VEYA @lid (WhatsApp gizli-numara /
+                        // Linked ID formatı). @lid'de gerçek telefon Baileys 6.7'de
+                        // key.senderPn'de, Baileys 7'de key.remoteJidAlt'ta gelir; ikisi de
+                        // yoksa v7'nin LID eşleme deposuna sorulur.
+                        // Grup(@g.us)/broadcast/status hariç.
+                        let phone = null;
+                        if (jid.endsWith('@s.whatsapp.net')) {
+                            phone = jid.split('@')[0];
+                        } else if (jid.endsWith('@lid')) {
+                            let pn = m.key?.remoteJidAlt || m.key?.senderPn || m.key?.participantPn || '';
+                            if (!pn.endsWith('@s.whatsapp.net')) {
+                                try { pn = (await sock?.signalRepository?.lidMapping?.getPNForLID?.(jid)) || ''; }
+                                catch { pn = ''; }
+                            }
+                            // Cihaz son eki olabilir (905xx:12@s.whatsapp.net) → yalnız numara.
+                            if (pn.includes('@')) phone = pn.split('@')[0].split(':')[0];
+                        } else {
+                            continue;
+                        }
+                        // Güven paneli: bize mesaj attığımız numaradan gelen = yanıt (metin/medya farketmez).
+                        try { stats.onIncoming(phone); } catch { /* yok say */ }
+                        const text = extractText(m.message);
+                        if (!text) continue;
+                        if (!phone) { waEvent(`incoming-nopn jid=${jid}`); continue; }
+                        waEvent(`incoming from=${phone} jid=${jid} len=${text.length}`);
+                        // accountId: yanıt AYNI hattan gitsin (müşteri iki numaradan mesaj almasın).
+                        await incomingHandler({ phone, text, jid, id: m.key?.id || null, accountId: id });
+                    } catch (err) {
+                        waEvent(`incoming-err ${err.message}`);
+                    }
+                }
+            });
+
+            sock.ev.on('connection.update', (update) => {
+                const { connection, lastDisconnect, qr } = update;
+
+                // Baileys 7: yeni sohbet kısıtı başladı/kalktı. Bitiş zamanı yoksa WA Web gibi +60 sn.
+                if (update.reachoutTimeLock) {
+                    const r = update.reachoutTimeLock;
+                    if (r.isActive) {
+                        const t = r.timeEnforcementEnds ? new Date(r.timeEnforcementEnds).getTime() : NaN;
+                        reachoutLock = { until: Number.isFinite(t) ? t : Date.now() + 60_000, type: r.enforcementType || null };
+                        waEvent(`reachout-timelock active until=${new Date(reachoutLock.until).toISOString()} type=${reachoutLock.type || ''}`);
+                        try { restrictedHandler && restrictedHandler(meId || credsIdentity(), reachoutLock.until); } catch { /* yok say */ }
+                    } else {
+                        reachoutLock = null;
+                        waEvent('reachout-timelock lifted');
+                    }
+                }
+
+                if (qr) {
+                    // Diskte BAĞLI bir kimlik dururken QR isteniyorsa oturumu biz
+                    // düşürmedik: WhatsApp iptal etmiştir (kullanıcı "bağlı cihazlar"dan
+                    // çıkardı ya da hesap kısıtlandı). Bunu sessizce yeni QR turu sanmak
+                    // ölümcül: her eşleşme YENİ bir cihaz slotu yakar (canlı vaka: aynı
+                    // numara :60. slotta) ve cihaz fırtınası başlı başına flag sebebidir.
+                    const linkedId = credsIdentity();
+                    if (linkedId && !sessionRevoked) {
+                        sessionRevoked = true;
+                        meId = meId || linkedId;
+                        waEvent(`session-revoked me=${linkedId}`);
+                        lastError = 'WhatsApp oturumu iptal edildi. Numara "Bağlı cihazlar"dan çıkarılmış ya da hesap kısıtlanmış olabilir. Yeniden QR okutmadan önce numaranın durumunu telefondan kontrol edin.';
+                        try { revokedHandler && revokedHandler(linkedId); } catch { /* yok say */ }
+                    }
+                    currentQR = qr;
+                    isReady = false;
+                    isInitializing = false;
+                    clearQrTimer();
+                    console.log(`[WhatsApp:${id}] QR hazır — telefonla okutun.`);
+                }
+
+                if (connection === 'open') {
+                    isReady = true;
+                    isInitializing = false;
+                    currentQR = null;
+                    lastError = null;
+                    meId = sock?.user?.id || null;
+                    reconnectFails = 0;
+                    badSessionFails = 0;
+                    // Başarılı açılış: çakışma gerçekten iyi huyluydu, oturum geçerli.
+                    lastConflictAt = 0;
+                    sessionRevoked = false;
+                    qrCycles = 0;
+                    clearQrTimer();
+                    console.log(`[WhatsApp:${id}] Bağlantı kuruldu!`, meId || '');
+                    waEvent(`open ${meId || ''} engine=${sockEngine}`);
+                    // Anti-ban: açılış = önceki 403/401 yanlış alarmdı → soğumayı kaldır.
+                    try { openHandler && openHandler(meId); } catch { /* yok say */ }
+                    notifyReady();
+                }
+
+                if (connection === 'close') {
+                    clearQrTimer();
+                    const statusCode = lastDisconnect?.error?.output?.statusCode;
+                    const errMsg = lastDisconnect?.error?.message;
+                    console.log(`[WhatsApp:${id}] Bağlantı kapandı. Kod: ${statusCode}, mesaj: ${errMsg}`);
+                    waEvent(`close code=${statusCode} msg=${errMsg || ''}`);
+                    isReady = false;
+                    cleanupSocket();
+
+                    // Aynı oturum başka yerde açıldı (WhatsApp Web / ikinci kopya). Baileys
+                    // bunu 440 connectionReplaced ile bildirir; bazı sürümlerde 401 +
+                    // "Stream Errored (conflict)" olarak gelir. İkincisi 401 sanılıp oturum
+                    // SİLİNİYORDU → her WA Web açılışında QR fırtınası. Çakışma oturumu
+                    // geçersiz kılmaz: silme, sadece daha uzun bekle.
+                    // DİKKAT: çakışma İKİ kapanış üretiyor; ikincisinde mesajda 'conflict'
+                    // GEÇMİYOR (canlı 4 Ağu: 07:08:57 "401 (conflict)" → 07:09:02 düz "401
+                    // Connection Failure"). Olaya tek tek bakınca ikincisi gerçek logout
+                    // sanılıp auth siliniyordu. Kısa pencereyle aynı olay say.
+                    const conflictNow =
+                        statusCode === DisconnectReason.connectionReplaced ||
+                        statusCode === 440 ||
+                        /conflict|replaced/i.test(String(errMsg || ''));
+                    if (conflictNow) lastConflictAt = Date.now();
+                    const conflict = conflictNow || (Date.now() - lastConflictAt < CONFLICT_GRACE_MS);
+                    if (conflict) {
+                        lastError = 'Bu WhatsApp oturumu başka bir yerde açıldı (WhatsApp Web / ikinci kopya). Diğer oturumu kapatın.';
+                    }
+
+                    // Anti-ban: ban-şüpheli kapanış / fırtına → gönderim soğuması. meId
+                    // kapanışta korunur; oturum hiç açılmadıysa (connect'te 403) diskteki
+                    // kimlik gider. Anti-ban'ın "son bilinen numara" yedeği çok hesapta
+                    // BAŞKA hattı soğutuyordu (canlı 12 Eki: ana hattın 403'ü ikinci
+                    // numaraya yazıldı). Çakışma kararını BURADA çözüp geçiriyoruz —
+                    // antiban tek mesaja bakarak aynı hatayı yapmasın.
+                    try { disconnectHandler && disconnectHandler(statusCode, meId || credsIdentity(), errMsg, conflict); } catch { /* yok say */ }
+
+                    // Okutulmayan QR turu: Baileys süre dolunca 408 "QR refs attempts ended"
+                    // ile kapanıyor. Eski kod bunu sonsuza dek yeniden deniyordu (tek
+                    // günlükte 2074 tur) — her tur WhatsApp'a yeni el sıkışma demek.
+                    if (statusCode === 408 && /QR refs/i.test(String(errMsg || ''))) qrCycles++;
+
+                    // badSession (500) çoğu zaman geçici senkron hatası; ilk gelişte
+                    // oturumu SİLMEDEN diskten yeniden bağlan, ÜST ÜSTE 2. kez gelirse
+                    // gerçekten bozuk say ve auth'u sil (yeni QR). open olunca sıfırlanır.
+                    const isBadSession = statusCode === DisconnectReason.badSession;
+                    if (isBadSession) badSessionFails++;
+                    else badSessionFails = 0; // araya başka kod girerse "üst üste" sıfırlanır
+                    // 403 = hesap kısıtlı: oturumu SİLME (yeni QR = yeni cihaz slotu) ve
+                    // yeniden bağlanma kurma. Kayıt diske yazılır (bkz. FORBIDDEN_HOLD_MS).
+                    if (statusCode === 403 && !conflict) {
+                        markForbidden();
+                        isInitializing = false;
+                        currentQR = null;
+                        clearRetry();
+                        lastError = FORBIDDEN_TEXT;
+                        waEvent('forbidden-stopped');
+                        return;
+                    }
+
+                    const shouldWipe = !conflict && (
+                        statusCode === DisconnectReason.loggedOut ||
+                        statusCode === 401 ||
+                        (isBadSession && badSessionFails >= 2));
+
+                    if (shouldWipe) {
+                        wipeAuth();
+                        isInitializing = false;
+                        currentQR = null;
+                        lastError = null;
+                        reconnectFails = 0;
+                        badSessionFails = 0;
+                        scheduleInit(1500);
+                    } else if (sessionRevoked || qrCycles >= MAX_QR_CYCLES) {
+                        // Otomatik döngüyü DURDUR. Oturum iptal edildiyse ya da QR
+                        // okutulmuyorsa yeniden denemek numaraya zarar veriyor: her tur
+                        // yeni el sıkışma, her yeni eşleşme yeni cihaz slotu. Kullanıcı
+                        // "Yenile"ye basınca (refresh) sayaçlar sıfırlanıp devam eder.
+                        isInitializing = false;
+                        clearRetry();
+                        if (!sessionRevoked) {
+                            lastError = 'QR okutulmadı — otomatik yeniden deneme durduruldu. Devam etmek için "Yenile"ye basın.';
+                        }
+                        waEvent(`qr-loop-stopped cycles=${qrCycles} revoked=${sessionRevoked}`);
+                    } else {
+                        isInitializing = false;
+                        currentQR = null;
+                        scheduleInit(conflict ? 20_000 : backoffMs());
+                        reconnectFails++;
+                    }
+                }
+            });
+
+            // "QR yok, open yok, close yok" takılma durumuna karşı koruma.
+            qrTimer = setTimeout(() => {
+                if (!isReady && !currentQR) {
+                    console.warn(`[WhatsApp:${id}] QR zaman aşımı, yeniden deneniyor.`);
+                    lastError = 'QR oluşturulamadı, yeniden deneniyor...';
+                    cleanupSocket();
+                    isInitializing = false;
+                    // Oturum iptalinde bu yol da döngüye girmemeli (yukarıdaki gerekçe).
+                    if (!sessionRevoked) scheduleInit(500);
+                }
+            }, QR_TIMEOUT_MS);
+
+        } catch (err) {
+            lastError = err.message;
+            isInitializing = false;
+            isReady = false;
+            cleanupSocket();
+            clearQrTimer();
+            console.error(`[WhatsApp:${id}] Başlatma hatası:`, err.message);
+            scheduleInit(5000);
+        }
+
+        return getStatus();
+    };
+
+    // 403 sonrası elle yeniden bağlanma: oturum SİLİNMEZ (QR gerekmez, yeni cihaz
+    // slotu açılmaz). Kullanıcı numaranın telefonda açıldığını doğruladığında.
+    const resume = async () => {
+        console.log(`[WhatsApp:${id}] Elle yeniden bağlanma (403 durdurması kaldırıldı).`);
+        clearForbidden();
+        clearRetry();
+        cleanupSocket();
+        clearQrTimer();
+        isReady = false;
+        isInitializing = false;
+        lastError = null;
+        reconnectFails = 0;
+        waEvent('forbidden-resume');
+        return initialize();
+    };
+
+    const refresh = async () => {
+        console.log(`[WhatsApp:${id}] Manuel yenileme (oturum sıfırlanır).`);
+        clearRetry();          // bekleyen otomatik reconnect'i kır — elle QR'a öncelik ver
+        cleanupSocket();
+        clearQrTimer();
+        isReady = false;
+        isInitializing = false;
+        currentQR = null;
+        lastError = null;
+        meId = null;
+        reconnectFails = 0;
+        badSessionFails = 0;
+        // Kullanıcı bilerek yeni oturum istiyor: iptal/QR-döngüsü kilitlerini kaldır.
+        sessionRevoked = false;
+        qrCycles = 0;
+        lastConflictAt = 0;
+        wipeAuth();
+        return initialize();
+    };
+
+    // Oturumu SİLMEDEN yeniden bağlan (motor değişimi). Yeni QR istemez; disk
+    // oturumu yeni motorla açılır. Zamanlanmış yeniden denemeyi kırar.
+    const restart = async () => {
+        if (disposed) return getStatus();
+        clearRetry();
+        clearQrTimer();
+        cleanupSocket();
+        isReady = false;
+        isInitializing = false;
+        currentQR = null;
+        waEvent(`restart engine=${engine}`);
+        return initialize();
+    };
+
+    // Çıkış yap (auth silinir → yeni QR ister). shutdown=true ise yeniden
+    // başlatılmaz; hesap silinirken kullanılır.
+    const logout = async ({ shutdown = false } = {}) => {
+        // Kaldırma: bayrağı ÖNCE koy — logout'un tetiklediği 'close' olayı
+        // yeniden bağlanma zamanlamasın (hayalet oturum).
+        if (shutdown) disposed = true;
+        clearRetry();
+        clearQrTimer();
+        try { if (sock) await sock.logout(); } catch { /* yok say */ }
+        cleanupSocket();
+        isReady = false;
+        isInitializing = false;
+        meId = null;
+        reconnectFails = 0;
+        badSessionFails = 0;
+        sessionRevoked = false;
+        qrCycles = 0;
+        lastConflictAt = 0;
+        wipeAuth();
+        if (shutdown) { currentQR = null; lastError = 'Hesap kapatıldı.'; }
+        return getStatus();
+    };
+
+    // Numara WhatsApp'ta kayıtlı mı? Kayıtlı değilse gönderme (ban sinyalini azaltır).
+    // transient=true → sonuç güvenilmez (bağlantı yok / sorgu hatası / boş yanıt);
+    // çağıran taraf numarayı "WhatsApp'ta yok" sayıp kalıcı atlamamalı, tekrar denemeli.
+    // (Baileys yeniden bağlanmanın hemen ardından onWhatsApp'a boş dizi dönebiliyor —
+    // gerçek kullanıcılar "kullanıcı değil" sanılıp mesajsız kalıyordu.)
+    const checkOnWhatsApp = async (phone) => {
+        if (!isReady || !sock) return { exists: false, transient: true, error: 'WhatsApp bağlı değil.' };
+        try {
+            const clean = normalizePhone(phone);
+            if (!clean) return { exists: false, transient: false, error: 'Geçersiz numara.' };
+            const results = await sock.onWhatsApp(clean);
+            if (!Array.isArray(results) || !results.length) {
+                return { exists: false, transient: true, error: 'Sorgu boş yanıt verdi' };
+            }
+            const r = results[0];
+            return { exists: !!r?.exists, jid: r?.jid || null };
+        } catch (err) {
+            return { exists: false, transient: true, error: err.message };
+        }
+    };
+
+    // İnsansı görünüm: "yazıyor..." durumu gönder, kısa bekle.
+    const simulateTyping = async (jid, ms = 1500) => {
+        try {
+            await sock.presenceSubscribe(jid);
+            await sock.sendPresenceUpdate('composing', jid);
+            await new Promise((r) => setTimeout(r, ms));
+            await sock.sendPresenceUpdate('paused', jid);
+        } catch { /* presence başarısızlığı gönderimi engellemesin */ }
+    };
+
+    // Tek mesaj gönder. media: { kind:'image'|'video'|'document', buffer, mimetype, fileName } | null
+    const sendMessage = async (phone, text, media = null, opts = {}) => {
+        if (!isReady || !sock) return { success: false, error: 'WhatsApp bağlı değil.' };
+        // Zombi bağlantı koruması: connection.update 'open' geldi ama alttaki WebSocket
+        // temiz bir 'close' olayı gelmeden sessizce kapandıysa isReady bayrağı yanıltıcı
+        // kalır → sock.sendMessage throw ETMEDEN çözülür, "gönderildi" loglanır ama mesaj
+        // TESLİM OLMAZ. Gerçek WS durumunu kontrol et: kapalıysa başarısız say + yeniden
+        // bağlanmayı tetikle (üst katman kuyruğa alır/yeniden dener). isOpen yalnız KESİN
+        // false ise müdahale et (tanımsız/ara durumda eski davranışı koru).
+        if (sock.ws && sock.ws.isOpen === false) {
+            isReady = false;
+            waEvent('send-abort ws-not-open (zombie)');
+            scheduleInit(500);
+            return { success: false, error: 'WhatsApp bağlantısı kopuk (yeniden bağlanılıyor).' };
+        }
+        const clean = normalizePhone(phone);
+        if (!clean) return { success: false, error: 'Geçersiz numara.' };
+        const jid = `${clean}@s.whatsapp.net`;
+
+        try {
+            if (opts.simulateTyping) await simulateTyping(jid, opts.typingMs || 1500);
+
+            let content;
+            const caption = text || '';
+            if (media && media.buffer) {
+                if (media.kind === 'image') {
+                    content = { image: media.buffer, caption, mimetype: media.mimetype || 'image/jpeg' };
+                } else if (media.kind === 'video') {
+                    content = { video: media.buffer, caption, mimetype: media.mimetype || 'video/mp4' };
+                } else {
+                    content = {
+                        document: media.buffer,
+                        mimetype: media.mimetype || 'application/octet-stream',
+                        fileName: media.fileName || 'dosya',
+                        caption,
+                    };
+                }
+            } else {
+                content = { text: caption };
+            }
+
+            const sent = await sock.sendMessage(jid, content);
+            // Retry/yeniden şifreleme için orijinali sakla (getMessage buradan döndürür).
+            cacheSentMessage(sent?.key?.id, sent?.message);
+            bumpDailySent();
+            // Güven paneli: gönderim kaydı (ack geldikçe teslim/okundu bu id'ye işlenir).
+            try { stats.recordSent({ id: sent?.key?.id, phone: clean, channel: opts.channel }); } catch { /* yok say */ }
+            // TANILAMA: relay sonucu. id varsa Baileys WA sunucusuna iletti; ardından gelen
+            // 'ack' satırları (messages.update) gerçek teslimi gösterir. id YOKSA relay olmadı.
+            waEvent(`send-ok to=${clean} id=${sent?.key?.id || 'YOK'}`);
+            return { success: true, id: sent?.key?.id || null, accountId: id };
+        } catch (err) {
+            console.error(`[WhatsApp:${id}] Gönderim hatası →`, clean, err.message);
+            waEvent(`send-fail to=${clean} err=${err.message}`);
+            try { stats.recordFail(opts.channel); } catch { /* yok say */ }
+            return { success: false, error: err.message, accountId: id };
+        }
+    };
+
+    // Gönderilmiş bir mesajı herkesten geri çek (delete-for-everyone). id = sendMessage'ın
+    // döndürdüğü key.id. WhatsApp ~2 gün sınırı koyar; daha eski mesajda sunucu hata döner.
+    // Birebir (DM) sohbet olduğu için key.participant gerekmez.
+    const deleteMessage = async (phone, msgId) => {
+        if (!isReady || !sock) return { success: false, error: 'WhatsApp bağlı değil.' };
+        if (!msgId) return { success: false, error: 'Mesaj kimliği yok.' };
+        const clean = normalizePhone(phone);
+        if (!clean) return { success: false, error: 'Geçersiz numara.' };
+        const jid = `${clean}@s.whatsapp.net`;
+        try {
+            await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: true, id: msgId } });
+            waEvent(`recall-ok to=${clean} id=${msgId}`);
+            return { success: true };
+        } catch (err) {
+            waEvent(`recall-fail to=${clean} id=${msgId} err=${err.message}`);
+            return { success: false, error: err.message };
+        }
+    };
+
+    return {
+        id,
+        get label() { return label; },
+        set label(v) { label = v; },
+        authDir: AUTH_DIR,
+        initialize,
+        refresh,
+        resume,
+        restart,
+        logout,
+        getStatus,
+        sendMessage,
+        deleteMessage,
+        checkOnWhatsApp,
+        getDailySent,
+        waitForReady,
+        setIncomingHandler: (fn) => { incomingHandler = fn; },
+        setDisconnectHandler: (fn) => { disconnectHandler = fn; },
+        setOpenHandler: (fn) => { openHandler = fn; },
+        setRevokedHandler: (fn) => { revokedHandler = fn; },
+        setRestrictedHandler: (fn) => { restrictedHandler = fn; },
+        get client() { return sock; },
+    };
+}
+
+module.exports = { createSession, toJid, baseDir, DATA_DIR, setEngine, getEngine, ENGINES, prepareAuthForEngine };

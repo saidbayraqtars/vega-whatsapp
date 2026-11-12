@@ -5,7 +5,7 @@
 node_modules/
 dist/
 **/server/build/
-legacy/server-dist/
+legacy/server/vendor/
 
 # Çalışma verileri — ASLA commit edilmez:
 # config.json şifreli DB parolası + PIN hash içerir; data/ WhatsApp oturumu içerir.

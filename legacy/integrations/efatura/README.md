@@ -1,0 +1,89 @@
+# Vega e-Fatura / e-Arsiv WhatsApp entegrasyonu
+
+Bu klasor kurulumda `C:\Program Files\Vega WhatsApp\integrations\efatura`
+altina kopyalanir ve Vega WhatsApp acilirken otomatik yuklenir.
+
+## Acma / kapama
+
+Guncellemeyle herkese dagitildigi icin **varsayilan KAPALI**dir. Ayarlar >
+**e-Fatura PDF gonderimi** > "Fatura kesilince PDF'i musteriye WhatsApp'tan
+gonder" isaretlenip Kaydet'e basilinca calisir. Kapaliyken satis faturalari
+eskisi gibi Belge Mesajlari'ndan metin olarak gider.
+
+Tusun acildigi andaki en yuksek `IND` baslangic kabul edilir: once kesilmis
+faturalar gonderilmez. Bundan sonra Vega satis faturasi (`BELGETIPI=21`) 16
+karakterli `BELGENO` aldigi anda, GIB/e-Arsiv gonderimi beklenmeden PDF olarak
+gonderilir. `EFATURA` alani sadece hangi dizaynin secilecegini belirler.
+
+## Dizayn ve log klasoru
+
+Ayarlar'daki **"Dizayn ve log klasorunu ac"** dugmesi su klasoru acar:
+
+`C:\ProgramData\Vega WhatsApp\efatura`
+
+- `dizaynlar\` — XSLT dosyalari
+- `efatura-log.txt` — gunluk (metin belgesi)
+- `state.json` — gonderim kaydi (elle degistirmeyin)
+- `settings.json` — istege bagli makineye ozel ayar (ornegin `testPhone`)
+
+Program Files kullanilmaz: her guncelleme o klasoru bastan siler.
+
+## Dizayn secimi
+
+Her belge icin ilk bulunan dosya kullanilir:
+
+1. `dizaynlar\invoice_<VKN/TCKN>.xslt` / `earchive_<VKN/TCKN>.xslt` (birden fazla firma)
+2. `dizaynlar\invoice.xslt` / `earchive.xslt`
+
+e-Fatura `invoice`, e-Arsiv `earchive` dizaynini kullanir. VKN faturanin
+satici bilgisinden okunur (`integration.json` > `invoiceVkn` ile sabitlenebilir).
+**Dizayn bulunamazsa belge gonderilmez**; hata logda ve Ayarlar'da gorunur.
+Kuruluma gomulu `designs\default` yalniz ornektir, otomatik kullanilmaz.
+
+## Yonetici gorevi
+
+Vega'nin `vega.earsiv.console.exe` araci Windows geregi yonetici yetkisi ister.
+Kurulum export gorevini SYSTEM hesabinda kaydeder ve oturum acmis kullanicilara
+calistirma izni verir. Gorev eksik gorunurse `tools\setup-task.cmd` dosyasini bir
+kez cift tiklayin ve UAC onayini verin.
+
+## Test modu
+
+Ayarlar > **e-Fatura PDF gonderimi** > "Test modu" isaretlenip numara ve sure
+secilir. **Varsayilan KAPALI.** Acikken butun PDF ve iptal mesajlari cari yerine
+o numaraya gider, mesajin basinda gercek alici yazar.
+
+Gecicidir: secilen sure (1 saat / 4 saat / 1 gun) dolunca kendiliginden kapanir
+ve gonderim gercek carilere doner; "suresiz" secilirse elle kapatilana kadar
+surer. Ayar `settings.json` icinde `testPhone` + `testUntil` olarak durur,
+elle de yazilabilir.
+
+Test modunda gonderilen faturalar gonderildi sayilir; kapatinca ayni fatura
+gercek cariye tekrar gitmez.
+
+## Degisiklik ve iptal
+
+PDF yalniz carinin ana cep numarasina gider; watcher'in "tum telefonlara gonder"
+ayari burada uygulanmaz.
+
+Gonderilen bir faturanin tutari, carisi, tarihi veya satirlari sonraki 7 gun
+icinde degisirse guncel PDF gonderilir. Vega'da acip kaydetmek (`LADATE`) ya da
+GIB durumu degisiklik sayilmaz. Degisiklik `updateSettleMinutes` (15 dk) sabit
+kalmadan gitmez; ard arda duzeltmeler tek mesaja iner. Fatura basina en fazla
+`maxUpdates` (1) guncelleme gider, sonrasi sessiz kalir. Fatura `IPTAL=1` olursa
+veya kaydi silinirse musteriye iptal bildirimi gider.
+
+Eski PDF mesaji hicbir durumda geri cekilmez ("herkesten sil"). Alicida "Bu mesaj
+silindi" yigini birakiyordu ve ban sinyaliydi (Expert hatti, 9 Eki 2026).
+
+## Guvenlik ve dogruluk
+
+- Konsola belge numarasi degil sayisal `TBLSATFATBASLIK.IND` verilir.
+- Uretilen UBL'nin kok fatura numarasi beklenen `BELGENO` ile ayni degilse
+  WhatsApp gonderimi durdurulur. Bu kontrol yanlis firma/donem ayarinda baska
+  faturanin gitmesini engeller.
+- Tetik icin `TBLEARCHIVEHISTORY`, `SENTSTATUS` veya GIB sonucu kullanilmaz.
+- Ayni 16 haneli satis faturasinin eski metin bildirimi (tus aciksa) atlanir; PDF
+  ve aciklama tek WhatsApp mesaji olarak gider.
+- WhatsApp gonderimi ana uygulamanin mevcut hesap/relay/cloud ve anti-ban
+  katmanindan yapilir.

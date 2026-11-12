@@ -1,0 +1,785 @@
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const db = require('./db');
+const exporter = require('./console-export');
+const renderer = require('./renderer');
+
+// Virus tarayici/yedekleme araci dosyayi kisa sure kilitleyince rename EPERM
+// verir. Canlida bu tum taramayi dusurdu; birkac kez dene, olmazsa dogrudan yaz.
+function sleepSync(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function atomicJson(file, value) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const text = JSON.stringify(value, null, 2);
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, text, 'utf8');
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try { fs.renameSync(tmp, file); return; }
+        catch { sleepSync(80); }
+    }
+    try { fs.writeFileSync(file, text, 'utf8'); }
+    finally { try { fs.unlinkSync(tmp); } catch { /* sonraki yazimda ustune gelir */ } }
+}
+
+// TR cep numarasi → 905xxxxxxxxx (bos/gecersizse '').
+function normalizeTestPhone(raw) {
+    let d = String(raw || '').replace(/\D/g, '');
+    if (d.startsWith('00')) d = d.slice(2);
+    if (d.startsWith('0')) d = '90' + d.slice(1);
+    else if (d.length === 10 && d.startsWith('5')) d = '90' + d;
+    return /^905\d{9}$/.test(d) ? d : '';
+}
+
+// Program Files'taki integration.json yonetici ister; makineye ozel ayarlar
+// ProgramData\...\efatura\settings.json ile ezilir (ornegin test numarasi).
+function readLocalSettings(dataDir) {
+    try { return JSON.parse(fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8')) || {}; }
+    catch { return {}; }
+}
+
+function formatMoney(value) {
+    return (Number(value) || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatDate(value) {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? String(value || '') : d.toLocaleDateString('tr-TR');
+}
+
+function caption(template, row, contact) {
+    const values = {
+        '{unvan}': contact.name || '',
+        '{belgeno}': row.BELGENO || '',
+        '{tarih}': formatDate(row.TARIH),
+        '{tutar}': formatMoney(row.TUTAR),
+        '{parabirimi}': row.PARABIRIMI || 'TL',
+        '{belgeturu}': row.DOCUMENT_TYPE === 'earsiv' ? 'e-Arsiv fatura' : 'e-Fatura',
+        '{ettn}': row.EFATURAUUID || row.ETTN || '',
+    };
+    return Object.entries(values).reduce((s, [k, v]) => s.split(k).join(v), String(template || ''));
+}
+
+// Yalniz musterinin PDF'te gordugu icerik. v1 LADATE (son islem tarihi), ETTN ve
+// e-Fatura bayragini da iceriyordu: fatura Vega'da acilip kaydedilince ya da GIB
+// durumu degisince "degisti" sayilip ayni PDF yeniden gonderiliyor, eskisi herkesten
+// siliniyordu. Canli 7 Eki 2026: ayni fatura 3 numaraya gunde 4 kez + 28 geri cekme;
+// 9 Eki'de Expert hatti banlandi. Iptal/iade ayri kontrol edilir (reconcileSent).
+const FP_VERSION = 2;
+function fingerprint(row) {
+    const values = [
+        row.BELGENO, row.TARIH instanceof Date ? row.TARIH.toISOString() : row.TARIH,
+        String(row.TUTAR == null ? '' : row.TUTAR), row.PARABIRIMI, row.CARIIND,
+        String(row.LINE_COUNT == null ? 0 : row.LINE_COUNT), row.LINE_CHECKSUM || 0,
+    ];
+    return crypto.createHash('sha256').update(JSON.stringify([FP_VERSION, ...values])).digest('hex');
+}
+
+class State {
+    constructor(file) {
+        this.file = file;
+        this.data = { version: 2, contexts: {}, documents: {} };
+        try { this.data = { ...this.data, ...JSON.parse(fs.readFileSync(file, 'utf8')) }; } catch { /* ilk calisma */ }
+        this.data.version = 2;
+    }
+    context(key) { return this.data.contexts[key] || null; }
+    init(key, baselineMax) {
+        this.data.contexts[key] = { baselineMax, scanAfter: baselineMax, initializedAt: new Date().toISOString() };
+        this.save();
+    }
+    scanAfter(key, value) { this.data.contexts[key].scanAfter = value; this.save(); }
+    doc(key) { return this.data.documents[key] || null; }
+    // save=false: toplu yazimda (sira doldurma, sira temizleme) dosya tek seferde yazilsin.
+    setDoc(key, value, save = true) { this.data.documents[key] = { ...(this.data.documents[key] || {}), ...value, updatedAt: new Date().toISOString() }; if (save) this.save(); }
+    docsForContext(contextKey) {
+        return Object.entries(this.data.documents)
+            .filter(([key, value]) => value.contextKey === contextKey || key.startsWith(`${contextKey}:`))
+            .map(([key, value]) => ({ key, ...value }));
+    }
+    save() { atomicJson(this.file, this.data); }
+}
+
+class Integration {
+    constructor(host) {
+        this.host = host;
+        fs.mkdirSync(host.dataDir, { recursive: true });
+        this.settings = {
+            pollSeconds: 30, batchLimit: 5, changeWindowDays: 7,
+            // Degisiklik bu kadar dakika sabit kalmadan guncel PDF gitmez: Vega'da
+            // ard arda yapilan duzeltmeler tek mesaja iner.
+            updateSettleMinutes: 15,
+            // Bir faturaya en fazla bu kadar guncel PDF gider; sonrasi sessiz kalir.
+            maxUpdates: 1,
+            ...(host.manifest.settings || {}), ...readLocalSettings(host.dataDir),
+        };
+        // TEST MODU: dolu ise butun PDF/iptal mesajlari cari yerine bu numaraya gider.
+        // Ayarlar'dan acilir, varsayilan KAPALI. Acik unutulmasin diye surelidir:
+        // testUntil gecince kendiliginden gercek carilere doner.
+        this._testPhone = normalizeTestPhone(this.settings.testPhone);
+        this._testUntil = Date.parse(this.settings.testUntil) || 0;
+        this.state = new State(path.join(host.dataDir, 'state.json'));
+        // Guncelleme Program Files'i sildigi icin musteri dosyalari ProgramData'da;
+        // Ayarlar > e-Fatura > "Klasoru ac" ile tek tikla ulasilir.
+        this.designsDir = path.join(host.dataDir, 'dizaynlar');
+        fs.mkdirSync(this.designsDir, { recursive: true });
+        this.logFile = path.join(host.dataDir, 'efatura-log.txt');
+        this.timer = null;
+        this.running = false;
+        this.lastRun = null;
+        this.lastError = null;
+        this.lastResult = null;
+    }
+
+    // Suresi dolan test modu ilk okumada kendini kapatir; tick ve status da bu
+    // getter'dan gectigi icin program acik kalsa bile gercek cariye geri doner.
+    get testPhone() {
+        if (!this._testPhone) return '';
+        if (this._testUntil && Date.now() > this._testUntil) {
+            this._testPhone = '';
+            this._testUntil = 0;
+            this.settings.testPhone = '';
+            this.settings.testUntil = null;
+            this.writeLocalSettings({ testPhone: '', testUntil: null });
+            this.log('INFO', 'test modu suresi doldu; PDF gonderimi gercek carilere dondu');
+        }
+        return this._testPhone;
+    }
+
+    testModeStatus() {
+        const phone = this.testPhone;
+        return { testPhone: phone || null, testUntil: phone && this._testUntil ? new Date(this._testUntil).toISOString() : null };
+    }
+
+    // Ayarlar > e-Fatura > Test modu. phone bos ise kapatir.
+    setTestMode({ phone, minutes } = {}) {
+        const target = normalizeTestPhone(phone);
+        if (phone && !target) throw new Error('Test numarasi gecersiz. Ornek: 5350786101');
+        const mins = Number(minutes);
+        const until = target && Number.isFinite(mins) && mins > 0 ? Date.now() + mins * 60000 : 0;
+        this._testPhone = target;
+        this._testUntil = until;
+        this.settings.testPhone = target;
+        this.settings.testUntil = until ? new Date(until).toISOString() : null;
+        this.writeLocalSettings({ testPhone: target, testUntil: this.settings.testUntil });
+        this.log('INFO', target
+            ? `test modu acildi → ${target}${until ? ` (${new Date(until).toLocaleString('tr-TR')} kadar)` : ' (sure sinirsiz)'}`
+            : 'test modu kapatildi; PDF gonderimi gercek carilere gider');
+        return this.testModeStatus();
+    }
+
+    // integration.json Program Files'ta (yonetici ister); makineye ozel ayar
+    // ProgramData...efaturasettings.json icinde tutulur.
+    writeLocalSettings(patch) {
+        const file = path.join(this.host.dataDir, 'settings.json');
+        atomicJson(file, { ...readLocalSettings(this.host.dataDir), ...patch });
+    }
+
+    // Ana ekrandaki "Son gonderilenler" listesine yaz. e-Fatura hatasi
+    // ProgramData logunda saklı kalmasin: belge metin olarak da gitmediği icin
+    // kullanici ekranda gormezse musteri hic mesaj almamis olur.
+    uiLog(entry) {
+        try { if (typeof this.host.log === 'function') this.host.log({ ruleName: 'e-Fatura PDF', ...entry }); }
+        catch { /* ana log yazilamadi, dosya logu yeterli */ }
+    }
+
+    log(level, message) {
+        const line = `${new Date().toISOString()} [${level}] ${message}`;
+        try { fs.appendFileSync(this.logFile, line + '\n', 'utf8'); } catch { /* console yine calisir */ }
+        const fn = level === 'ERROR' ? console.error : (level === 'WARN' ? console.warn : console.log);
+        fn(`[e-Fatura] ${message}`);
+    }
+
+    async currentContext(pool) {
+        const raw = this.host.getContext && this.host.getContext();
+        return await db.resolveContext(pool, raw);
+    }
+
+    key(ctx) { return `F${ctx.firmaNo}D${ctx.donemNo}`; }
+    documentKey(ctx, row) { return `${this.key(ctx)}:${row.IND}`; }
+
+    // Ayarlardaki tus. Varsayilan KAPALI: guncellemeyle herkese dagitildigi icin
+    // musteri acmadikca hicbir sey yapilmaz. enabledAt, acildigi an baslangic icin.
+    enabledInfo() {
+        const e = this.host.getEnabled ? this.host.getEnabled() : null;
+        return { enabled: !!(e && e.enabled), enabledAt: (e && e.enabledAt) || null };
+    }
+
+    claimsWatcherDocument(item) {
+        // Kapaliyken belge mesajlari eskisi gibi metin olarak gitmeye devam eder.
+        return this.enabledInfo().enabled
+            && !!item
+            && item.docType === 'satisFaturasi'
+            && String(item.evrak || '').trim().length === 16;
+    }
+
+    // Belgenin gittigi tum numaralar. Eski kayitlarda yalniz phone/waMessageId vardir.
+    static deliveries(doc) {
+        if (!doc) return [];
+        if (Array.isArray(doc.sends) && doc.sends.length) return doc.sends.filter(s => s && s.phone);
+        return doc.phone ? [{ phone: doc.phone, waMessageId: doc.waMessageId || null }] : [];
+    }
+
+    // Eski mesaj geri CEKILMEZ: "herkesten sil" alicida "Bu mesaj silindi" yigini
+    // birakiyor ve resmi olmayan istemcide ban sinyali. Guncelleme/iptal yeni bir
+    // mesajla bildirilir; metin onceki PDF'in gecersiz oldugunu soyler.
+
+    // PDF yalniz carinin ana cep numarasina gider. Watcher'in "tum telefonlara gonder"
+    // ayari burada uygulanmaz: her tekrar her numaraya katlaniyordu.
+    recipients(contact) {
+        return contact && contact.phone ? [contact.phone] : [];
+    }
+
+    // Ayni cariye art arda numaralar arasinda kisa bekleme (anti-ban, watcher gibi).
+    async phoneGap() {
+        const ms = this.phoneGapMs != null ? this.phoneGapMs : 3000 + Math.floor(Math.random() * 4000);
+        if (ms > 0) await new Promise(r => setTimeout(r, ms));
+    }
+
+    // ── Yoğun trafik modu ─────────────────────────────────────────────────────
+    // Watcher'daki "Yoğun trafik modu" açıkken PDF anında gitmez: fatura sıraya girer,
+    // belge mesajı ve ShopStar ile AYNI gönderim hakkını (host.slow) paylaşarak 5–15 dk
+    // aralıkla, tek tek gider; pencere kapanınca o güne düşen kalanlar silinir. Canlıda
+    // (Expert Bilişim) PDF'lerin bu moddan muaf olması banın sebebi sayıldı.
+    // host.slow = { active(), take(), deadline(from) } — server.js sahibi firmanın watcher'ına bağlar.
+    slowActive() {
+        const s = this.host.slow;
+        try { return !!(s && s.active()); } catch { return false; }
+    }
+
+    // Sıradaki faturalar: ayrı kuyruk dosyası yok, belge kaydının durumu 'queued' ise sıradadır.
+    // Tam tarama ve yeniden başlatma sırayı bozmaz; temizleme/süre aşımı da tek durum değişikliği.
+    queuedDocs(contextKey) {
+        const list = Object.entries(this.state.data.documents)
+            .filter(([, v]) => v && v.status === 'queued')
+            .map(([key, v]) => ({ key, ...v }))
+            .filter(d => !contextKey || d.contextKey === contextKey);
+        return list.sort((a, b) => (Date.parse(a.queuedAt) || 0) - (Date.parse(b.queuedAt) || 0) || Number(a.ind) - Number(b.ind));
+    }
+
+    queuedCount() { return this.queuedDocs().length; }
+
+    // "Birikmiş mesajları temizle": sıradaki faturalar silinir. Durum 'skipped' kalır;
+    // 'queued' bırakılsa ya da kayıt silinse tam tarama aynı faturayı yeniden sıraya alırdı.
+    clearPending() {
+        const items = this.queuedDocs();
+        if (!items.length) return 0;
+        const at = new Date().toISOString();
+        for (const d of items) this.state.setDoc(d.key, { status: 'skipped', reason: 'bekleyen mesajlar elle temizlendi', clearedAt: at }, false);
+        this.state.save();
+        this.log('INFO', `sirada bekleyen ${items.length} fatura elle temizlendi`);
+        this.uiLog({ status: 'cleared', name: 'e-Fatura PDF', error: `Kuyruk elle temizlendi (${items.length} bekleyen fatura PDF'i silindi)` });
+        return items.length;
+    }
+
+    // Gün sonu: pencere kapanınca o güne düşen ve gönderilemeyen PDF'ler silinir (belge
+    // mesajıyla aynı kural — sıkıştırıp peş peşe göndermek tam da ban sebebi).
+    expireQueued(now = Date.now()) {
+        const slow = this.host.slow;
+        if (!slow) return 0;
+        let deadline = null;
+        const expired = this.queuedDocs().filter(d => {
+            try { deadline = slow.deadline(d.queuedAt); } catch { deadline = null; }
+            return deadline != null && now >= deadline;
+        });
+        if (!expired.length) return 0;
+        const at = new Date(now).toISOString();
+        for (const d of expired) this.state.setDoc(d.key, { status: 'skipped', reason: 'gun sonu: gonderim saati bitti (yogun trafik modu)', clearedAt: at }, false);
+        this.state.save();
+        this.log('INFO', `yogun trafik modu: gun sonu, ${expired.length} fatura siradan silindi`);
+        this.uiLog({ status: 'cleared', name: 'e-Fatura PDF', error: `Gün sonu: gönderim saati bitti, sırada kalan ${expired.length} fatura PDF'i silindi (yoğun trafik modu)` });
+        return expired.length;
+    }
+
+    // Yeni hazır faturaları gönderim yapmadan sıraya al; imleç ilerler.
+    async enqueueNew(pool, ctx, ctxKey, stateCtx) {
+        let rows = await db.readyDocuments(pool, ctx, { afterInd: stateCtx.scanAfter, limit: 50 });
+        if (!rows.length && stateCtx.scanAfter !== stateCtx.baselineMax) {
+            this.state.scanAfter(ctxKey, stateCtx.baselineMax); // gec tamamlanan hareketleri yeniden tara
+            stateCtx = this.state.context(ctxKey);
+            rows = await db.readyDocuments(pool, ctx, { afterInd: stateCtx.scanAfter, limit: 50 });
+        }
+        if (!rows.length) return 0;
+        let added = 0, cursor = Number(stateCtx.scanAfter) || 0;
+        const queuedAt = new Date().toISOString();
+        for (const row of rows) {
+            cursor = Number(row.IND);
+            const key = this.documentKey(ctx, row);
+            const old = this.state.doc(key);
+            if (old && (old.status === 'sent' || old.status === 'skipped' || old.status === 'queued')) continue;
+            this.state.setDoc(key, {
+                status: 'queued', queuedAt, contextKey: ctxKey, ind: Number(row.IND), belgeNo: row.BELGENO,
+                cariInd: row.CARIIND, type: row.DOCUMENT_TYPE, amount: row.TUTAR,
+                attempts: Number((old && old.attempts) || 0),
+            }, false);
+            added++;
+        }
+        if (added) this.state.save();
+        if (cursor > Number(stateCtx.scanAfter)) this.state.scanAfter(ctxKey, cursor);
+        return added;
+    }
+
+    // Sıradaki faturaları gönder. Yoğun trafik modunda ortak hak alınır ve EN ÇOK BİR PDF gider;
+    // mod kapalıysa (sıra doluyken kapatıldı) batchLimit kadar boşaltılır. Bekleyen fatura
+    // gönderim anında Vega'dan yeniden okunur: silinmiş/iptal edilmişse hak harcamadan düşer,
+    // değişmişse PDF zaten o anki halinden üretilir.
+    async drainQueued(pool, ctx, { slow }) {
+        const ctxKey = this.key(ctx);
+        const items = this.queuedDocs(ctxKey);
+        if (!items.length) return { processed: 0 };
+        let slot = null;
+        if (slow) {
+            slot = this.host.slow.take();
+            if (!slot.ok) return { paused: slot.reason, waiting: items.length };
+        }
+        const limit = slow ? 1 : Math.max(1, Number(this.settings.batchLimit) || 5);
+        const results = [];
+        let used = false;
+        try {
+            const head = items.slice(0, 50);
+            const rows = await db.documentStates(pool, ctx, head.map(d => d.ind));
+            const byInd = new Map(rows.map(r => [Number(r.IND), r]));
+            for (const it of head) {
+                if (results.filter(x => x.sent).length >= limit) break;
+                const row = byInd.get(Number(it.ind));
+                const why = !row ? "fatura Vega'dan silinmis"
+                    : (row.IPTAL || row.IADE) ? 'fatura iptal/iade edilmis'
+                        : String(row.BELGENO || '').trim().length !== 16 ? 'fatura numarasi gecersiz' : null;
+                if (why) {
+                    this.state.setDoc(it.key, { status: 'skipped', reason: `sirada beklerken: ${why}` });
+                    this.uiLog({ status: 'dropped', name: 'e-Fatura PDF', evrak: it.belgeNo || String(it.ind), error: `Sıradaki PDF gönderilmedi: ${why}` });
+                    results.push({ dropped: why, belgeNo: it.belgeNo });
+                    continue;
+                }
+                try {
+                    const r = await this.processOne(ctx, row, 'queued');
+                    results.push(r);
+                    if (r.paused) break;
+                    if (r.sent) used = true;
+                } catch (e) {
+                    const previous = this.state.doc(it.key) || {};
+                    this.state.setDoc(it.key, { status: 'error', attempts: Number(previous.attempts || 0) + 1, lastError: e.message });
+                    this.lastError = e.message;
+                    if (previous.lastError !== e.message) {
+                        this.log('ERROR', `${row.BELGENO} islenemedi: ${e.message}`);
+                        this.uiLog({ status: 'failed', name: 'e-Fatura PDF', evrak: row.BELGENO, error: e.message });
+                    }
+                    results.push({ belgeNo: row.BELGENO, error: e.message });
+                    break;
+                }
+            }
+        } finally { if (slot) slot.release(used); }
+        return { processed: results.length, results };
+    }
+
+    async processOne(ctx, row, mode = 'initial') {
+        const itemKey = this.documentKey(ctx, row);
+        const old = this.state.doc(itemKey);
+        // 'queued' modu sıradan çıkan faturadır: kayıt zaten 'queued' durumunda, korumaya takılmaz.
+        if (mode === 'initial' && old && (old.status === 'sent' || old.status === 'skipped' || old.status === 'queued')) return { skipped: old.status, belgeNo: row.BELGENO };
+
+        const contacts = await this.host.resolveCariContacts(ctx.firmaNo, [Number(row.CARIIND)]);
+        const contact = contacts.get(Number(row.CARIIND));
+        if (!this.testPhone && (!contact || !contact.valid || !contact.phone)) {
+            this.state.setDoc(itemKey, { status: 'skipped', reason: 'gecerli cari cep telefonu yok', cariInd: row.CARIIND });
+            this.uiLog({ status: 'noPhone', name: (contact && contact.name) || 'e-Fatura', evrak: row.BELGENO, error: 'PDF gonderilemedi: cari cep telefonu yok' });
+            return { skipped: 'telefon-yok', belgeNo: row.BELGENO };
+        }
+        if (contact && contact.pasif && !this.testPhone) {
+            this.state.setDoc(itemKey, { status: 'skipped', reason: 'cari pasif', cariInd: row.CARIIND });
+            this.uiLog({ status: 'pasif', name: contact.name || 'e-Fatura', evrak: row.BELGENO, error: 'PDF gonderilmedi: cari pasif' });
+            return { skipped: 'cari-pasif', belgeNo: row.BELGENO };
+        }
+
+        const gate = this.host.gate ? this.host.gate('watcher') : { ok: true };
+        if (gate && gate.ok === false) return { paused: gate.reason || 'gonderim limiti', belgeNo: row.BELGENO };
+
+        if (!renderer.hasAnyDesign(this.designsDir, row.DOCUMENT_TYPE)) {
+            const base = row.DOCUMENT_TYPE === 'earsiv' ? 'earchive' : 'invoice';
+            throw new Error(`dizayn yok, gonderilmedi: ${base}.xslt veya ${base}_<VKN>.xslt dizaynlar klasorune konmali`);
+        }
+
+        const consoleDir = exporter.findConsoleDir(this.settings.consoleDir);
+        const exported = await exporter.exportInvoice({
+            ind: row.IND,
+            expectedBelgeNo: row.BELGENO,
+            expectedUuid: row.EFATURAUUID || '',
+            consoleDir,
+            taskName: this.settings.taskName,
+            dataDir: this.host.dataDir,
+        });
+        const workDir = path.join(this.host.dataDir, 'work');
+        fs.mkdirSync(workDir, { recursive: true });
+        const safeName = `${row.IND}-${String(row.BELGENO).replace(/[^A-Za-z0-9._-]/g, '_')}`;
+        const htmlPath = path.join(workDir, `${safeName}.html`);
+        try {
+            const rendered = await renderer.render({
+                integrationDir: this.host.integrationDir,
+                designsDir: this.designsDir,
+                documentType: row.DOCUMENT_TYPE,
+                invoiceVkn: this.settings.invoiceVkn,
+                xml: exported.xml,
+                xmlPath: exported.xmlPath,
+                htmlPath,
+                saxonDir: consoleDir,
+                electron: this.host.electron,
+            });
+            const who = contact || { name: '' };
+            const target = this.testTarget(who);
+            const text = target.prefix + caption(mode === 'update' ? this.settings.updatedCaption : this.settings.caption, row, who);
+            const fileName = `${String(row.BELGENO).replace(/[^A-Za-z0-9._-]/g, '_')}.pdf`;
+            const media = { kind: 'document', buffer: rendered.pdf, mimetype: 'application/pdf', fileName };
+            // PDF bir kez uretilir, secili her numaraya ayni belge gider.
+            const sends = [], failures = [];
+            for (const [i, phone] of target.phones.entries()) {
+                if (i > 0) {
+                    const g = this.host.gate ? this.host.gate('watcher') : { ok: true };
+                    if (g && g.ok === false) { failures.push({ phone, error: `gonderim limiti: ${g.reason || 'dolu'}` }); continue; }
+                    await this.phoneGap();
+                }
+                try {
+                    const result = await this.host.waSend(phone, text, media, { simulateTyping: true, typingMs: 1200, channel: 'watcher' });
+                    if (!result || result.success === false) throw new Error((result && (result.error || result.message)) || 'WhatsApp gonderimi basarisiz');
+                    sends.push({ phone, waMessageId: result.id || (result.key && result.key.id) || null });
+                } catch (e) {
+                    failures.push({ phone, error: e.message });
+                }
+            }
+            // Hicbir numaraya gitmediyse belge sonraki turda yeniden denenir. Bir kismina
+            // gittiyse "gonderildi" sayilir: yeniden denemek gidenlere ikinci PDF atar.
+            if (!sends.length) throw new Error(failures.map(f => `${f.phone}: ${f.error}`).join('; ') || 'WhatsApp gonderimi basarisiz');
+            this.state.setDoc(itemKey, {
+                status: 'sent', sentAt: new Date().toISOString(), type: row.DOCUMENT_TYPE,
+                contextKey: this.key(ctx), ind: Number(row.IND), belgeNo: row.BELGENO,
+                phone: sends[0].phone, sends, failedPhones: failures,
+                cariInd: row.CARIIND, design: rendered.design, testMode: !!this.testPhone,
+                contactName: who.name || '', invoiceDate: row.TARIH, amount: row.TUTAR,
+                currency: row.PARABIRIMI || 'TL', fingerprint: fingerprint(row),
+                waMessageId: sends[0].waMessageId, fpVersion: FP_VERSION,
+                revision: mode === 'update' ? Number((old && old.revision) || 1) + 1 : 1,
+                updates: mode === 'update' ? Number((old && old.updates) || 0) + 1 : 0,
+                pendingFingerprint: null, pendingSince: null,
+                pdfBytes: rendered.pdf.length, exportMode: exported.mode,
+            });
+            if (mode === 'update' && old) {
+                this.state.setDoc(itemKey, { previousWaMessageId: old.waMessageId, previousSends: Integration.deliveries(old) });
+            }
+            const name = (this.testPhone ? '[TEST] ' : '') + (who.name || 'e-Fatura');
+            for (const s of sends) {
+                this.uiLog({
+                    status: mode === 'update' ? 'edited' : 'sent', name,
+                    phone: s.phone, evrak: row.BELGENO, tutar: formatMoney(row.TUTAR),
+                    error: `PDF ${mode === 'update' ? 'guncellendi' : 'gonderildi'} (${rendered.design})`,
+                });
+            }
+            for (const f of failures) {
+                this.uiLog({ status: 'failed', name, phone: f.phone, evrak: row.BELGENO, error: `PDF bu numaraya gonderilemedi: ${f.error}` });
+                this.log('WARN', `${row.BELGENO} PDF ${f.phone} numarasina gonderilemedi: ${f.error}`);
+            }
+            this.log('INFO', `${row.BELGENO} ${row.DOCUMENT_TYPE} PDF ${mode === 'update' ? 'guncellenerek ' : ''}gonderildi (${rendered.design}, ${rendered.pdf.length} bayt) → ${sends.map(s => s.phone).join(', ')}${this.testPhone ? ' [TEST]' : ''}`);
+            return { sent: true, updated: mode === 'update', belgeNo: row.BELGENO, type: row.DOCUMENT_TYPE, design: rendered.design, phones: sends.map(s => s.phone), failed: failures.length };
+        } finally {
+            try { fs.unlinkSync(htmlPath); } catch { /* gecici dosya yok */ }
+            try { fs.unlinkSync(exported.xmlPath); } catch { /* Vega temp temizligi kritik degil */ }
+            if (exported.sourcePath) { try { fs.unlinkSync(exported.sourcePath); } catch { /* SYSTEM'e ait olabilir */ } }
+        }
+    }
+
+    // Test modunda alici test numarasi olur; mesajin basina gercek alici yazilir ki
+    // testte kimin alacagi gorulsun.
+    testTarget(contact) {
+        const phones = this.recipients(contact);
+        if (!this.testPhone) return { phone: phones[0], phones, prefix: '' };
+        const real = phones.length ? phones.join(', ') : 'telefon yok';
+        return {
+            phone: this.testPhone, phones: [this.testPhone],
+            prefix: `🔔 TEST — gercek alici: ${(contact && contact.name) || '(cari adi yok)'} (${real})\n`,
+        };
+    }
+
+    async cancelOne(ctx, doc, row, reason) {
+        if (!doc || doc.status !== 'sent') return { skipped: true };
+        const gate = this.host.gate ? this.host.gate('watcher') : { ok: true };
+        if (gate && gate.ok === false) return { paused: gate.reason || 'gonderim limiti', belgeNo: doc.belgeNo };
+
+        const invoice = row || {
+            BELGENO: doc.belgeNo, TARIH: doc.invoiceDate, TUTAR: doc.amount,
+            PARABIRIMI: doc.currency, DOCUMENT_TYPE: doc.type,
+        };
+        // Test modunda gonderilen belge doc.phone'da zaten test numarasini tasir.
+        const prefix = (this.testPhone || doc.testMode) ? `🔔 TEST — gercek alici: ${doc.contactName || '(cari adi yok)'}\n` : '';
+        const text = prefix + caption(this.settings.cancelledCaption, invoice, { name: doc.contactName || '' });
+        // PDF hangi numaralara gittiyse iptal bildirimi de onlara gider.
+        const phones = [...new Set(Integration.deliveries(doc).map(s => s.phone))];
+        const notified = [], errors = [];
+        for (const [i, phone] of phones.entries()) {
+            if (i > 0) await this.phoneGap();
+            try {
+                const result = await this.host.waSend(phone, text, null, { simulateTyping: true, typingMs: 900, channel: 'watcher' });
+                if (!result || result.success === false) throw new Error((result && (result.error || result.message)) || 'iptal bildirimi gonderilemedi');
+                notified.push({ phone, waMessageId: result.id || (result.key && result.key.id) || null });
+            } catch (e) {
+                errors.push(`${phone}: ${e.message}`);
+            }
+        }
+        if (!notified.length) throw new Error(errors.join('; ') || 'iptal bildirimi gonderilemedi');
+        if (errors.length) this.log('WARN', `${doc.belgeNo || doc.ind} iptal bildirimi bazi numaralara gitmedi: ${errors.join('; ')}`);
+        this.state.setDoc(doc.key, {
+            status: reason === 'silindi' ? 'deleted' : 'cancelled',
+            cancelledAt: new Date().toISOString(), cancelReason: reason,
+            cancelMessageId: notified[0].waMessageId, cancelSends: notified,
+        });
+        for (const n of notified) {
+            this.uiLog({
+                status: 'cancelled', name: doc.contactName || 'e-Fatura', phone: n.phone,
+                evrak: doc.belgeNo || String(doc.ind), error: `fatura ${reason}; musteriye iptal bildirimi gonderildi`,
+            });
+        }
+        this.log('INFO', `${doc.belgeNo || doc.ind} ${reason}; musteriye iptal bildirimi gonderildi`);
+        return { cancelled: true, reason, belgeNo: doc.belgeNo };
+    }
+
+    // Degisen faturaya guncel PDF gitsin mi? 'send' disinda hep sessiz kalir.
+    // Sinir dolduysa yeni parmak izi kabul edilir ki her turda yeniden sorulmasin.
+    updateDecision(doc, currentFingerprint, now = Date.now()) {
+        const maxUpdates = Math.max(0, Number(this.settings.maxUpdates ?? 1));
+        // v1.10.8 'updates' tutmuyordu; orada yapilan guncellemeler revision'da sayili.
+        const used = Math.max(Number(doc.updates || 0), Number(doc.revision || 1) - 1);
+        if (used >= maxUpdates) {
+            this.state.setDoc(doc.key, { fingerprint: currentFingerprint, pendingFingerprint: null, pendingSince: null });
+            this.log('INFO', `${doc.belgeNo || doc.ind} yine degisti; guncelleme siniri (${maxUpdates}) dolu, PDF gonderilmedi`);
+            this.uiLog({ status: 'info', name: doc.contactName || 'e-Fatura PDF', evrak: doc.belgeNo || String(doc.ind), error: 'Fatura yine degisti; guncelleme siniri dolu, musteriye yeni PDF gonderilmedi' });
+            return 'limit';
+        }
+        if (doc.pendingFingerprint !== currentFingerprint) {
+            this.state.setDoc(doc.key, { pendingFingerprint: currentFingerprint, pendingSince: new Date(now).toISOString() });
+            return 'wait';
+        }
+        const settleMs = Math.max(0, Number(this.settings.updateSettleMinutes ?? 15)) * 60000;
+        return now - Date.parse(doc.pendingSince) >= settleMs ? 'send' : 'wait';
+    }
+
+    async reconcileSent(pool, ctx) {
+        const contextKey = this.key(ctx);
+        const cutoff = Date.now() - Math.max(1, Number(this.settings.changeWindowDays) || 7) * 86400000;
+        const watched = this.state.docsForContext(contextKey)
+            .filter(d => d.status === 'sent' && Number(d.ind) > 0)
+            .filter(d => !d.sentAt || Date.parse(d.sentAt) >= cutoff)
+            .slice(0, 1000);
+        if (!watched.length) return [];
+
+        const rows = await db.documentStates(pool, ctx, watched.map(d => d.ind));
+        const current = new Map(rows.map(r => [Number(r.IND), r]));
+        const results = [];
+        // Yoğun trafik modu: iptal bildirimi ve güncel PDF de ortak gönderim hakkıyla gider
+        // (hak yoksa { paused } döner, bir sonraki turda aynı karar yeniden verilir).
+        const slow = this.slowActive();
+        const withSlot = async (doc, send) => {
+            if (!slow) return send();
+            const slot = this.host.slow.take();
+            if (!slot.ok) return { paused: slot.reason, belgeNo: doc.belgeNo, slotWait: true };
+            let used = false;
+            try {
+                const r = await send();
+                used = !!(r && (r.cancelled || r.updated || r.sent));
+                return r;
+            } finally { slot.release(used); }
+        };
+        for (const doc of watched) {
+            if (results.length >= Number(this.settings.batchLimit || 5)) break;
+            const row = current.get(Number(doc.ind));
+            try {
+                if (!row) {
+                    const r = await withSlot(doc, () => this.cancelOne(ctx, doc, null, 'silindi'));
+                    results.push(r);
+                    if (r && r.slotWait) break;
+                    continue;
+                }
+                if (row.IPTAL || row.IADE) {
+                    const r = await withSlot(doc, () => this.cancelOne(ctx, doc, row, 'iptal'));
+                    results.push(r);
+                    if (r && r.slotWait) break;
+                    continue;
+                }
+                if (String(row.BELGENO || '').trim().length !== 16) continue;
+                const currentFingerprint = fingerprint(row);
+                // Eski surum (v1) parmak izi yeni hesapla karsilastirilamaz: sessizce
+                // yenile. Yoksa guncellemeden sonra izlenen her fatura "degisti" sayilirdi.
+                if (!doc.fingerprint || doc.fpVersion !== FP_VERSION) {
+                    this.state.setDoc(doc.key, { fingerprint: currentFingerprint, fpVersion: FP_VERSION, pendingFingerprint: null, pendingSince: null });
+                    continue;
+                }
+                if (doc.fingerprint === currentFingerprint) {
+                    if (doc.pendingFingerprint) this.state.setDoc(doc.key, { pendingFingerprint: null, pendingSince: null });
+                    continue;
+                }
+                if (this.updateDecision(doc, currentFingerprint) === 'send') {
+                    const r = await withSlot(doc, () => this.processOne(ctx, row, 'update'));
+                    results.push(r);
+                    if (r && r.slotWait) break;
+                }
+            } catch (e) {
+                this.state.setDoc(doc.key, { lastChangeError: e.message, changeAttempts: Number(doc.changeAttempts || 0) + 1 });
+                this.lastError = e.message;
+                this.log('ERROR', `${doc.belgeNo || doc.ind} degisiklik/iptal islenemedi: ${e.message}`);
+                this.uiLog({ status: 'failed', name: doc.contactName || 'e-Fatura PDF', evrak: doc.belgeNo || String(doc.ind), error: `degisiklik/iptal islenemedi: ${e.message}` });
+                results.push({ belgeNo: doc.belgeNo, error: e.message });
+                break;
+            }
+        }
+        return results;
+    }
+
+    async tick() {
+        if (this.running) return { skipped: 'onceki tarama suruyor' };
+        const { enabled, enabledAt } = this.enabledInfo();
+        if (!enabled) return { skipped: 'ayarlardan kapali' };
+        this.running = true;
+        this.lastRun = new Date().toISOString();
+        try {
+            // Yoğun trafik: gün sonu temizliği veritabanı/WhatsApp hazır olmasa da yapılır.
+            if (this.slowActive()) this.expireQueued();
+            const pool = this.host.getPool && this.host.getPool();
+            if (!pool || !pool.connected) return { skipped: 'veritabani bagli degil' };
+            const ctx = await this.currentContext(pool);
+            if (!ctx) return { skipped: 'firma secilmemis' };
+            const ctxKey = this.key(ctx);
+            let stateCtx = this.state.context(ctxKey);
+            // Baslangic, tusun ACILDIGI an alinir: kapaliyken (ya da eski surumde) kesilen
+            // faturalar acildiktan sonra toplu gitmesin.
+            const staleBaseline = stateCtx && enabledAt
+                && !(Date.parse(stateCtx.initializedAt) >= Date.parse(enabledAt));
+            if (!stateCtx || staleBaseline) {
+                const max = await db.maxInvoiceInd(pool, ctx);
+                this.state.init(ctxKey, max);
+                this.log('INFO', `${ctxKey} gonderim acildi: mevcut faturalar atlandi, baslangic IND=${max}`);
+                return { initialized: true, context: ctxKey, baselineMax: max };
+            }
+
+            const wa = this.host.waStatus && this.host.waStatus();
+            if (!wa || !wa.ready) return { skipped: 'WhatsApp hazir degil', context: ctxKey };
+
+            // Yoğun trafik modu: yeni faturalar yalnız sıraya girer; bu turda en çok BİR PDF
+            // (önce iptal/güncelleme, yoksa sıradaki fatura) ortak gönderim hakkıyla gider.
+            const slow = this.slowActive();
+            let queuedNow = 0;
+            if (slow) queuedNow = await this.enqueueNew(pool, ctx, ctxKey, stateCtx);
+
+            const changed = await this.reconcileSent(pool, ctx);
+            if (changed.some(x => x && (x.cancelled || x.updated || x.error || x.paused))) {
+                this.lastResult = { context: ctxKey, processed: changed.length, changes: changed };
+                return this.lastResult;
+            }
+
+            if (slow) {
+                const drained = await this.drainQueued(pool, ctx, { slow: true });
+                this.lastResult = { context: ctxKey, slow: true, queuedNow, queue: this.queuedCount(), ...drained };
+                return this.lastResult;
+            }
+            // Mod sıra doluyken kapatıldıysa kalan faturalar normal hızla boşaltılır.
+            const flushed = await this.drainQueued(pool, ctx, { slow: false });
+            if (flushed.processed) {
+                this.lastResult = { context: ctxKey, processed: flushed.processed, results: flushed.results };
+                return this.lastResult;
+            }
+
+            let rows = await db.readyDocuments(pool, ctx, { afterInd: stateCtx.scanAfter, limit: 50 });
+            if (!rows.length && stateCtx.scanAfter !== stateCtx.baselineMax) {
+                this.state.scanAfter(ctxKey, stateCtx.baselineMax); // gec tamamlanan hareketleri yeniden tara
+                stateCtx = this.state.context(ctxKey);
+                rows = await db.readyDocuments(pool, ctx, { afterInd: stateCtx.scanAfter, limit: 50 });
+            }
+            if (!rows.length) return { processed: 0, context: ctxKey };
+
+            // Imlec yalniz gercekten ele alinan satira kadar ilerler. Tur batch
+            // sinirinda ya da kota kapisinda kesilirse kalan satirlar bir sonraki
+            // turda kaldigi yerden gelir. Hata alan belge imleci gecer; yeniden
+            // deneme, satir kalmadiginda yapilan tam tarama turunda olur.
+            const results = [];
+            this.lastError = null;
+            let cursor = Number(stateCtx.scanAfter) || 0;
+            for (const row of rows) {
+                if (results.filter(x => x.sent).length >= Number(this.settings.batchLimit || 5)) break;
+                try {
+                    const result = await this.processOne(ctx, row);
+                    results.push(result);
+                    if (result.paused) break;
+                    cursor = Number(row.IND);
+                } catch (e) {
+                    const itemKey = this.documentKey(ctx, row);
+                    const previous = this.state.doc(itemKey) || {};
+                    this.state.setDoc(itemKey, { status: 'error', attempts: Number(previous.attempts || 0) + 1, lastError: e.message });
+                    this.lastError = e.message;
+                    // Ayni hata her taramada tekrarlanir (ornegin dizayn yok); log bir kez yazilsin.
+                    if (previous.lastError !== e.message) {
+                        this.log('ERROR', `${row.BELGENO} islenemedi: ${e.message}`);
+                        this.uiLog({ status: 'failed', name: 'e-Fatura PDF', evrak: row.BELGENO, error: e.message });
+                    }
+                    results.push({ belgeNo: row.BELGENO, error: e.message });
+                    cursor = Number(row.IND);
+                    break;
+                }
+            }
+            if (cursor > Number(stateCtx.scanAfter)) this.state.scanAfter(ctxKey, cursor);
+            this.lastResult = { context: ctxKey, processed: results.length, results };
+            return this.lastResult;
+        } catch (e) {
+            this.lastError = e.message;
+            this.log('ERROR', `tarama hatasi: ${e.message}`);
+            throw e;
+        } finally {
+            this.running = false;
+        }
+    }
+
+    // Gorev rozeti icin schtasks sorgusu asenkron. Sonucu onbellege alip
+    // status() senkron kalabilsin diye baslangicta ve her turda tazelenir.
+    refreshTaskState() {
+        return exporter.taskExists(this.settings.taskName)
+            .then(v => { this.taskReady = v; return v; })
+            .catch(() => this.taskReady);
+    }
+
+    start() {
+        if (this.timer) return;
+        this.refreshTaskState();
+        const run = () => { this.refreshTaskState(); return this.tick().catch(() => {}); };
+        run();
+        this.timer = setInterval(run, Math.max(10, Number(this.settings.pollSeconds) || 30) * 1000);
+        this.timer.unref && this.timer.unref();
+        this.log('INFO', `entegrasyon basladi (${this.enabledInfo().enabled ? 'acik' : 'ayarlardan kapali'}); dizayn klasoru ${this.designsDir}`);
+    }
+
+    stop() {
+        if (this.timer) clearInterval(this.timer);
+        this.timer = null;
+    }
+
+    status() {
+        let task = 'bilinmiyor';
+        this.refreshTaskState();
+        if (this.taskReady === true) task = 'hazir';
+        else if (this.taskReady === false) task = 'kurulum-gerekli';
+        let designs = [];
+        try { designs = fs.readdirSync(this.designsDir).filter(f => /\.xslt$/i.test(f)); } catch { /* klasor yok */ }
+        return {
+            ...this.enabledInfo(),
+            designs,
+            logFile: this.logFile,
+            running: !!this.timer,
+            busy: this.running,
+            lastRun: this.lastRun,
+            lastError: this.lastError,
+            lastResult: this.lastResult,
+            slow: this.slowActive(),
+            queued: this.queuedCount(),
+            task,
+            ...this.testModeStatus(),
+            dataDir: this.host.dataDir,
+            designsDir: this.designsDir,
+        };
+    }
+}
+
+module.exports = { create: host => new Integration(host), Integration, State, caption, fingerprint, FP_VERSION };

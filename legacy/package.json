@@ -1,0 +1,89 @@
+{
+  "name": "vega-whatsapp-desktop-legacy",
+  "version": "1.11.1",
+  "description": "Vega WhatsApp Legacy — Windows 7 SP1 / Server 2008 R2 / Server 2012 için masaüstü (Electron 22). Toplu mesaj + otomatik tahsilat takibi.",
+  "main": "electron/main.js",
+  "author": "Vega",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saidbayraqtars/vega-whatsapp.git"
+  },
+  "scripts": {
+    "vendor": "node scripts/build-vendor.js",
+    "start": "node scripts/build-vendor.js && electron .",
+    "dist": "node scripts/build-vendor.js && electron-builder --win",
+    "release": "node scripts/release.js",
+    "test:antiban": "node --test \"server/test/*.test.js\"",
+    "test:legacy": "node scripts/build-vendor.js && electron scripts/legacy-smoke.js",
+    "test:efatura": "node integrations/efatura/test/smoke.js",
+    "test:efatura-pdf": "electron integrations/efatura/test/electron-pdf-smoke.js",
+    "test:efatura-testmode": "node integrations/efatura/test/testmode.js",
+    "test:efatura-e2e": "electron integrations/efatura/test/e2e-send.js"
+  },
+  "build": {
+    "appId": "com.vega.whatsapp",
+    "productName": "Vega WhatsApp",
+    "asar": false,
+    "directories": {
+      "output": "dist"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "saidbayraqtars",
+        "repo": "vega-whatsapp-legacy-releases",
+        "releaseType": "release"
+      }
+    ],
+    "files": [
+      "electron/**",
+      "server/**",
+      "!server/build/**",
+      "!server/data/**",
+      "!server/node_modules/**",
+      "!server/config.json",
+      "!server/server.log",
+      "!server/_x/**",
+      "!server/test/**"
+    ],
+    "extraFiles": [
+      {
+        "from": "integrations",
+        "to": "integrations",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "electron/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "Vega WhatsApp",
+      "include": "build/installer.nsh"
+    },
+    "artifactName": "Vega WhatsApp Legacy Setup ${version}.${ext}"
+  },
+  "devDependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "baileys7": "npm:@whiskeysockets/baileys@7.0.0-rc14",
+    "electron": "22.3.27",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.24.0",
+    "lru-cache": "^10.4.3"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "electron-updater": "^6.8.9",
+    "express": "^4.21.0",
+    "mssql": "^11.0.1",
+    "multer": "^1.4.5-lts.1",
+    "pdfkit": "^0.19.1",
+    "qrcode": "^1.5.4"
+  }
+}

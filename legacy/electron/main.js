@@ -1,0 +1,408 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  Vega WhatsApp — Electron masaüstü sarmalayıcı
+//  • Express sunucu + tahsilat watcher AYNI process'te çalışır (arka plan servis).
+//  • Pencere (X) kapatınca tray'e küçülür; izleme DURMAZ.
+//  • Windows açılışında otomatik başlar (login item).
+//  • PIN, Windows DPAPI (safeStorage) ile şifreli saklanır → PC açılışında
+//    otomatik DB bağlantısı + watcher (kullanıcı PIN girmeden takip sürer).
+//  LEGACY: Electron 22 (Node 16) — Windows 7 SP1 / Server 2008 R2 / Server 2012.
+//  Node 16'da global fetch yok → yerel istekler http ile (localRequest).
+// ═══════════════════════════════════════════════════════════════════════════
+
+require(require('path').join(__dirname, '..', 'server', 'node16-shim.js')); // globalThis.crypto + HKDF
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, safeStorage } = require('electron');
+const { autoUpdater } = require('electron-updater');
+const http = require('http');   // zorunlu güncelleme "meşgul mü" sorgusu
+const path = require('path');
+const fs = require('fs');
+
+const PORT = 3100;
+const URL = `http://localhost:${PORT}`;
+
+// Node 16'da fetch yok: yerel sunucuya küçük istek. { ok, status, body } döner.
+function localRequest(urlPath, { method = 'GET', body = null, timeoutMs = 5000 } = {}) {
+    return new Promise((resolve, reject) => {
+        const data = body == null ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
+        const req = http.request({
+            host: '127.0.0.1', port: PORT, path: urlPath, method,
+            headers: data ? { 'Content-Type': 'application/json', 'Content-Length': data.length } : {},
+            timeout: timeoutMs,
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+        });
+        req.on('timeout', () => req.destroy(new Error('zaman aşımı')));
+        req.on('error', reject);
+        if (data) req.write(data);
+        req.end();
+    });
+}
+
+// Tek örnek kilidi — ikinci kez açılırsa mevcut pencereyi öne getir.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) { app.quit(); process.exit(0); }
+
+let mainWindow = null;
+let floatWindow = null;
+let tray = null;
+let isQuitting = false;
+
+const userDataDir = app.getPath('userData');
+const AUTH_BIN = path.join(userDataDir, 'auth.bin'); // safeStorage ile şifreli PIN
+const FLOAT_POS = path.join(userDataDir, 'float-pos.json'); // yüzen buton konumu
+const FLOAT_HIDDEN = path.join(userDataDir, '.float-hidden'); // kullanıcı gizlediyse marker
+
+// ─── Sunucuyu aynı process'te başlat ───────────────────────────────────────────
+function startServer() {
+    process.env.VEGA_BASE_DIR = userDataDir; // config.json + data/ buraya
+    if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
+    require(path.join(__dirname, '..', 'server', 'server.js')); // app.listen tetikler
+}
+
+// Sunucu ayağa kalkana kadar bekle.
+async function waitForServer(timeoutMs = 20000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const r = await localRequest('/api/status');
+            if (r.ok) return true;
+        } catch { /* henüz hazır değil */ }
+        await new Promise(r => setTimeout(r, 400));
+    }
+    return false;
+}
+
+// ─── PIN saklama (DPAPI) ───────────────────────────────────────────────────────
+function savePin(pin) {
+    if (!safeStorage.isEncryptionAvailable()) return false;
+    fs.writeFileSync(AUTH_BIN, safeStorage.encryptString(String(pin)));
+    return true;
+}
+function readPin() {
+    try {
+        if (!fs.existsSync(AUTH_BIN) || !safeStorage.isEncryptionAvailable()) return null;
+        return safeStorage.decryptString(fs.readFileSync(AUTH_BIN));
+    } catch { return null; }
+}
+function clearPin() { try { fs.existsSync(AUTH_BIN) && fs.unlinkSync(AUTH_BIN); } catch { /* yok say */ } }
+
+// PC açılışı / uygulama başlangıcında: PIN'siz sessiz DB bağlantısı. Sunucu zaten
+// boot'ta otomatik bağlanır; bu yalnızca emniyet için bir tetikleyici. /api/connect
+// içinde watcher + reminders autoStart çalışır → takip kendiliğinden sürer.
+async function autoConnect() {
+    try {
+        await localRequest('/api/connect', { method: 'POST', body: '{}', timeoutMs: 30000 });
+        console.log('[Electron] Otomatik bağlantı denendi.');
+    } catch (e) { console.error('[Electron] auto-connect hata:', e.message); }
+}
+
+// ─── Otomatik güncelleme (GitHub Releases) ─────────────────────────────────────
+// LEGACY paketli sürüm github.com/saidbayraqtars/vega-whatsapp-legacy-releases'tan
+// yeni sürüm denetler (publish ayarı package.json'da). Güncel (Electron 33) sürümün
+// deposuna BAĞLANMAZ — o kurulum Windows 7/2008 R2/2012'de açılmaz. İndirme otomatik; kurulum kullanıcı
+// onayıyla hemen ya da uygulama kapanırken sessizce yapılır.
+let updateDownloaded = false;
+let updateVersion = null;
+
+// ─── ZORUNLU GÜNCELLEME ────────────────────────────────────────────────────
+// Uygulama tray'de haftalarca açık kalıyor. Eski davranışta indirilen sürüm
+// yalnızca kullanıcı "Şimdi Kur" derse ya da uygulamadan ÇIKINCA kuruluyordu
+// (autoInstallOnAppQuit). Çıkılmadığı için sahada 1.0.24 gibi çok eski sürümler
+// kaldı. Artık indirme bitince geri sayım başlıyor; süre dolunca kurulum
+// kendiliğinden yapılıp uygulama yeniden başlıyor. "Sonra" yok, yalnız "gizle".
+const FORCE_GRACE_MS = 10 * 60 * 1000;      // indirme bitti → kuruluma kalan süre
+const FORCE_BUSY_RETRY_MS = 60 * 1000;      // gönderim sürüyorsa bu aralıkla tekrar bak
+const FORCE_BUSY_MAX_MS = 3 * 60 * 60 * 1000; // meşgul diye en fazla bu kadar ertele
+let forceDeadline = null;   // kurulumun yapılacağı an (ms)
+let forceTimer = null;      // geri sayım/arayüz tazeleme zamanlayıcısı
+let forceBusyUntil = null;  // meşguliyet yüzünden erteleme tavanı
+
+function installUpdateNow() {
+    if (forceTimer) { clearInterval(forceTimer); forceTimer = null; }
+    isQuitting = true; // tray'e gizlenme davranışını atla, gerçekten kapan
+    autoUpdater.quitAndInstall(true, true); // sessiz kur + kurulunca yeniden başlat
+}
+
+// Sunucuya sor: şu an kesilmemesi gereken bir iş (toplu gönderim) var mı?
+// Sunucu cevap vermezse meşgul SAYMA — aksi halde sunucu çöktüğünde güncelleme
+// sonsuza kadar ertelenirdi.
+function isServerBusy() {
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (v) => { if (!done) { done = true; resolve(v); } };
+        try {
+            const req = http.get(`${URL}/api/busy`, { timeout: 4000 }, (res) => {
+                let body = '';
+                res.on('data', (c) => { body += c; });
+                res.on('end', () => {
+                    try { const j = JSON.parse(body); finish({ busy: !!j.busy, reason: j.reason || '' }); }
+                    catch { finish({ busy: false, reason: '' }); }
+                });
+            });
+            req.on('error', () => finish({ busy: false, reason: '' }));
+            req.on('timeout', () => { req.destroy(); finish({ busy: false, reason: '' }); });
+        } catch { finish({ busy: false, reason: '' }); }
+    });
+}
+
+// Geri sayım: her saniye arayüzü tazele, süre dolunca kur. Gönderim sürüyorsa
+// bekle (en fazla FORCE_BUSY_MAX_MS), sonra yine de kur.
+function startForcedInstall() {
+    if (forceTimer) return;
+    forceDeadline = Date.now() + FORCE_GRACE_MS;
+    forceBusyUntil = Date.now() + FORCE_BUSY_MAX_MS;
+    let checking = false;
+    forceTimer = setInterval(async () => {
+        const left = Math.max(0, forceDeadline - Date.now());
+        sendUpdateState({ phase: 'ready', version: updateVersion, forced: true, secondsLeft: Math.ceil(left / 1000) });
+        if (left > 0 || checking) return;
+        checking = true;
+        const { busy, reason } = await isServerBusy();
+        checking = false;
+        if (busy && Date.now() < forceBusyUntil) {
+            forceDeadline = Date.now() + FORCE_BUSY_RETRY_MS;
+            sendUpdateState({ phase: 'ready', version: updateVersion, forced: true, secondsLeft: Math.ceil(FORCE_BUSY_RETRY_MS / 1000), busyReason: reason });
+            return;
+        }
+        installUpdateNow();
+    }, 1000);
+}
+
+// ─── Güncelleme durum penceresi ────────────────────────────────────────────────
+// İndirme arka planda sürer; sağ-altta küçük, logolu "Güncelleme yükleniyor..."
+// kartı çıkar (odak çalmaz). İndirme bitince aynı kartta "Şimdi Kur / Sonra".
+let updateWindow = null;
+let updateWinState = null;
+
+function sendUpdateState(state) {
+    updateWinState = state;
+    if (updateWindow && !updateWindow.isDestroyed()) {
+        updateWindow.webContents.send('updater:state', state);
+    }
+}
+
+function createUpdateWindow() {
+    if (updateWindow && !updateWindow.isDestroyed()) { return; }
+    const { screen } = require('electron');
+    const wa = screen.getPrimaryDisplay().workArea;
+    updateWindow = new BrowserWindow({
+        width: 380, height: 160,
+        x: wa.x + wa.width - 396, y: wa.y + wa.height - 176,
+        frame: false, transparent: true, hasShadow: false,
+        resizable: false, maximizable: false, minimizable: false, fullscreenable: false,
+        skipTaskbar: true, alwaysOnTop: true, show: false,
+        title: 'Güncelleme',
+        webPreferences: { preload: path.join(__dirname, 'updater-preload.js'), contextIsolation: true },
+    });
+    updateWindow.loadFile(path.join(__dirname, 'updater.html'));
+    updateWindow.webContents.on('did-finish-load', () => {
+        if (updateWinState) updateWindow.webContents.send('updater:state', updateWinState);
+    });
+    updateWindow.once('ready-to-show', () => {
+        if (updateWindow && !updateWindow.isDestroyed()) updateWindow.showInactive(); // odak çalma
+    });
+    updateWindow.on('closed', () => { updateWindow = null; });
+}
+
+function closeUpdateWindow() {
+    if (updateWindow && !updateWindow.isDestroyed()) updateWindow.close();
+}
+
+function setupAutoUpdater() {
+    if (!app.isPackaged) return; // geliştirmede (npm start) denetleme yapma
+
+    autoUpdater.autoDownload = true;
+    autoUpdater.autoInstallOnAppQuit = true; // kullanıcı "Sonra" derse çıkışta kurulur
+
+    // İndirme başladı → durum penceresini göster (arka planda inmeye devam eder).
+    autoUpdater.on('update-available', (info) => {
+        updateVersion = info.version;
+        createUpdateWindow();
+        sendUpdateState({ phase: 'downloading', version: info.version, percent: 0 });
+    });
+
+    autoUpdater.on('download-progress', (p) => {
+        sendUpdateState({ phase: 'downloading', version: updateVersion, percent: Math.round(p?.percent || 0) });
+    });
+
+    autoUpdater.on('update-downloaded', (info) => {
+        updateDownloaded = true;
+        updateVersion = info.version;
+        refreshTrayMenu();
+        // Zorunlu: kartı göster + geri sayımı başlat. Kullanıcı hemen kurabilir,
+        // erteleyemez — yalnızca kartı gizleyebilir (geri sayım arkada işler).
+        createUpdateWindow();
+        sendUpdateState({ phase: 'ready', version: info.version, forced: true, secondsLeft: Math.ceil(FORCE_GRACE_MS / 1000) });
+        startForcedInstall();
+    });
+
+    // İndirilmiş sürüm varken gelen hata (ör. sonraki denetleme ağ hatası) geri
+    // sayımı iptal etmemeli — kartı yalnız henüz hazır bir kurulum yokken kapat.
+    autoUpdater.on('error', (e) => {
+        console.error('[Updater]', (e && e.message) || e);
+        if (!updateDownloaded) closeUpdateWindow();
+    });
+
+    // Açılışta + her 4 saatte bir denetle (uygulama tray'de uzun süre açık kalıyor).
+    autoUpdater.checkForUpdates().catch(() => { /* ağ yoksa sessiz geç */ });
+    setInterval(() => autoUpdater.checkForUpdates().catch(() => { /* yok say */ }), 4 * 60 * 60 * 1000);
+}
+
+// ─── Pencere + Tray ────────────────────────────────────────────────────────────
+function createWindow() {
+    mainWindow = new BrowserWindow({
+        width: 1280, height: 820, minWidth: 980, minHeight: 640,
+        icon: path.join(__dirname, 'icon.png'),
+        title: 'Expert Bilişim — WhatsApp Tahsilat',
+        autoHideMenuBar: true,
+        webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true },
+    });
+    // Önceki sürümden cache'lenmiş eski arayüz (index/app/style) kalmasın → temizle, sonra yükle.
+    mainWindow.webContents.session.clearCache()
+        .catch(() => { /* yok say */ })
+        .finally(() => mainWindow.loadURL(URL));
+
+    // X → kapatma değil, tray'e gizle (izleme sürsün).
+    mainWindow.on('close', (e) => {
+        if (!isQuitting) {
+            e.preventDefault();
+            mainWindow.hide();
+            if (tray) tray.displayBalloon?.({ title: 'Expert Bilişim', content: 'Arka planda tahsilat takibi sürüyor.' });
+        }
+    });
+}
+
+// ─── Yüzen "Bakiyeyi Gönder" butonu ────────────────────────────────────────────
+// Arctos'un üstünde duran küçük, her zaman üstte, çerçevesiz pencere. Arctos'ta
+// açık cariyi (server plan-cache ile tespit eder) gösterir; tıkla → önizle → gönder.
+function loadFloatPos() {
+    try { if (fs.existsSync(FLOAT_POS)) return JSON.parse(fs.readFileSync(FLOAT_POS, 'utf8')); } catch { /* yok say */ }
+    return null;
+}
+function saveFloatPos() {
+    if (!floatWindow || floatWindow.isDestroyed()) return;
+    try { const [x, y] = floatWindow.getPosition(); fs.writeFileSync(FLOAT_POS, JSON.stringify({ x, y })); } catch { /* yok say */ }
+}
+
+function createFloatWindow() {
+    if (floatWindow && !floatWindow.isDestroyed()) { floatWindow.show(); return; }
+    const pos = loadFloatPos();
+    floatWindow = new BrowserWindow({
+        width: 300, height: 170,
+        x: pos ? pos.x : undefined, y: pos ? pos.y : undefined,
+        frame: false, transparent: true, hasShadow: false,
+        resizable: true, maximizable: false, minimizable: false, fullscreenable: false,
+        skipTaskbar: true, alwaysOnTop: true,
+        title: 'Bakiyeyi Gönder',
+        webPreferences: { preload: path.join(__dirname, 'float-preload.js'), contextIsolation: true },
+    });
+    floatWindow.setAlwaysOnTop(true, 'screen-saver');
+    floatWindow.setVisibleOnAllWorkspaces?.(true);
+    floatWindow.loadURL(`${URL}/float.html`);
+    if (!pos) {
+        // İlk açılış: ekranın sağ-altına yerleştir.
+        const { screen } = require('electron');
+        const wa = screen.getPrimaryDisplay().workArea;
+        floatWindow.setPosition(wa.x + wa.width - 320, wa.y + wa.height - 200);
+    }
+    floatWindow.on('moved', saveFloatPos);
+    floatWindow.on('closed', () => { floatWindow = null; });
+}
+
+function showFloat() { try { fs.existsSync(FLOAT_HIDDEN) && fs.unlinkSync(FLOAT_HIDDEN); } catch { /* yok say */ } createFloatWindow(); refreshTrayMenu(); }
+function hideFloat() {
+    try { fs.writeFileSync(FLOAT_HIDDEN, '1'); } catch { /* yok say */ }
+    if (floatWindow && !floatWindow.isDestroyed()) floatWindow.hide();
+    refreshTrayMenu();
+}
+function floatVisible() { return !!(floatWindow && !floatWindow.isDestroyed() && floatWindow.isVisible()); }
+
+function refreshTrayMenu() {
+    if (!tray) return;
+    const showWin = () => { mainWindow ? (mainWindow.show(), mainWindow.focus()) : createWindow(); };
+    const items = [
+        { label: 'Göster', click: showWin },
+        { type: 'separator' },
+    ];
+    if (updateDownloaded) {
+        items.push({ label: `Güncellemeyi Şimdi Kur (v${updateVersion}) — zorunlu`, click: installUpdateNow });
+    } else if (app.isPackaged) {
+        items.push({ label: 'Güncellemeleri Denetle', click: () => autoUpdater.checkForUpdates().catch(() => { /* yok say */ }) });
+    }
+    items.push(
+        { type: 'separator' },
+        {
+            label: 'Bakiye butonu (Arctos üstünde)', type: 'checkbox',
+            checked: floatVisible(),
+            click: (item) => { item.checked ? showFloat() : hideFloat(); },
+        },
+        {
+            label: 'Windows açılışında başlat', type: 'checkbox',
+            checked: app.getLoginItemSettings().openAtLogin,
+            click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked, args: ['--hidden'] }),
+        },
+        { type: 'separator' },
+        { label: 'Çıkış (takibi durdurur)', click: () => { isQuitting = true; app.quit(); } },
+    );
+    tray.setContextMenu(Menu.buildFromTemplate(items));
+}
+
+function createTray() {
+    const img = nativeImage.createFromPath(path.join(__dirname, 'icon.png')).resize({ width: 16, height: 16 });
+    tray = new Tray(img);
+    tray.setToolTip('Expert Bilişim — tahsilat takibi aktif');
+    refreshTrayMenu();
+    tray.on('double-click', () => { mainWindow ? (mainWindow.show(), mainWindow.focus()) : createWindow(); });
+}
+
+// ─── IPC (preload üzerinden web arayüzü çağırır) ───────────────────────────────
+ipcMain.handle('pin:save', (_e, pin) => savePin(pin));
+ipcMain.handle('pin:has', () => fs.existsSync(AUTH_BIN));
+ipcMain.handle('pin:clear', () => { clearPin(); return true; });
+ipcMain.handle('autostart:get', () => app.getLoginItemSettings().openAtLogin);
+ipcMain.handle('autostart:set', (_e, on) => { app.setLoginItemSettings({ openAtLogin: !!on, args: ['--hidden'] }); return true; });
+
+// Güncelleme penceresi butonları.
+ipcMain.on('updater:install', () => installUpdateNow());
+// "Gizle": kartı kapatır ama ZORUNLU geri sayım arkada işlemeye devam eder.
+// (Eskiden "Sonra" idi ve kurulum çıkışa kalıyordu — uygulama kapatılmadığı için
+//  sahada çok eski sürümler kalıyordu.)
+ipcMain.on('updater:later', () => closeUpdateWindow());
+
+// Yüzen buton: pencere boyutu (önizleme açılınca büyür) + gizle.
+ipcMain.on('float:size', (_e, { w, h } = {}) => {
+    if (floatWindow && !floatWindow.isDestroyed() && w && h) {
+        floatWindow.setSize(Math.round(w), Math.round(h));
+    }
+});
+ipcMain.on('float:hide', () => hideFloat());
+
+app.on('second-instance', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
+
+app.whenReady().then(async () => {
+    // Varsayılan: ilk kurulumda Windows açılışında başlatmayı aç.
+    if (app.getLoginItemSettings().openAtLogin === false && !fs.existsSync(path.join(userDataDir, '.autostart-set'))) {
+        app.setLoginItemSettings({ openAtLogin: true, args: ['--hidden'] });
+        try { fs.writeFileSync(path.join(userDataDir, '.autostart-set'), '1'); } catch { /* yok say */ }
+    }
+
+    startServer();
+    createTray();
+    setupAutoUpdater();
+    const ok = await waitForServer();
+    if (!ok) console.error('[Electron] Sunucu başlatılamadı.');
+    await autoConnect();
+
+    // Yüzen "Bakiyeyi Gönder" butonu — kullanıcı daha önce gizlemediyse göster.
+    if (!fs.existsSync(FLOAT_HIDDEN)) createFloatWindow();
+
+    // --hidden ile (oto-başlatma) açıldıysa pencereyi gösterme, tray'de kal.
+    const hidden = process.argv.includes('--hidden');
+    if (!hidden) createWindow();
+    else createWindow(), mainWindow.hide();
+});
+
+// Tray uygulaması: tüm pencereler kapansa da çalışmaya devam (macOS hariç davranış).
+app.on('window-all-closed', (e) => { /* tray'de kal, çıkma */ });
+app.on('before-quit', () => { isQuitting = true; });

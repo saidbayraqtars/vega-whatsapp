@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bakiyeyi Gönder</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    background: transparent; color: #eaf2f8;
+    overflow: hidden; user-select: none;
+  }
+  .card {
+    height: 100vh; display: flex; flex-direction: column;
+    background: #16222e;
+    border: 1px solid #22c55e55; border-radius: 14px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.6); overflow: hidden;
+  }
+  /* Üst şerit = sürükleme tutamağı */
+  .grip {
+    -webkit-app-region: drag; cursor: move;
+    display: flex; align-items: center; gap: 7px;
+    height: 26px; padding: 0 8px;
+    background: #0e1822; border-bottom: 1px solid #ffffff0e;
+  }
+  .grip .dots { display: flex; gap: 3px; }
+  .grip .dots i { width: 4px; height: 4px; border-radius: 50%; background: #46586a; }
+  .grip .lbl { flex: 1; font-size: 10px; font-weight: 600; letter-spacing: .4px; color: #7d93a4; text-transform: uppercase; }
+  .grip .x { -webkit-app-region: no-drag; cursor: pointer; color: #6b7c8a; font-size: 13px; padding: 2px 5px; border-radius: 6px; }
+  .grip .x:hover { color: #fff; background: #ffffff14; }
+
+  .body { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 12px; }
+
+  /* ── Ana görünüm ── */
+  #viewMain { gap: 12px; justify-content: center; text-align: center; }
+  .nm { font-size: 16px; font-weight: 800; color: #fff; line-height: 1.2; word-break: break-word;
+        display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .bal { font-size: 14px; color: #9fb3c2; }
+  .bal b { font-size: 22px; font-weight: 800; display: block; margin-top: 2px; }
+  .bal b.borc { color: #f87171; }
+  .bal b.alacak { color: #22c55e; }
+
+  button.go {
+    -webkit-app-region: no-drag; border: none; border-radius: 12px; cursor: pointer;
+    padding: 16px; font-size: 16px; font-weight: 800; letter-spacing: .3px; color: #fff;
+    background: linear-gradient(120deg, #22c55e, #16a34a);
+    box-shadow: 0 4px 14px #16a34a55; transition: filter .15s, opacity .15s;
+  }
+  button.go:hover { filter: brightness(1.08); }
+  button.go:disabled { background: #283a47; color: #6b7c8a; box-shadow: none; cursor: default; }
+
+  .note { font-size: 12px; min-height: 16px; color: #8aa0b0; }
+  .note.err { color: #f87171; }
+  .note.warn { color: #fbbf24; }
+
+  /* ── Önizleme ── */
+  #viewPreview { gap: 10px; }
+  .pvto { font-size: 13px; color: #9fb3c2; }
+  .pvto b { color: #fff; font-weight: 700; }
+  textarea {
+    -webkit-app-region: no-drag; width: 100%; flex: 1; min-height: 110px; resize: none;
+    background: #0d1922; color: #eaf2f8; border: 1px solid #ffffff1f; border-radius: 11px;
+    padding: 10px; font-size: 13px; font-family: inherit; line-height: 1.45; user-select: text;
+  }
+  textarea:focus { outline: none; border-color: #22c55e99; }
+  .pvstatus { font-size: 12px; min-height: 15px; }
+  .pvstatus.ok { color: #22c55e; } .pvstatus.err { color: #f87171; } .pvstatus.warn { color: #fbbf24; }
+  .row { display: flex; gap: 8px; }
+  button.send { flex: 1; -webkit-app-region: no-drag; border: none; border-radius: 11px; cursor: pointer;
+    padding: 14px; font-size: 15px; font-weight: 800; color: #fff;
+    background: linear-gradient(120deg, #22c55e, #16a34a); }
+  button.send:hover { filter: brightness(1.08); }
+  button.send:disabled { opacity: .5; cursor: default; }
+  button.back { -webkit-app-region: no-drag; border: 1px solid #ffffff26; border-radius: 11px; cursor: pointer;
+    padding: 14px 16px; font-size: 14px; font-weight: 600; color: #cdd9e3; background: transparent; }
+  button.back:hover { background: #ffffff10; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="grip">
+    <span class="dots"><i></i><i></i><i></i></span>
+    <span class="lbl">Bakiyeyi Gönder</span>
+    <span class="x" id="btnHide" title="Gizle">✕</span>
+  </div>
+
+  <!-- ANA GÖRÜNÜM: tek büyük buton -->
+  <div class="body" id="viewMain">
+    <div class="nm" id="cariName">Cari bekleniyor</div>
+    <div class="bal" id="cariBal"></div>
+    <button class="go" id="btnOpen" disabled>Bakiyeyi Gönder</button>
+    <div class="note" id="mainNote">Arctos'ta bir cari açın</div>
+  </div>
+
+  <!-- ÖNİZLEME -->
+  <div class="body hidden" id="viewPreview">
+    <div class="pvto">Alıcı: <b id="pvName"></b><br><span id="pvPhone"></span></div>
+    <textarea id="pvMsg" spellcheck="false"></textarea>
+    <div class="pvstatus" id="pvStatus"></div>
+    <div class="row">
+      <button class="back" id="btnCancel">Vazgeç</button>
+      <button class="send" id="btnSend">Gönder</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = location.origin;
+let current = null;
+let previewCari = null;
+let sending = false;
+
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => (Number(n)||0).toLocaleString('tr-TR',{minimumFractionDigits:2,maximumFractionDigits:2});
+function setSize(h){ try { window.floatApi.setSize(300, h); } catch {} }
+function inPreview(){ return !$('viewPreview').classList.contains('hidden'); }
+
+function renderMain(a){
+  const note = $('mainNote');
+  if (!a || a.dbConnected === false) {
+    $('cariName').textContent = a && a.dbConnected===false ? 'Bağlantı yok' : 'Cari bekleniyor';
+    $('cariBal').textContent = ''; $('btnOpen').disabled = true;
+    note.className = 'note'; note.textContent = a && a.dbConnected===false ? 'Uygulamada bağlantıyı açın' : "Arctos'ta bir cari açın";
+    return;
+  }
+  if (a.found === false) {
+    $('cariName').textContent = 'Cari #' + a.ind; $('cariBal').textContent = '';
+    $('btnOpen').disabled = true; note.className='note err'; note.textContent = 'Cari çözümlenemedi';
+    return;
+  }
+  $('cariName').textContent = a.name || ('Cari #' + a.ind);
+  if (a.bakiye == null) $('cariBal').innerHTML = '';
+  else { const cls = a.bakiye>0?'borc':(a.bakiye<0?'alacak':''); $('cariBal').innerHTML = (a.durum||'Bakiye') + ' <b class="'+cls+'">'+fmt(Math.abs(a.bakiye))+' TL</b>'; }
+
+  const canSend = a.valid && !a.pasif;
+  $('btnOpen').disabled = !canSend;
+  let n = '', cls = 'note';
+  if (a.pasif) { n = 'Cari pasif — gönderilemez'; cls = 'note err'; }
+  else if (!a.valid) { n = 'Telefon numarası yok'; cls = 'note err'; }
+  else if (!a.wa) { n = 'WhatsApp bağlı değil'; cls = 'note warn'; }
+  else { n = '✓ Göndermeye hazır'; cls = 'note'; }
+  note.className = cls; note.textContent = n;
+}
+
+async function poll(){
+  if (sending) return;
+  try {
+    const r = await fetch(API+'/api/active-cari', { cache:'no-store' });
+    const j = await r.json();
+    current = j && j.success ? j.active : null;
+    if (!inPreview()) renderMain(current);
+  } catch {}
+}
+
+function openPreview(){
+  if (!current || !current.found) return;
+  previewCari = current;
+  $('pvName').textContent = current.name || ('Cari #'+current.ind);
+  $('pvPhone').textContent = current.phone ? ('📱 '+current.phone) : '';
+  $('pvMsg').value = current.message || '';
+  $('pvStatus').textContent = current.wa ? '' : 'WhatsApp bağlı değil — bağlanmadan gönderilemez';
+  $('pvStatus').className = 'pvstatus ' + (current.wa ? '' : 'warn');
+  $('viewMain').classList.add('hidden'); $('viewPreview').classList.remove('hidden');
+  setSize(320);
+}
+function closePreview(){
+  previewCari = null;
+  $('viewPreview').classList.add('hidden'); $('viewMain').classList.remove('hidden');
+  setSize(205); renderMain(current);
+}
+
+async function send(){
+  if (!previewCari || sending) return;
+  sending = true; $('btnSend').disabled = true; $('btnCancel').disabled = true;
+  $('pvStatus').className='pvstatus'; $('pvStatus').textContent='Gönderiliyor…';
+  try {
+    const r = await fetch(API+'/api/active-cari/send', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ firmaNo: previewCari.firmaNo, donemNo: previewCari.donemNo, ind: previewCari.ind, message: $('pvMsg').value }),
+    });
+    const j = await r.json();
+    if (j.success) { $('pvStatus').className='pvstatus ok'; $('pvStatus').textContent='✓ Gönderildi'; setTimeout(closePreview, 1300); }
+    else { $('pvStatus').className='pvstatus err'; $('pvStatus').textContent = j.message || 'Gönderilemedi'; }
+  } catch (e) { $('pvStatus').className='pvstatus err'; $('pvStatus').textContent='Hata: '+e.message; }
+  finally { sending = false; $('btnSend').disabled = false; $('btnCancel').disabled = false; }
+}
+
+$('btnOpen').addEventListener('click', openPreview);
+$('btnCancel').addEventListener('click', closePreview);
+$('btnSend').addEventListener('click', send);
+$('btnHide').addEventListener('click', () => { try { window.floatApi.hide(); } catch {} });
+
+setSize(205); poll(); setInterval(poll, 1800);
+</script>
+</body>
+</html>
